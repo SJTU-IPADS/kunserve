@@ -778,6 +778,11 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
+        # Lifecycle diagnostics for RL latency analysis.
+        # _prefill_count > 1 means this req was prefetched/prefilled repeatedly (e.g., after retract).
+        self._prefill_count = 0
+        # Cumulative wasted decode time (ms) caused by retract after prefill finished.
+        self._retract_wasted_ms = 0.0
 
         # For metrics
         self.metrics_collector = metrics_collector

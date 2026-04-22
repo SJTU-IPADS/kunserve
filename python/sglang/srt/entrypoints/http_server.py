@@ -602,9 +602,15 @@ async def server_info():
     if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
         del _global_state.tokenizer_manager.server_args.model_config
 
+    server_args = dataclasses.asdict(_global_state.tokenizer_manager.server_args)
+    scheduler_info = _global_state.scheduler_info
+    if isinstance(scheduler_info, dict):
+        server_args = {**server_args, **scheduler_info}
+    else:
+        server_args["scheduler_info"] = scheduler_info
+
     return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
-        **_global_state.scheduler_info,
+        **server_args,
         "internal_states": internal_states,
         "version": __version__,
     }
