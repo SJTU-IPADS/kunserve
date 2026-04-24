@@ -37,7 +37,6 @@ The Git submodule URL for `FlashTransformer` is set in `.gitmodules` to the **Fl
 
 - **KunServe** (Python layer, evaluation scope, acknowledgements): [kunserve/README.md](kunserve/README.md)
 - **FlashTransformer** (native backend): [FlashTransformer/README.md](FlashTransformer/README.md)
-- **Scripts** (benchmarks, evaluation): [scripts/README.md](scripts/README.md)
 
 ## Roadmap
 

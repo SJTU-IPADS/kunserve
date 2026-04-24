@@ -1,0 +1,3 @@
+[submodule "FlashTransformer"]
+	path = FlashTransformer
+	url = https://github.com/Sparrow612/FlashTransformer.git
