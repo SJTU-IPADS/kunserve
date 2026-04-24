@@ -1,0 +1,87 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+SHELL ["/bin/bash", "-c"]
+WORKDIR /app
+
+ARG http_proxy
+ARG https_proxy
+
+ENV http_proxy ${http_proxy}
+ENV https_proxy ${https_proxy}
+
+# Install dependencies
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt/lists \
+    apt update && \
+    apt install -y --no-install-recommends libssl-dev git build-essential openmpi-bin openmpi-common libopenmpi-dev libaio-dev wget curl
+
+ARG CMAKE_VERSION=3.23.5
+WORKDIR /tmp
+RUN wget https://cmake.org/files/v3.23/cmake-3.23.5.tar.gz \
+    && tar -zxvf cmake-3.23.5.tar.gz \
+    && rm cmake-3.23.5.tar.gz
+WORKDIR /tmp/cmake-3.23.5
+RUN ./bootstrap --prefix=/usr/local \
+    --no-qt-gui \
+    --no-system-libs \
+    --parallel=$(nproc) \
+    && make -j$(nproc) \
+    && make install
+
+# Install micromamba
+RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba && \
+    mv bin/micromamba /usr/local/bin/micromamba && \
+    rm -rf bin && \
+    micromamba shell init --shell bash --root-prefix=/root/micromamba && \
+    micromamba shell init --shell fish --root-prefix=/root/micromamba
+
+# Set conda mirror to TUNA mirror
+COPY <<EOF /root/.condarc
+channels:
+    - defaults
+show_channel_urls: true
+default_channels:
+    - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+    - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+    - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2
+custom_channels:
+    conda-forge: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    msys2: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    bioconda: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    menpo: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    pytorch: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    pytorch-lts: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    simpleitk: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    deepmodeling: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/
+EOF
+
+# Set pip mirror to TUNA mirror
+RUN mkdir -p /root/.pip && \
+    echo "[global]" > /root/.pip/pip.conf && \
+    echo "index-url = https://pypi.tuna.tsinghua.edu.cn/simple" >> /root/.pip/pip.conf && \
+    echo "trusted-host = pypi.tuna.tsinghua.edu.cn" >> /root/.pip/pip.conf
+
+# Set up env for KunServe
+COPY environment.yml /app/environment.yml
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/micromamba/pkgs \
+    micromamba create -n kunserve -f /app/environment.yml
+
+# Set up FlashTransformer
+# `git submodule update --init --recursive` has been run inside `FlashTransformer`\
+COPY . /app/KunServe
+# RUN --mount=type=cache,target=/app/KunServe/FlashTransformer/build \
+#     eval "$(micromamba shell hook --shell bash)" && \
+#     micromamba activate kunserve && \
+#     cd /app/KunServe/FlashTransformer && \
+#     cmake -DTORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0" -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" -B build && \
+#     cmake --build build -j$(nproc) && \
+#     cp build/lib/libflash_pybinding.so .
+
+# Install kunserve
+RUN eval "$(micromamba shell hook --shell bash)" && \
+    micromamba activate kunserve && \
+    cd /app/KunServe && \
+    pip install -e .
+
+WORKDIR /app/KunServe
