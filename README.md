@@ -40,9 +40,9 @@ The Git submodule URL for `FlashTransformer` is set in `.gitmodules` to the **Fl
 
 ## Roadmap
 
-Planned directions (non-binding; order and timing may change):
+We will extend KunServe in the following directions:
 
-- **Weight loading from host memory / SSD** — broader storage tiers beyond today’s assumptions, for large models and flexible deployment.
+- **Weight loading from host memory or SSD** — broader storage tiers beyond today’s assumptions, for large models and flexible deployment.
 - **Integrate SOTA inference engines (e.g. vLLM, SGLang)** — optional backends alongside KunServe’s research-oriented execution stack, so benchmarks and scheduling ideas can target widely used runtimes.
 - **CUDA graphs for efficient decoding** — capture and replay steady-state decode for lower launch overhead where the graph constraints are acceptable.
 - **Extend KunServe to RL rollout** — reuse orchestration, batching, and tracing for rollout-heavy RL training loops, not only static serving benchmarks.
