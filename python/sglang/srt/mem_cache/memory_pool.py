@@ -52,6 +52,9 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
+from sglang.srt.model_executor.balloon_utils import (
+    resolve_balloon_kv_slots_to_whole_donor_segments,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -963,6 +966,7 @@ class MHATokenToKVPool(KVCache):
                 allocation.ensure_active_rows(
                     target_rows,
                     donor_segments=remaining_donors,
+                    allow_donor_split=False,
                 )
                 expanded_allocations.append((allocation, previous_rows))
         except Exception:
@@ -1028,6 +1032,23 @@ class MHATokenToKVPool(KVCache):
         return sum(
             int(np.prod(buf.shape[1:])) * buf.dtype.itemsize
             for buf in self.k_buffer + self.v_buffer
+        )
+
+    def quantize_slots_to_whole_donor_segments(
+        self, requested_slots: int, donor_segments: List[DonorSegment]
+    ) -> int:
+        requested_slots = int(requested_slots)
+        if requested_slots <= 0 or not self._kv_vmm_enabled or not donor_segments:
+            return max(requested_slots, 0)
+
+        return resolve_balloon_kv_slots_to_whole_donor_segments(
+            requested_slots=requested_slots,
+            donor_segment_sizes=[segment.size_bytes for segment in donor_segments],
+            allocation_row_bytes=[
+                allocation.row_bytes
+                for allocation in self._k_vmm_allocations + self._v_vmm_allocations
+            ],
+            page_size=self.page_size,
         )
 
     # for disagg

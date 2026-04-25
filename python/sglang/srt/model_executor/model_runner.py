@@ -1135,8 +1135,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         target_variant = self._normalize_balloon_variant(target_variant)
+        offload_local_experts = int(offload_local_experts)
         if self._balloon_state == "balloon":
-            raise ValueError("Model runner is already in balloon mode.")
+            current_variant = self.get_cuda_graph_runtime_variant()
+            current_offload_local_experts = int(self._balloon_offloaded_local_experts)
+            if (
+                current_variant == target_variant
+                and current_offload_local_experts == offload_local_experts
+            ):
+                logger.info(
+                    "Commit balloon requested for an already-active runtime; returning existing status: "
+                    "runtime_variant=%s offloaded_local_experts=%d",
+                    current_variant,
+                    current_offload_local_experts,
+                )
+                self._balloon_last_error = None
+                return self.get_balloon_status()
+            raise ValueError(
+                "Model runner is already in balloon mode with "
+                f"runtime_variant={current_variant} offloaded_local_experts={current_offload_local_experts}; "
+                f"requested target_variant={target_variant} offload_local_experts={offload_local_experts}."
+            )
         if require_prepared and self._balloon_prepared_variant != target_variant:
             raise ValueError(
                 f"Balloon variant '{target_variant}' must be prepared before commit."
@@ -1249,6 +1268,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     kv_vmm_headroom_slots=kv_vmm_headroom_slots,
                     num_slots_to_expand=num_slots_to_expand,
                 )
+                donor_compatible_slots = kv_cache.quantize_slots_to_whole_donor_segments(
+                    added_slots, remaining_donors
+                )
+                if donor_compatible_slots != added_slots:
+                    logger.info(
+                        "Quantized balloon KV slots from %d to %d to preserve whole donor segments.",
+                        added_slots,
+                        donor_compatible_slots,
+                    )
+                    added_slots = donor_compatible_slots
                 logger.info(
                     "Balloon donor summary: donor_segments=%d donor_bytes=%d bytes_per_slot=%d "
                     "max_slots_from_donor=%d kv_vmm_headroom=%d requested_slots=%s final_added_slots=%d",
@@ -1261,9 +1290,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     added_slots,
                 )
 
+                kv_cache_expanded = False
+                allocator_expanded = False
                 if added_slots > 0:
                     kv_cache.expand_by_slots(added_slots, donor_segments=remaining_donors)
+                    kv_cache_expanded = True
                     self.token_to_kv_pool_allocator.expand_by_slots(added_slots)
+                    allocator_expanded = True
                     self.sync_kv_capacity(delta_slots=added_slots)
 
                 unused_donors = DonorLedger(label="balloon_unused")
@@ -1306,9 +1339,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_variant,
                 offload_local_experts,
             )
-            if added_slots > 0:
+            if added_slots > 0 and 'allocator_expanded' in locals() and allocator_expanded:
                 try:
                     self.token_to_kv_pool_allocator.shrink_tail(added_slots)
+                except Exception:
+                    logger.exception("Failed to roll back balloon KV allocator expansion.")
+            if added_slots > 0 and 'kv_cache_expanded' in locals() and kv_cache_expanded:
+                try:
                     returned = self._get_balloon_kv_cache().shrink_tail(
                         added_slots
                     )

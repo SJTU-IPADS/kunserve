@@ -677,6 +677,7 @@ class ExpandableVmmTensor:
         target_rows: int,
         *,
         donor_segments: Optional[Iterable[DonorSegment]] = None,
+        allow_donor_split: bool = True,
     ) -> list[DonorSegment]:
         target_rows = int(target_rows)
         if target_rows < 0 or target_rows > self.reserve_rows:
@@ -691,6 +692,14 @@ class ExpandableVmmTensor:
             raise RuntimeError(
                 "ensure_active_rows only supports prefix-managed mappings."
             )
+        aligned_row_chunk_bytes: Optional[int] = None
+        if self.row_bytes % self.region.granularity != 0:
+            aligned_row_chunk_bytes = (
+                min_granularity_aligned_row_count(
+                    self.row_bytes, self.region.granularity
+                )
+                * self.row_bytes
+            )
         if target_prefix_bytes > self._mapped_bytes:
             cursor = self._mapped_bytes
             remaining = target_prefix_bytes - self._mapped_bytes
@@ -704,6 +713,12 @@ class ExpandableVmmTensor:
                 if donors:
                     donor = donors.pop(0)
                     if donor.size_bytes > remaining:
+                        if not allow_donor_split:
+                            raise RuntimeError(
+                                "Donor-backed VMM expansion requires whole donor segments; "
+                                f"needed {remaining} bytes but next donor segment is "
+                                f"{donor.size_bytes} bytes."
+                            )
                         donor, remainder = donor.split_prefix(remaining)
                         donors.insert(0, remainder)
                     self.region.map_existing(
@@ -718,18 +733,18 @@ class ExpandableVmmTensor:
                     cursor += donor.size_bytes
                     remaining -= donor.size_bytes
                 else:
-                    if self.row_bytes % self.region.granularity == 0:
-                        mapping = self.region.map_new(
-                            va_offset_bytes=cursor,
-                            size_bytes=self.row_bytes,
-                            label=self.label,
-                        )
+                    if aligned_row_chunk_bytes is None:
+                        mapping_size_bytes = self.row_bytes
                     else:
-                        mapping = self.region.map_new(
-                            va_offset_bytes=cursor,
-                            size_bytes=remaining,
-                            label=self.label,
-                        )
+                        # Keep sub-granularity rows grouped into borrowable chunks so
+                        # later donor borrows can unmap whole mappings instead of
+                        # carving a suffix out of one giant region.
+                        mapping_size_bytes = min(remaining, aligned_row_chunk_bytes)
+                    mapping = self.region.map_new(
+                        va_offset_bytes=cursor,
+                        size_bytes=mapping_size_bytes,
+                        label=self.label,
+                    )
                     cursor += mapping.size_bytes
                     remaining -= mapping.size_bytes
             self._mapped_bytes = target_prefix_bytes

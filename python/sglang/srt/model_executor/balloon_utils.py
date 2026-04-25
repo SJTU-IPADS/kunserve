@@ -152,3 +152,54 @@ def resolve_balloon_kv_slots_to_expand(
             f"{kv_vmm_headroom_slots}."
         )
     return requested_slots
+
+
+def resolve_balloon_kv_slots_to_whole_donor_segments(
+    *,
+    requested_slots: int,
+    donor_segment_sizes: Sequence[int],
+    allocation_row_bytes: Sequence[int],
+    page_size: int,
+) -> int:
+    requested_slots = int(requested_slots)
+    page_size = int(page_size)
+    if requested_slots < 0:
+        raise ValueError(f"requested_slots must be non-negative, got {requested_slots}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if requested_slots == 0:
+        return 0
+
+    donor_segment_sizes = [int(size) for size in donor_segment_sizes]
+    allocation_row_bytes = [int(size) for size in allocation_row_bytes]
+    if any(size <= 0 for size in donor_segment_sizes):
+        raise ValueError("donor_segment_sizes must contain only positive values.")
+    if any(size <= 0 for size in allocation_row_bytes):
+        raise ValueError("allocation_row_bytes must contain only positive values.")
+    if not donor_segment_sizes or not allocation_row_bytes:
+        return 0
+
+    candidate_slots = requested_slots // page_size * page_size
+    while candidate_slots > 0:
+        donor_idx = 0
+        donor_bytes_used = 0
+        required_boundary_bytes = 0
+        fits = True
+
+        for row_bytes in allocation_row_bytes:
+            required_boundary_bytes += candidate_slots * row_bytes
+            while (
+                donor_bytes_used < required_boundary_bytes
+                and donor_idx < len(donor_segment_sizes)
+            ):
+                donor_bytes_used += donor_segment_sizes[donor_idx]
+                donor_idx += 1
+            if donor_bytes_used != required_boundary_bytes:
+                fits = False
+                break
+
+        if fits:
+            return candidate_slots
+        candidate_slots -= page_size
+
+    return 0

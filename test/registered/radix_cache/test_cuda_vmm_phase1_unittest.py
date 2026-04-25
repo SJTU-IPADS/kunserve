@@ -83,6 +83,29 @@ class TestCudaVmmPhase1(unittest.TestCase):
         self.assertTrue(torch.allclose(weight.tensor[0], torch.full_like(weight.tensor[0], 1)))
         self.assertTrue(torch.allclose(weight.tensor[1], torch.full_like(weight.tensor[1], 2)))
 
+    def test_moe_weight_tail_borrow_roundtrip_with_sub_granularity_rows(self):
+        weight = ExpandableVmmTensor(
+            reserve_shape=(4, 2048, 768),
+            dtype=torch.float16,
+            active_rows=4,
+            label="test_tail_borrow_sub_granularity",
+            wrap_full_tensor=True,
+        )
+        for idx in range(4):
+            weight.tensor[idx].fill_(idx + 1)
+        torch.cuda.synchronize()
+
+        donor = weight.borrow_tail_rows(2, owner={"kind": "expert_tail", "idx": 2})
+        self.assertEqual(weight.active_rows, 2)
+        self.assertTrue(torch.allclose(weight.tensor[0], torch.full_like(weight.tensor[0], 1)))
+        self.assertTrue(torch.allclose(weight.tensor[1], torch.full_like(weight.tensor[1], 2)))
+
+        donor.restore_to_source()
+        weight.sync_from_region()
+        self.assertEqual(weight.active_rows, 4)
+        self.assertTrue(torch.allclose(weight.tensor[2], torch.full_like(weight.tensor[2], 3)))
+        self.assertTrue(torch.allclose(weight.tensor[3], torch.full_like(weight.tensor[3], 4)))
+
     def test_mha_kv_pool_vmm_expand_and_shrink(self):
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_EXPERIMENTAL_CUDA_VMM.override(True))

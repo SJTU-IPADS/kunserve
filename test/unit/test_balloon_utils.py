@@ -5,6 +5,7 @@ import torch
 from sglang.srt.model_executor.balloon_utils import (
     build_dispatcher_local_expert_mapping,
     resolve_balloon_kv_slots_to_expand,
+    resolve_balloon_kv_slots_to_whole_donor_segments,
     slice_rank_local_logical_expert_ids,
 )
 
@@ -79,6 +80,52 @@ class TestResolveBalloonKvSlotsToExpand(unittest.TestCase):
                 kv_vmm_headroom_slots=1024,
                 num_slots_to_expand=2048,
             )
+
+
+class TestResolveBalloonKvSlotsToWholeDonorSegments(unittest.TestCase):
+    def test_keeps_requested_slots_when_each_allocation_consumes_whole_donors(self):
+        self.assertEqual(
+            resolve_balloon_kv_slots_to_whole_donor_segments(
+                requested_slots=12,
+                donor_segment_sizes=[6, 6, 6, 6],
+                allocation_row_bytes=[1, 1],
+                page_size=1,
+            ),
+            12,
+        )
+
+    def test_rounds_down_when_requested_slots_would_force_donor_split(self):
+        self.assertEqual(
+            resolve_balloon_kv_slots_to_whole_donor_segments(
+                requested_slots=16,
+                donor_segment_sizes=[6, 6, 6, 6, 6, 6, 6, 6],
+                allocation_row_bytes=[1, 1],
+                page_size=1,
+            ),
+            12,
+        )
+
+    def test_respects_page_size_while_rounding_down(self):
+        self.assertEqual(
+            resolve_balloon_kv_slots_to_whole_donor_segments(
+                requested_slots=18,
+                donor_segment_sizes=[6, 6, 6, 6, 6, 6, 6, 6],
+                allocation_row_bytes=[1, 1],
+                page_size=4,
+            ),
+            12,
+        )
+
+    def test_checks_cumulative_donor_boundaries_across_allocations(self):
+        self.assertEqual(
+            resolve_balloon_kv_slots_to_whole_donor_segments(
+                requested_slots=12,
+                donor_segment_sizes=[6, 6, 6],
+                allocation_row_bytes=[1, 1],
+                page_size=1,
+            ),
+            6,
+        )
 
 
 if __name__ == "__main__":
