@@ -2,7 +2,7 @@
 
 This repository hosts **KunServe** (Python orchestration, Ray, scheduling experiments) and **FlashTransformer** (high-performance dense Transformer inference kernels and model execution in C++/CUDA), used together for **LLM serving research and reproducible evaluation**.
 
-## Disclaimer (read first)
+## Disclaimer
 
 - **Academic and evaluation focus.** The stack is intended for **research, benchmarking, and prototyping**, not as a drop-in replacement for commercial managed inference. Operability, security hardening, and long-term API stability are not goals of this release on their own.
 
@@ -47,6 +47,26 @@ Planned directions (non-binding; order and timing may change):
 - **CUDA graphs for efficient decoding** — capture and replay steady-state decode for lower launch overhead where the graph constraints are acceptable.
 - **Extend KunServe to RL rollout** — reuse orchestration, batching, and tracing for rollout-heavy RL training loops, not only static serving benchmarks.
 
+## Acknowledgement
+
+During the development, KunServe learns and borrows modules from these projects:
+- DistServe & SwiftTransformer
+- Llumnix
+- vLLM
+- FlashInfer
+
 ## Citation
 
-If this codebase helps your research, please cite the publications that match the components you build on (for example, the **DistServe** paper if you compare against or extend disaggregated prefill/decode serving), **vLLM**, **FlashAttention**, **FlashInfer**, **Llumnix**, and your own work as appropriate.
+If this codebase helps your research, please kindly cite our paperusing the following bib, thanks!
+
+```bib
+@inproceedings{kunserve-eurosys26,
+  author       = {Rongxin Cheng and Yuxin Lai and Xingda Wei and Rong Chen and Haibo Chen},
+  title        = {KUNSERVE: Parameter-centric Memory Management for Efficient Memory Overloading Handling in LLM Serving},
+  booktitle    = {Proceedings of the 21st European Conference on Computer Systems,
+                  EuroSys 2026, Edinburgh, Scotland Uk, April 27--30, 2026},
+  publisher    = {{ACM}},
+  year         = {2026},
+  doi          = {10.1145/3767295.3769348},
+}
+```
