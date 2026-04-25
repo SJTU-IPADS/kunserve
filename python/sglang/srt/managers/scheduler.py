@@ -84,6 +84,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
+    CommitBalloonReqInput,
+    CommitBalloonReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -99,6 +101,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
+    GetBalloonStatusReqInput,
+    GetBalloonStatusReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
@@ -116,7 +120,11 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
+    PrepareBalloonReqInput,
+    PrepareBalloonReqOutput,
     ReleaseMemoryOccupationReqInput,
+    RestoreFromBalloonReqInput,
+    RestoreFromBalloonReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -126,6 +134,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    SyncKVCapacityReqInput,
+    SyncKVCapacityReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -768,6 +778,10 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+        self.expand_requested = False
+        self.expand_request_reason: Optional[str] = None
+        self.balloon_keepalive_step_ct: int = 0
+        self._balloon_keepalive_active = False
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1080,6 +1094,11 @@ class Scheduler(
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
+                (GetBalloonStatusReqInput, self.get_balloon_status),
+                (PrepareBalloonReqInput, self.prepare_balloon),
+                (CommitBalloonReqInput, self.commit_balloon),
+                (RestoreFromBalloonReqInput, self.restore_from_balloon),
+                (SyncKVCapacityReqInput, self.sync_kv_capacity),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -1126,6 +1145,10 @@ class Scheduler(
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
+            if batch is None:
+                batch = self._maybe_get_balloon_keepalive_batch()
+            else:
+                self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
 
             # Launch the current batch
@@ -1162,6 +1185,8 @@ class Scheduler(
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
+            if batch is not None:
+                self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1182,8 +1207,15 @@ class Scheduler(
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                keepalive_batch = self._maybe_get_balloon_keepalive_batch()
+                if keepalive_batch is not None:
+                    batch = keepalive_batch
+                    self.cur_batch = batch
+                    batch_result = self.run_batch(batch)
+                    self.result_queue.append((batch.copy(), batch_result))
+                else:
+                    # When the server is idle, do self-check and re-init some states
+                    self.self_check_during_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2282,6 +2314,21 @@ class Scheduler(
                 if kv_full_retract_flag
                 else "Testing retraction. "
             )
+            if kv_full_retract_flag:
+                prev_expand_requested = self.expand_requested
+                self.expand_requested = True
+                self.expand_request_reason = "retract_decode"
+                logger.info(
+                    "[KunServeScheduler] expand requested by retract_decode: "
+                    "prev_expand=%s available_tokens=%d gained_tokens=%d "
+                    "running=%d waiting=%d max_total_num_tokens=%d",
+                    prev_expand_requested,
+                    new_available_tokens,
+                    new_token_gained,
+                    len(batch.reqs),
+                    len(self.waiting_queue),
+                    int(self.max_total_num_tokens),
+                )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
             if kv_full_retract_flag:
                 msg_details += (
@@ -2805,6 +2852,47 @@ class Scheduler(
             )
         return no_request
 
+    def _stop_balloon_keepalive(self, reason: str) -> None:
+        if self._balloon_keepalive_active:
+            logger.info(
+                "[KunServeScheduler] stop balloon keepalive: reason=%s steps=%d",
+                reason,
+                self.balloon_keepalive_step_ct,
+            )
+            self._balloon_keepalive_active = False
+
+    def _maybe_get_balloon_keepalive_batch(self) -> Optional[ScheduleBatch]:
+        try:
+            local_status = self.tp_worker.get_balloon_status(GetBalloonStatusReqInput())
+        except Exception:
+            self._stop_balloon_keepalive("balloon status query failed")
+            logger.exception(
+                "[KunServeScheduler] failed to query balloon status before keepalive"
+            )
+            return None
+
+        if str(local_status.get("state")) != "balloon":
+            self._stop_balloon_keepalive("runtime is not balloon")
+            return None
+
+        self.balloon_keepalive_step_ct += 1
+        if not self._balloon_keepalive_active:
+            logger.warning(
+                "[KunServeScheduler] start balloon keepalive: variant=%s offloaded=%s added_slots=%s",
+                local_status.get("runtime_variant"),
+                local_status.get("offloaded_local_experts"),
+                local_status.get("added_kv_slots"),
+            )
+            self._balloon_keepalive_active = True
+        elif self.balloon_keepalive_step_ct % 128 == 0:
+            logger.info(
+                "[KunServeScheduler] balloon keepalive progress: steps=%d variant=%s",
+                self.balloon_keepalive_step_ct,
+                local_status.get("runtime_variant"),
+            )
+
+        return self.get_idle_batch()
+
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if self._is_no_request():
@@ -2832,6 +2920,192 @@ class Scheduler(
             success = False
         return success
 
+    def _sync_runtime_capacity_cache(self, max_total_num_tokens: int) -> None:
+        self.max_total_num_tokens = int(max_total_num_tokens)
+        self.tp_worker.max_total_num_tokens = int(max_total_num_tokens)
+        if self.model_worker is not self.tp_worker and hasattr(
+            self.model_worker, "max_total_num_tokens"
+        ):
+            self.model_worker.max_total_num_tokens = int(max_total_num_tokens)
+
+    def _format_balloon_status(self, status: Dict[str, Any]) -> str:
+        if not status:
+            return "status=<empty>"
+        return (
+            "state={state} variant={variant} max_tokens={max_tokens} "
+            "offloaded={offloaded} added_slots={added_slots} expand={expand} "
+            "running={running} waiting={waiting}"
+        ).format(
+            state=status.get("state"),
+            variant=status.get("runtime_variant"),
+            max_tokens=status.get("max_total_num_tokens"),
+            offloaded=status.get("offloaded_local_experts"),
+            added_slots=status.get("added_kv_slots"),
+            expand=status.get("expand_requested"),
+            running=status.get("num_running_requests"),
+            waiting=status.get("num_waiting_requests"),
+        )
+
+    def get_balloon_status(self, recv_req: GetBalloonStatusReqInput):
+        status = self.tp_worker.get_balloon_status(recv_req)
+        status.update(
+            {
+                "expand_requested": bool(self.expand_requested),
+                "expand_request_reason": self.expand_request_reason,
+                "num_waiting_requests": len(self.waiting_queue),
+                "num_running_requests": len(self.running_batch.reqs),
+                "scheduler_max_total_num_tokens": int(self.max_total_num_tokens),
+                "balloon_keepalive_steps": int(self.balloon_keepalive_step_ct),
+                "balloon_keepalive_active": bool(self._balloon_keepalive_active),
+            }
+        )
+        return GetBalloonStatusReqOutput(status=status)
+
+    def prepare_balloon(self, recv_req: PrepareBalloonReqInput):
+        logger.info(
+            "[KunServeScheduler] prepare_balloon request: target=%s runtime_ep_size=%s "
+            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_graph=%s",
+            recv_req.target_variant,
+            recv_req.runtime_ep_size,
+            recv_req.runtime_rank_offset,
+            recv_req.dispatch_rank_offset,
+            recv_req.process_group_name,
+            recv_req.capture_cuda_graph,
+        )
+        try:
+            status = self.tp_worker.prepare_balloon(recv_req)
+            logger.info(
+                "[KunServeScheduler] prepare_balloon success: %s",
+                self._format_balloon_status(status),
+            )
+            return PrepareBalloonReqOutput(
+                success=True,
+                message="Prepared balloon runtime.",
+                status=status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[KunServeScheduler] prepare_balloon failed: target=%s process_group=%s",
+                recv_req.target_variant,
+                recv_req.process_group_name,
+            )
+            return PrepareBalloonReqOutput(
+                success=False,
+                message=str(exc),
+                status=self.get_balloon_status(GetBalloonStatusReqInput()).status,
+            )
+
+    def commit_balloon(self, recv_req: CommitBalloonReqInput):
+        logger.info(
+            "[KunServeScheduler] commit_balloon request: target=%s offload_local_experts=%s "
+            "num_slots_to_expand=%s require_prepared=%s",
+            recv_req.target_variant,
+            recv_req.offload_local_experts,
+            recv_req.num_slots_to_expand,
+            recv_req.require_prepared,
+        )
+        try:
+            status = self.tp_worker.commit_balloon(recv_req)
+            self._sync_runtime_capacity_cache(status["max_total_num_tokens"])
+            self.expand_requested = False
+            self.expand_request_reason = None
+            logger.info(
+                "[KunServeScheduler] commit_balloon success: %s",
+                self._format_balloon_status(status),
+            )
+            return CommitBalloonReqOutput(
+                success=True,
+                message="Committed balloon runtime.",
+                status=status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[KunServeScheduler] commit_balloon failed: target=%s offload_local_experts=%s",
+                recv_req.target_variant,
+                recv_req.offload_local_experts,
+            )
+            return CommitBalloonReqOutput(
+                success=False,
+                message=str(exc),
+                status=self.get_balloon_status(GetBalloonStatusReqInput()).status,
+            )
+
+    def restore_from_balloon(self, recv_req: RestoreFromBalloonReqInput):
+        logger.info(
+            "[KunServeScheduler] restore_from_balloon request: require_idle=%s "
+            "running=%d waiting=%d",
+            recv_req.require_idle,
+            len(self.running_batch.reqs),
+            len(self.waiting_queue),
+        )
+        if recv_req.require_idle and not self._is_no_request():
+            logger.warning(
+                "[KunServeScheduler] restore_from_balloon rejected because scheduler is not idle: "
+                "running=%d waiting=%d",
+                len(self.running_batch.reqs),
+                len(self.waiting_queue),
+            )
+            return RestoreFromBalloonReqOutput(
+                success=False,
+                message="restore_from_balloon requires the scheduler to be idle.",
+                status=self.get_balloon_status(GetBalloonStatusReqInput()).status,
+            )
+
+        try:
+            status = self.tp_worker.restore_from_balloon(recv_req)
+            self._sync_runtime_capacity_cache(status["max_total_num_tokens"])
+            self.expand_requested = False
+            self.expand_request_reason = None
+            logger.info(
+                "[KunServeScheduler] restore_from_balloon success: %s",
+                self._format_balloon_status(status),
+            )
+            return RestoreFromBalloonReqOutput(
+                success=True,
+                message="Restored from balloon runtime.",
+                status=status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[KunServeScheduler] restore_from_balloon failed: require_idle=%s",
+                recv_req.require_idle,
+            )
+            return RestoreFromBalloonReqOutput(
+                success=False,
+                message=str(exc),
+                status=self.get_balloon_status(GetBalloonStatusReqInput()).status,
+            )
+
+    def sync_kv_capacity(self, recv_req: SyncKVCapacityReqInput):
+        logger.info(
+            "[KunServeScheduler] sync_kv_capacity request: max_total_num_tokens=%s delta_slots=%s",
+            recv_req.max_total_num_tokens,
+            recv_req.delta_slots,
+        )
+        try:
+            status = self.tp_worker.sync_kv_capacity(recv_req)
+            self._sync_runtime_capacity_cache(status["max_total_num_tokens"])
+            logger.info(
+                "[KunServeScheduler] sync_kv_capacity success: %s",
+                self._format_balloon_status(status),
+            )
+            return SyncKVCapacityReqOutput(
+                success=True,
+                message="Synchronized KV capacity.",
+                status=status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[KunServeScheduler] sync_kv_capacity failed: max_total_num_tokens=%s delta_slots=%s",
+                recv_req.max_total_num_tokens,
+                recv_req.delta_slots,
+            )
+            return SyncKVCapacityReqOutput(
+                success=False,
+                message=str(exc),
+                status=self.get_balloon_status(GetBalloonStatusReqInput()).status,
+            )
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
@@ -2843,6 +3117,9 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        ret["balloon_status"] = self.get_balloon_status(
+            GetBalloonStatusReqInput()
+        ).status
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:

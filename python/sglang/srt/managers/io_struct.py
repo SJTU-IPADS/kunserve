@@ -1563,6 +1563,79 @@ class SetInternalStateReqOutput(BaseReq):
 
 
 @dataclass
+class GetBalloonStatusReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class GetBalloonStatusReqOutput(BaseReq):
+    status: Dict[str, Any]
+
+
+@dataclass
+class PrepareBalloonReqInput(BaseReq):
+    target_variant: str = "global"
+    runtime_ep_size: Optional[int] = None
+    moe_ep_rank: Optional[int] = None
+    dispatch_ep_rank: Optional[int] = None
+    runtime_rank_offset: Optional[int] = None
+    dispatch_rank_offset: Optional[int] = None
+    retained_local_experts: Optional[int] = None
+    active_local_expert_mapping: Optional[List[int]] = None
+    active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None
+    physical_to_logical_map: Optional[List[List[int]]] = None
+    process_group_name: Optional[str] = None
+    capture_cuda_graph: bool = True
+
+
+@dataclass
+class CommitBalloonReqInput(BaseReq):
+    target_variant: str = "global"
+    offload_local_experts: int = 0
+    num_slots_to_expand: Optional[int] = None
+    require_prepared: bool = True
+
+
+@dataclass
+class RestoreFromBalloonReqInput(BaseReq):
+    require_idle: bool = True
+
+
+@dataclass
+class SyncKVCapacityReqInput(BaseReq):
+    max_total_num_tokens: Optional[int] = None
+    delta_slots: int = 0
+
+
+@dataclass
+class PrepareBalloonReqOutput(BaseReq):
+    success: bool
+    message: str
+    status: Dict[str, Any]
+
+
+@dataclass
+class CommitBalloonReqOutput(BaseReq):
+    success: bool
+    message: str
+    status: Dict[str, Any]
+
+
+@dataclass
+class RestoreFromBalloonReqOutput(BaseReq):
+    success: bool
+    message: str
+    status: Dict[str, Any]
+
+
+@dataclass
+class SyncKVCapacityReqOutput(BaseReq):
+    success: bool
+    message: str
+    status: Dict[str, Any]
+
+
+@dataclass
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None

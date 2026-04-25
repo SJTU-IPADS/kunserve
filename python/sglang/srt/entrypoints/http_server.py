@@ -101,12 +101,14 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CommitBalloonReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetBalloonStatusReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -115,13 +117,16 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PrepareBalloonReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
+    RestoreFromBalloonReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    SyncKVCapacityReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -609,6 +614,11 @@ async def server_info():
     else:
         server_args["scheduler_info"] = scheduler_info
 
+    if internal_states:
+        token_capacity = internal_states[0].get("memory_usage", {}).get("token_capacity")
+        if token_capacity is not None:
+            server_args["max_total_num_tokens"] = token_capacity
+
     return {
         **server_args,
         "internal_states": internal_states,
@@ -633,6 +643,36 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+@app.get("/kunserve/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_balloon_status():
+    return await _global_state.tokenizer_manager.get_balloon_status()
+
+
+@app.api_route("/kunserve/prepare_balloon", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_balloon(obj: PrepareBalloonReqInput, request: Request):
+    return await _global_state.tokenizer_manager.prepare_balloon(obj)
+
+
+@app.api_route("/kunserve/commit_balloon", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def commit_balloon(obj: CommitBalloonReqInput, request: Request):
+    return await _global_state.tokenizer_manager.commit_balloon(obj)
+
+
+@app.api_route("/kunserve/restore_from_balloon", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def restore_from_balloon(obj: RestoreFromBalloonReqInput, request: Request):
+    return await _global_state.tokenizer_manager.restore_from_balloon(obj)
+
+
+@app.api_route("/kunserve/sync_kv_capacity", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def sync_kv_capacity(obj: SyncKVCapacityReqInput, request: Request):
+    return await _global_state.tokenizer_manager.sync_kv_capacity(obj)
 
 
 # Do not import `dumper.py` to avoid dependency

@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitBalloonReqOutput,
+    CommitBalloonReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -41,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetBalloonStatusReqInput,
+    GetBalloonStatusReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
@@ -59,11 +63,15 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PrepareBalloonReqOutput,
     ProfileReq,
     ProfileReqOutput,
+    PrepareBalloonReqInput,
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    RestoreFromBalloonReqOutput,
+    RestoreFromBalloonReqInput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -72,6 +80,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    SyncKVCapacityReqInput,
+    SyncKVCapacityReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -217,6 +227,21 @@ class TokenizerCommunicatorMixin:
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_balloon_status_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.prepare_balloon_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.commit_balloon_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.restore_from_balloon_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.sync_kv_capacity_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -311,6 +336,26 @@ class TokenizerCommunicatorMixin:
                 (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
+                ),
+                (
+                    GetBalloonStatusReqOutput,
+                    self.get_balloon_status_communicator.handle_recv,
+                ),
+                (
+                    PrepareBalloonReqOutput,
+                    self.prepare_balloon_communicator.handle_recv,
+                ),
+                (
+                    CommitBalloonReqOutput,
+                    self.commit_balloon_communicator.handle_recv,
+                ),
+                (
+                    RestoreFromBalloonReqOutput,
+                    self.restore_from_balloon_communicator.handle_recv,
+                ),
+                (
+                    SyncKVCapacityReqOutput,
+                    self.sync_kv_capacity_communicator.handle_recv,
                 ),
                 (
                     GetInternalStateReqOutput,
@@ -853,6 +898,38 @@ class TokenizerCommunicatorMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def get_balloon_status(self: TokenizerManager) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        req = GetBalloonStatusReqInput()
+        responses: List[GetBalloonStatusReqOutput] = (
+            await self.get_balloon_status_communicator(req)
+        )
+        return [res.status for res in responses]
+
+    async def prepare_balloon(
+        self: TokenizerManager, obj: PrepareBalloonReqInput
+    ) -> List[PrepareBalloonReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.prepare_balloon_communicator(obj)
+
+    async def commit_balloon(
+        self: TokenizerManager, obj: CommitBalloonReqInput
+    ) -> List[CommitBalloonReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.commit_balloon_communicator(obj)
+
+    async def restore_from_balloon(
+        self: TokenizerManager, obj: RestoreFromBalloonReqInput
+    ) -> List[RestoreFromBalloonReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.restore_from_balloon_communicator(obj)
+
+    async def sync_kv_capacity(
+        self: TokenizerManager, obj: SyncKVCapacityReqInput
+    ) -> List[SyncKVCapacityReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.sync_kv_capacity_communicator(obj)
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()

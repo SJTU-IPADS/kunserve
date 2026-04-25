@@ -133,12 +133,44 @@ class DeepEPDispatchMode(IntEnum):
     LOW_LATENCY = auto()
 
 
+@dataclass
+class _DeepEPBufferEntry:
+    buffer: Buffer
+    hidden_size: int
+    param_bytes: int
+    num_max_dispatch_tokens_per_rank: int
+    num_experts: int
+
+
 class DeepEPBuffer:
-    _buffer = None
-    _dispatch_mode: Optional[DeepEPDispatchMode] = None
-    _hidden_size: Optional[int] = None
-    _num_max_dispatch_tokens_per_rank: Optional[int] = None
-    _num_experts: Optional[int] = None
+    _buffer_cache: dict[int, dict[DeepEPDispatchMode, _DeepEPBufferEntry]] = {}
+    _dispatch_mode_by_group: dict[int, DeepEPDispatchMode] = {}
+    _default_dispatch_mode: Optional[DeepEPDispatchMode] = None
+
+    @staticmethod
+    def _group_key(group: dist.ProcessGroup) -> int:
+        return id(group)
+
+    @classmethod
+    def _resolve_dispatch_mode(
+        cls,
+        group: dist.ProcessGroup,
+        deepep_mode: DeepEPMode,
+        dispatch_mode: Optional[DeepEPDispatchMode],
+    ) -> DeepEPDispatchMode:
+        if dispatch_mode is not None:
+            return dispatch_mode
+        if deepep_mode == DeepEPMode.NORMAL:
+            return DeepEPDispatchMode.NORMAL
+        if deepep_mode == DeepEPMode.LOW_LATENCY:
+            return DeepEPDispatchMode.LOW_LATENCY
+        if deepep_mode == DeepEPMode.AUTO:
+            group_key = cls._group_key(group)
+            return cls._dispatch_mode_by_group.get(
+                group_key,
+                cls._default_dispatch_mode or DeepEPDispatchMode.NORMAL,
+            )
+        raise NotImplementedError(f"Unsupported DeepEP mode: {deepep_mode}")
 
     @classmethod
     def get_deepep_buffer(
@@ -149,16 +181,45 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        dispatch_mode: Optional[DeepEPDispatchMode] = None,
     ):
-        if cls._buffer is not None:
-            return cls._buffer
+        resolved_dispatch_mode = cls._resolve_dispatch_mode(
+            group=group,
+            deepep_mode=deepep_mode,
+            dispatch_mode=dispatch_mode,
+        )
+        group_key = cls._group_key(group)
+        cls._dispatch_mode_by_group[group_key] = resolved_dispatch_mode
+        group_cache = cls._buffer_cache.setdefault(group_key, {})
+        entry = group_cache.get(resolved_dispatch_mode)
+        if entry is not None:
+            if entry.hidden_size != hidden_size or entry.param_bytes != param_bytes:
+                raise RuntimeError(
+                    "DeepEPBuffer cache was initialized with a different hidden_size or param_bytes "
+                    f"for group {group_key} and mode {resolved_dispatch_mode}."
+                )
+            if (
+                resolved_dispatch_mode == DeepEPDispatchMode.LOW_LATENCY
+                and (
+                    entry.num_max_dispatch_tokens_per_rank
+                    != num_max_dispatch_tokens_per_rank
+                    or entry.num_experts != num_experts
+                )
+            ):
+                raise RuntimeError(
+                    "DeepEPBuffer low-latency cache was initialized with different token/expert settings "
+                    f"for group {group_key}."
+                )
+            return entry.buffer
 
-        cls._hidden_size = hidden_size
-        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        cls._num_experts = num_experts
+        resolved_deepep_mode = (
+            DeepEPMode.NORMAL
+            if resolved_dispatch_mode == DeepEPDispatchMode.NORMAL
+            else DeepEPMode.LOW_LATENCY
+        )
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
-        if deepep_mode.enable_normal():
+        if resolved_deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
@@ -174,7 +235,7 @@ class DeepEPBuffer:
                     config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
                 )
-        if deepep_mode.enable_low_latency():
+        if resolved_deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
@@ -188,18 +249,12 @@ class DeepEPBuffer:
             )
 
         # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
-        if deepep_mode == DeepEPMode.NORMAL:
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms
-        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
-        elif deepep_mode == DeepEPMode.AUTO:
-            # low-latency and normal mode all need run
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
-            num_qps_per_rank = max(
-                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
-            )
         else:
             raise NotImplementedError
 
@@ -208,7 +263,7 @@ class DeepEPBuffer:
                 device="cuda"
             ).multi_processor_count
             if (
-                (deepep_mode != DeepEPMode.LOW_LATENCY)
+                (resolved_deepep_mode != DeepEPMode.LOW_LATENCY)
                 and not is_tbo_enabled()
                 and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
             ):
@@ -218,43 +273,79 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        cls._buffer = Buffer(
+        buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
-            low_latency_mode=deepep_mode.enable_low_latency(),
+            low_latency_mode=resolved_deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
         )
-        return cls._buffer
+        group_cache[resolved_dispatch_mode] = _DeepEPBufferEntry(
+            buffer=buffer,
+            hidden_size=hidden_size,
+            param_bytes=param_bytes,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            num_experts=num_experts,
+        )
+        return buffer
 
     @classmethod
-    def clean_buffer(cls):
-        if not cls._buffer.low_latency_mode:
+    def clean_buffer(
+        cls,
+        group: Optional[dist.ProcessGroup] = None,
+        dispatch_mode: Optional[DeepEPDispatchMode] = None,
+    ):
+        if group is None:
             return
-        cls._buffer.clean_low_latency_buffer(
-            cls._num_max_dispatch_tokens_per_rank,
-            cls._hidden_size,
-            cls._num_experts,
+        group_key = cls._group_key(group)
+        resolved_dispatch_mode = dispatch_mode or cls._dispatch_mode_by_group.get(
+            group_key
+        )
+        if resolved_dispatch_mode != DeepEPDispatchMode.LOW_LATENCY:
+            return
+        entry = cls._buffer_cache.get(group_key, {}).get(resolved_dispatch_mode)
+        if entry is None or not entry.buffer.low_latency_mode:
+            return
+        entry.buffer.clean_low_latency_buffer(
+            entry.num_max_dispatch_tokens_per_rank,
+            entry.hidden_size,
+            entry.num_experts,
         )
 
     @classmethod
-    def set_dispatch_mode_as_normal(cls):
-        cls._dispatch_mode = DeepEPDispatchMode.NORMAL
+    def set_dispatch_mode_as_normal(cls, group: Optional[dist.ProcessGroup] = None):
+        if group is None:
+            cls._default_dispatch_mode = DeepEPDispatchMode.NORMAL
+            return
+        cls._dispatch_mode_by_group[cls._group_key(group)] = DeepEPDispatchMode.NORMAL
 
     @classmethod
-    def set_dispatch_mode_as_low_latency(cls):
-        if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
-            cls.clean_buffer()
-        cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+    def set_dispatch_mode_as_low_latency(
+        cls, group: Optional[dist.ProcessGroup] = None
+    ):
+        if group is None:
+            cls._default_dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+            return
+        cls._dispatch_mode_by_group[cls._group_key(group)] = (
+            DeepEPDispatchMode.LOW_LATENCY
+        )
 
     @classmethod
-    def set_dispatch_mode(cls, mode: DeepEPMode):
-        if mode.is_low_latency():
-            cls.set_dispatch_mode_as_low_latency()
-        elif mode.is_normal():
-            cls.set_dispatch_mode_as_normal()
+    def set_dispatch_mode(
+        cls,
+        mode: Union[DeepEPMode, DeepEPDispatchMode],
+        group: Optional[dist.ProcessGroup] = None,
+    ):
+        if mode == DeepEPDispatchMode.LOW_LATENCY or (
+            isinstance(mode, DeepEPMode) and mode.is_low_latency()
+        ):
+            cls.set_dispatch_mode_as_low_latency(group=group)
+        elif mode == DeepEPDispatchMode.NORMAL or (
+            isinstance(mode, DeepEPMode) and mode.is_normal()
+        ):
+            cls.set_dispatch_mode_as_normal(group=group)
         else:
             raise Exception("unsupported mode")
 
@@ -519,7 +610,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_normal()
+        DeepEPBuffer.set_dispatch_mode_as_normal(group=self.group)
 
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
@@ -528,6 +619,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            dispatch_mode=DeepEPDispatchMode.NORMAL,
         )
 
 
@@ -709,7 +801,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        DeepEPBuffer.set_dispatch_mode_as_low_latency(group=self.group)
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
@@ -717,6 +809,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            dispatch_mode=DeepEPDispatchMode.LOW_LATENCY,
         )
 
 

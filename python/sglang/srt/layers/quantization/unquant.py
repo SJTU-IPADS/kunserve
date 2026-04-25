@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -27,12 +29,18 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_cuda,
     is_hip,
     is_npu,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
     use_intel_xpu_backend,
+)
+from sglang.srt.utils.cuda_vmm import (
+    ExpandableVmmTensor,
+    MoeWeightDonorManager,
+    cuda_vmm_available,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +68,55 @@ try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+
+logger = logging.getLogger(__name__)
+_MOE_VMM_SKIP_REASONS: set[str] = set()
+
+
+def _log_moe_vmm_skip_once(message: str) -> None:
+    if message in _MOE_VMM_SKIP_REASONS:
+        return
+    _MOE_VMM_SKIP_REASONS.add(message)
+    logger.warning(message)
+
+
+def _get_default_device_type() -> str:
+    try:
+        return torch.device(torch.get_default_device()).type
+    except Exception:
+        return "cpu"
+
+
+def _should_enable_moe_weight_vmm(
+    method: "UnquantizedFusedMoEMethod",
+) -> bool:
+    if not (
+        envs.SGLANG_EXPERIMENTAL_CUDA_VMM.get()
+        and envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get()
+    ):
+        return False
+    if not is_cuda() or _get_default_device_type() != "cuda":
+        _log_moe_vmm_skip_once(
+            "Skipping experimental MoE VMM weights because the current default device is not CUDA."
+        )
+        return False
+    if _use_aiter and get_moe_runner_backend().is_auto():
+        _log_moe_vmm_skip_once(
+            "Skipping experimental MoE VMM weights because the aiter post-load shuffle replaces the parameter tensors."
+        )
+        return False
+    if method.use_flashinfer_trtllm_moe:
+        _log_moe_vmm_skip_once(
+            "Skipping experimental MoE VMM weights because flashinfer TRT-LLM MoE reshapes expert weights after loading."
+        )
+        return False
+    if not cuda_vmm_available():
+        _log_moe_vmm_skip_once(
+            "Skipping experimental MoE VMM weights because CUDA VMM support is unavailable."
+        )
+        return False
+    return True
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -176,6 +233,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         **extra_weight_attrs,
     ):
         self.with_bias = with_bias
+        use_vmm_weights = _should_enable_moe_weight_vmm(self)
+        layer._sglang_moe_weight_vmm_allocations = {}
+        layer._sglang_moe_weight_donor_manager = None
 
         # Fused gate_up_proj (column parallel)
         w13_up_dim = (
@@ -186,10 +246,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
-        w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if use_vmm_weights:
+            w13_allocation = ExpandableVmmTensor(
+                reserve_shape=(num_experts, w13_weight_n, w13_weight_k),
+                dtype=params_dtype,
+                active_rows=num_experts,
+                label=f"moe_layer_{getattr(layer, 'layer_id', -1)}_w13_weight",
+                wrap_full_tensor=True,
+            )
+            w13_weight = torch.nn.Parameter(
+                w13_allocation.tensor,
+                requires_grad=False,
+            )
+            layer._sglang_moe_weight_vmm_allocations["w13_weight"] = w13_allocation
+        else:
+            w13_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    w13_weight_n,
+                    w13_weight_k,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -208,10 +287,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
-        w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if use_vmm_weights:
+            w2_allocation = ExpandableVmmTensor(
+                reserve_shape=(num_experts, w2_weight_n, w2_weight_k),
+                dtype=params_dtype,
+                active_rows=num_experts,
+                label=f"moe_layer_{getattr(layer, 'layer_id', -1)}_w2_weight",
+                wrap_full_tensor=True,
+            )
+            w2_weight = torch.nn.Parameter(
+                w2_allocation.tensor,
+                requires_grad=False,
+            )
+            layer._sglang_moe_weight_vmm_allocations["w2_weight"] = w2_allocation
+        else:
+            w2_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    w2_weight_n,
+                    w2_weight_k,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -222,6 +320,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+
+        if layer._sglang_moe_weight_vmm_allocations:
+            layer._sglang_moe_weight_donor_manager = MoeWeightDonorManager(
+                layer_id=getattr(layer, "layer_id", -1),
+                allocations=layer._sglang_moe_weight_vmm_allocations,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Skip aiter weight shuffle when using non-auto MoE backend (e.g., triton, triton_kernels)
@@ -329,6 +433,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         self.runner = MoeRunner(backend, moe_runner_config)
 
+    @staticmethod
+    def _get_runtime_tensor(layer: torch.nn.Module, name: str) -> torch.Tensor:
+        if hasattr(layer, "get_runtime_tensor"):
+            return layer.get_runtime_tensor(name)
+        return getattr(layer, name)
+
+    @staticmethod
+    def _get_runtime_bias(
+        layer: torch.nn.Module, name: str
+    ) -> Optional[torch.Tensor]:
+        if hasattr(layer, "get_runtime_bias"):
+            return layer.get_runtime_bias(name)
+        return getattr(layer, name, None)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
@@ -355,6 +473,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
+        runtime_w13_weight = self._get_runtime_tensor(layer, "w13_weight")
+        runtime_w2_weight = self._get_runtime_tensor(layer, "w2_weight")
+        runtime_w13_bias = self._get_runtime_bias(layer, "w13_weight_bias")
+        runtime_w2_bias = self._get_runtime_bias(layer, "w2_weight_bias")
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
@@ -363,10 +485,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
 
             quant_info = TritonKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
+                w13_weight=runtime_w13_weight,
+                w2_weight=runtime_w2_weight,
+                w13_bias=runtime_w13_bias,
+                w2_bias=runtime_w2_bias,
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
@@ -374,8 +496,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
                 token_final_scales=topk_output.topk_weights,
-                fc1_expert_weights=layer.w13_weight,
-                fc2_expert_weights=layer.w2_weight,
+                fc1_expert_weights=runtime_w13_weight,
+                fc2_expert_weights=runtime_w2_weight,
                 output_dtype=x.dtype,
                 quant_scales=None,
                 ep_size=layer.moe_ep_size,
@@ -406,8 +528,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     )  # topk_weights must be FP32 (float32)
                 output = fused_moe(
                     x,
-                    layer.w13_weight,
-                    layer.w2_weight,
+                    runtime_w13_weight,
+                    runtime_w2_weight,
                     topk_weights,
                     topk_ids,
                     activation=(
@@ -420,10 +542,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 return StandardCombineInput(hidden_states=output)
             else:
                 quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    b13=getattr(layer, "w13_weight_bias", None),
-                    b2=getattr(layer, "w2_weight_bias", None),
+                    w13_weight=runtime_w13_weight,
+                    w2_weight=runtime_w2_weight,
+                    b13=runtime_w13_bias,
+                    b2=runtime_w2_bias,
                 )
                 return self.runner.run(dispatch_output, quant_info)
 
@@ -442,6 +564,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         assert (
             moe_runner_config.activation == "silu"
         ), f"activation = {moe_runner_config.activation} is not supported."
+        runtime_w13_weight = self._get_runtime_tensor(layer, "w13_weight")
+        runtime_w2_weight = self._get_runtime_tensor(layer, "w2_weight")
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -452,8 +576,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             output = torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                runtime_w13_weight,
+                runtime_w2_weight,
                 topk_weights,
                 topk_ids,
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
@@ -492,6 +616,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             "silu",
             "gelu",
         ], f"activation = {moe_runner_config.activation} is not supported."
+        runtime_w13_weight = self._get_runtime_tensor(layer, "w13_weight")
+        runtime_w2_weight = self._get_runtime_tensor(layer, "w2_weight")
+        runtime_w13_bias = self._get_runtime_bias(layer, "w13_weight_bias")
+        runtime_w2_bias = self._get_runtime_bias(layer, "w2_weight_bias")
 
         backend = self.runner.runner_backend
         if use_intel_xpu_backend():
@@ -501,12 +629,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             topk_weights, topk_ids, _ = topk_output
             output = fused_experts(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                runtime_w13_weight,
+                runtime_w2_weight,
                 topk_weights,
                 topk_ids,
-                b1=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
+                b1=runtime_w13_bias,
+                b2=runtime_w2_bias,
                 activation=moe_runner_config.activation,
             )
             return StandardCombineInput(hidden_states=output)
@@ -518,10 +646,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
 
             quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
+                w13_weight=runtime_w13_weight,
+                w2_weight=runtime_w2_weight,
+                b13=runtime_w13_bias,
+                b2=runtime_w2_bias,
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -543,6 +671,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
         top_k = layer.top_k
+        runtime_w13_weight = self._get_runtime_tensor(layer, "w13_weight")
+        runtime_w2_weight = self._get_runtime_tensor(layer, "w2_weight")
+        runtime_w13_bias = self._get_runtime_bias(layer, "w13_weight_bias")
+        runtime_w2_bias = self._get_runtime_bias(layer, "w2_weight_bias")
         row_idx_len = num_tokens * top_k
         row_idx = (
             torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
@@ -562,13 +694,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
 
         expert_tokens = expert_tokens.to(torch.int64)
-        w13_bias = [layer.w13_weight_bias] if self.with_bias else None
-        w2_bias = [layer.w2_weight_bias] if self.with_bias else None
+        w13_bias = [runtime_w13_bias] if self.with_bias else None
+        w2_bias = [runtime_w2_bias] if self.with_bias else None
 
         # gmm1: gate_up_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[layer.w13_weight],
+            weight=[runtime_w13_weight],
             bias=w13_bias,
             split_item=2,
             group_list_type=0,
@@ -592,7 +724,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[layer.w2_weight],
+            weight=[runtime_w2_weight],
             bias=w2_bias,
             split_item=2,
             group_list_type=0,

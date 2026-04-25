@@ -441,6 +441,10 @@ class Envs:
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+    SGLANG_EXPERIMENTAL_CUDA_VMM = EnvBool(False)
+    SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS = EnvBool(False)
+    SGLANG_EXPERIMENTAL_VMM_KV_CACHE = EnvBool(False)
+    SGLANG_EXPERIMENTAL_VMM_KV_RESERVE_SLOTS = EnvInt(0)
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)

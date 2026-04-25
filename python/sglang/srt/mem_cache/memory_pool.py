@@ -60,6 +60,12 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.cuda_vmm import (
+    DonorLedger,
+    DonorSegment,
+    ExpandableVmmTensor,
+    cuda_vmm_available,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -799,6 +805,65 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        self._kv_vmm_enabled = False
+        self._kv_active_rows = self.size + self.page_size
+        self._kv_reserve_rows = self._kv_active_rows
+        self._k_vmm_allocations: list[ExpandableVmmTensor] = []
+        self._v_vmm_allocations: list[ExpandableVmmTensor] = []
+
+        use_vmm = (
+            envs.SGLANG_EXPERIMENTAL_CUDA_VMM.get()
+            and envs.SGLANG_EXPERIMENTAL_VMM_KV_CACHE.get()
+            and _is_cuda
+            and torch.device(self.device).type == "cuda"
+        )
+        if use_vmm and cuda_vmm_available():
+            reserve_slots = max(
+                0, int(envs.SGLANG_EXPERIMENTAL_VMM_KV_RESERVE_SLOTS.get() or 0)
+            )
+            if self.page_size > 1 and reserve_slots % self.page_size != 0:
+                aligned_reserve_slots = (
+                    (reserve_slots + self.page_size - 1) // self.page_size
+                ) * self.page_size
+                logger.warning(
+                    "Aligning experimental KV VMM reserve slots from %s to %s for page_size=%s.",
+                    reserve_slots,
+                    aligned_reserve_slots,
+                    self.page_size,
+                )
+                reserve_slots = aligned_reserve_slots
+            self._kv_reserve_rows = self._kv_active_rows + reserve_slots
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                for layer_idx in range(self.layer_num):
+                    self._k_vmm_allocations.append(
+                        ExpandableVmmTensor(
+                            reserve_shape=(
+                                self._kv_reserve_rows,
+                                self.head_num,
+                                self.head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            active_rows=self._kv_active_rows,
+                            label=f"mha_k_layer_{self.start_layer + layer_idx}",
+                        )
+                    )
+                    self._v_vmm_allocations.append(
+                        ExpandableVmmTensor(
+                            reserve_shape=(
+                                self._kv_reserve_rows,
+                                self.head_num,
+                                self.v_head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            active_rows=self._kv_active_rows,
+                            label=f"mha_v_layer_{self.start_layer + layer_idx}",
+                        )
+                    )
+            self._kv_vmm_enabled = True
+            self._refresh_vmm_active_buffers()
+            self._refresh_buffer_metadata()
+            return
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -823,7 +888,17 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+        self._refresh_buffer_metadata()
 
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        if hasattr(self, "_k_vmm_allocations"):
+            del self._k_vmm_allocations
+        if hasattr(self, "_v_vmm_allocations"):
+            del self._v_vmm_allocations
+
+    def _refresh_buffer_metadata(self):
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -843,9 +918,94 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
 
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
+    def _refresh_vmm_active_buffers(self):
+        self.k_buffer = [allocation.active_view for allocation in self._k_vmm_allocations]
+        self.v_buffer = [allocation.active_view for allocation in self._v_vmm_allocations]
+
+    def _refresh_mem_usage_metric(self):
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
+    def expand_by_slots(
+        self,
+        num_slots: int,
+        donor_segments: Optional[List[DonorSegment]] = None,
+    ) -> None:
+        if not self._kv_vmm_enabled:
+            raise RuntimeError("KV cache expansion requires the experimental VMM path.")
+        num_slots = int(num_slots)
+        if num_slots < 0:
+            raise ValueError(f"num_slots must be non-negative, got {num_slots}")
+        if num_slots == 0:
+            return
+        if self.page_size > 1 and num_slots % self.page_size != 0:
+            raise ValueError(
+                f"num_slots={num_slots} must be page-aligned for page_size={self.page_size}"
+            )
+        max_size = self._kv_reserve_rows - self.page_size
+        target_size = self.size + num_slots
+        if target_size > max_size:
+            raise ValueError(
+                f"Cannot expand KV cache to {target_size} slots; VMM reserve only supports up to {max_size}"
+            )
+
+        target_rows = target_size + self.page_size
+        if donor_segments is None:
+            remaining_donors: list[DonorSegment] = []
+        elif isinstance(donor_segments, list):
+            remaining_donors = donor_segments
+        else:
+            remaining_donors = list(donor_segments)
+        expanded_allocations: list[tuple[ExpandableVmmTensor, int]] = []
+        try:
+            for allocation in self._k_vmm_allocations + self._v_vmm_allocations:
+                previous_rows = allocation.active_rows
+                allocation.ensure_active_rows(
+                    target_rows,
+                    donor_segments=remaining_donors,
+                )
+                expanded_allocations.append((allocation, previous_rows))
+        except Exception:
+            for allocation, previous_rows in reversed(expanded_allocations):
+                rollback_segments = allocation.ensure_active_rows(previous_rows)
+                for segment in rollback_segments:
+                    if segment.source_region is not allocation.region:
+                        segment.restore_to_source()
+            raise
+
+        self.size = target_size
+        self._kv_active_rows = target_rows
+        self._refresh_vmm_active_buffers()
+        self._refresh_mem_usage_metric()
+
+    def shrink_tail(self, num_slots: int) -> DonorLedger:
+        if not self._kv_vmm_enabled:
+            raise RuntimeError("KV cache shrink requires the experimental VMM path.")
+        num_slots = int(num_slots)
+        if num_slots < 0:
+            raise ValueError(f"num_slots must be non-negative, got {num_slots}")
+        if num_slots == 0:
+            return DonorLedger(label="mha_kv_shrink")
+        if self.page_size > 1 and num_slots % self.page_size != 0:
+            raise ValueError(
+                f"num_slots={num_slots} must be page-aligned for page_size={self.page_size}"
+            )
+        if num_slots > self.size:
+            raise ValueError(
+                f"Cannot shrink {num_slots} slots from KV cache size {self.size}"
+            )
+
+        target_size = self.size - num_slots
+        target_rows = target_size + self.page_size
+        returned = DonorLedger(label="mha_kv_shrink")
+        for allocation in self._k_vmm_allocations + self._v_vmm_allocations:
+            returned.extend(allocation.ensure_active_rows(target_rows))
+
+        self.size = target_size
+        self._kv_active_rows = target_rows
+        self._refresh_vmm_active_buffers()
+        self._refresh_mem_usage_metric()
+        return returned
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -857,6 +1017,18 @@ class MHATokenToKVPool(KVCache):
         for v_cache in self.v_buffer:
             v_size_bytes += get_tensor_size_bytes(v_cache)
         return k_size_bytes, v_size_bytes
+
+    def bytes_per_slot(self) -> int:
+        if self._kv_vmm_enabled:
+            return sum(
+                allocation.row_bytes
+                for allocation in self._k_vmm_allocations + self._v_vmm_allocations
+            )
+
+        return sum(
+            int(np.prod(buf.shape[1:])) * buf.dtype.itemsize
+            for buf in self.k_buffer + self.v_buffer
+        )
 
     # for disagg
     def get_contiguous_buf_infos(self):

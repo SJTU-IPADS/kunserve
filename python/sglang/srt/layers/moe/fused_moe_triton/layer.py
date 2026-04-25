@@ -1,8 +1,7 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
-
 import logging
+from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -92,13 +91,26 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 logger = logging.getLogger(__name__)
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
+def create_moe_dispatcher(
+    moe_runner_config: MoeRunnerConfig,
+    *,
+    group=None,
+    moe_ep_size: Optional[int] = None,
+    moe_ep_rank: Optional[int] = None,
+    local_expert_mapping: Optional[torch.Tensor] = None,
+) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
+    group = group or get_tp_group().device_group
     if a2a_backend.is_none():
-        return StandardDispatcher(moe_runner_config)
+        return StandardDispatcher(
+            moe_runner_config,
+            moe_ep_size=moe_ep_size,
+            moe_ep_rank=moe_ep_rank,
+            local_expert_mapping=local_expert_mapping,
+        )
     elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
-            group=get_tp_group().device_group,
+            group=group,
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
             num_experts=moe_runner_config.num_experts,
@@ -113,7 +125,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
 
         return NpuFuseEPDispatcher(
-            group=get_tp_group().device_group,
+            group=group,
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
             num_experts=moe_runner_config.num_experts,
@@ -136,7 +148,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
-            group=get_tp_group().device_group,
+            group=group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
@@ -151,6 +163,26 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
+
+
+class FusedMoERuntimeVariant(Enum):
+    LOCAL = "local"
+    GLOBAL = "global"
+
+
+@dataclass
+class FusedMoERuntimeBundle:
+    variant: FusedMoERuntimeVariant
+    moe_runner_config: MoeRunnerConfig
+    dispatcher: BaseDispatcher
+    runner: Optional[object]
+    moe_ep_size: int
+    moe_ep_rank: int
+    moe_tp_size: int
+    moe_tp_rank: int
+    num_local_experts: int
+    active_local_expert_mapping: Optional[torch.Tensor] = None
+    active_tensors: Optional[Dict[str, torch.Tensor]] = None
 
 
 class FusedMoE(torch.nn.Module):
@@ -321,6 +353,222 @@ class FusedMoE(torch.nn.Module):
 
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
+
+        self.runtime_variant = FusedMoERuntimeVariant.LOCAL
+        self.active_local_expert_mapping: Optional[torch.Tensor] = None
+        self._active_runtime_tensors: Dict[str, torch.Tensor] = {}
+        self._runtime_bundles: Dict[FusedMoERuntimeVariant, FusedMoERuntimeBundle] = {}
+        self.local_bundle = self.register_runtime_bundle(
+            variant=FusedMoERuntimeVariant.LOCAL,
+            moe_runner_config=self.moe_runner_config,
+            dispatcher=self.dispatcher,
+            runner=getattr(self, "runner", None),
+            moe_ep_size=self.moe_ep_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_tp_size=self.moe_tp_size,
+            moe_tp_rank=self.moe_tp_rank,
+            num_local_experts=self.num_local_experts,
+        )
+        self.global_bundle: Optional[FusedMoERuntimeBundle] = None
+        self.switch_runtime_bundle(FusedMoERuntimeVariant.LOCAL)
+
+    @staticmethod
+    def _normalize_runtime_variant(
+        variant: Union[FusedMoERuntimeVariant, str]
+    ) -> FusedMoERuntimeVariant:
+        if isinstance(variant, FusedMoERuntimeVariant):
+            return variant
+        return FusedMoERuntimeVariant(variant)
+
+    def _build_runner_for_runtime_bundle(
+        self, moe_runner_config: MoeRunnerConfig
+    ) -> Optional[object]:
+        if self.quant_method is None or not hasattr(self.quant_method, "create_moe_runner"):
+            return getattr(self, "runner", None)
+
+        prev_runner = getattr(self.quant_method, "runner", None)
+        prev_moe_runner_config = getattr(self.quant_method, "moe_runner_config", None)
+        prev_layer_runner = getattr(self, "runner", None)
+        prev_layer_config = self.moe_runner_config
+
+        self.quant_method.create_moe_runner(self, moe_runner_config)
+        new_runner = getattr(self.quant_method, "runner", None)
+
+        if prev_runner is not None:
+            self.quant_method.runner = prev_runner
+        if prev_moe_runner_config is not None:
+            self.quant_method.moe_runner_config = prev_moe_runner_config
+        self.runner = prev_layer_runner
+        self.moe_runner_config = prev_layer_config
+        return new_runner
+
+    def build_dense_expert_runtime_tensors(
+        self,
+        active_local_expert_mapping: Union[torch.Tensor, Sequence[int]],
+        tensor_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if not isinstance(active_local_expert_mapping, torch.Tensor):
+            active_local_expert_mapping = torch.tensor(active_local_expert_mapping)
+        if active_local_expert_mapping.dim() != 1 or active_local_expert_mapping.numel() == 0:
+            raise ValueError(
+                "active_local_expert_mapping must be a non-empty 1D tensor."
+            )
+
+        active_local_expert_mapping = active_local_expert_mapping.to(dtype=torch.long)
+        start = int(active_local_expert_mapping[0].item())
+        expected = torch.arange(
+            start,
+            start + active_local_expert_mapping.numel(),
+            dtype=active_local_expert_mapping.dtype,
+        )
+        if not torch.equal(active_local_expert_mapping.cpu(), expected.cpu()):
+            raise ValueError(
+                "Current runtime bundle implementation only supports contiguous expert rows."
+            )
+
+        tensor_names = tensor_names or (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_bias",
+            "w2_weight_bias",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        )
+        active_tensors: Dict[str, torch.Tensor] = {}
+        length = int(active_local_expert_mapping.numel())
+        for tensor_name in tensor_names:
+            tensor = getattr(self, tensor_name, None)
+            if tensor is None:
+                continue
+            active_tensors[tensor_name] = tensor.narrow(0, start, length)
+        return active_tensors
+
+    def register_runtime_bundle(
+        self,
+        variant: Union[FusedMoERuntimeVariant, str],
+        moe_runner_config: MoeRunnerConfig,
+        *,
+        dispatcher: Optional[BaseDispatcher] = None,
+        runner: Optional[object] = None,
+        group=None,
+        moe_ep_size: Optional[int] = None,
+        moe_ep_rank: Optional[int] = None,
+        moe_tp_size: Optional[int] = None,
+        moe_tp_rank: Optional[int] = None,
+        num_local_experts: Optional[int] = None,
+        active_local_expert_mapping: Optional[Union[torch.Tensor, Sequence[int]]] = None,
+        dispatcher_local_expert_mapping: Optional[
+            Union[torch.Tensor, Sequence[int]]
+        ] = None,
+        active_tensors: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> FusedMoERuntimeBundle:
+        variant = self._normalize_runtime_variant(variant)
+        if active_local_expert_mapping is not None and not isinstance(
+            active_local_expert_mapping, torch.Tensor
+        ):
+            active_local_expert_mapping = torch.tensor(active_local_expert_mapping)
+        if active_local_expert_mapping is not None:
+            active_local_expert_mapping = active_local_expert_mapping.to(
+                dtype=torch.int32
+            )
+            if active_tensors is None:
+                active_tensors = self.build_dense_expert_runtime_tensors(
+                    active_local_expert_mapping
+                )
+        if dispatcher_local_expert_mapping is not None and not isinstance(
+            dispatcher_local_expert_mapping, torch.Tensor
+        ):
+            dispatcher_local_expert_mapping = torch.tensor(
+                dispatcher_local_expert_mapping
+            )
+        if dispatcher_local_expert_mapping is not None:
+            dispatcher_local_expert_mapping = dispatcher_local_expert_mapping.to(
+                dtype=torch.int32
+            )
+        elif active_local_expert_mapping is not None:
+            dispatcher_local_expert_mapping = active_local_expert_mapping
+
+        if dispatcher is None:
+            dispatcher = create_moe_dispatcher(
+                moe_runner_config,
+                group=group,
+                moe_ep_size=moe_ep_size,
+                moe_ep_rank=moe_ep_rank,
+                local_expert_mapping=dispatcher_local_expert_mapping,
+            )
+        if dispatcher_local_expert_mapping is not None:
+            dispatcher.local_expert_mapping = dispatcher_local_expert_mapping
+            dispatcher.active_local_expert_mapping = dispatcher_local_expert_mapping
+
+        current_quant_config = getattr(self.dispatcher, "quant_config", None)
+        if current_quant_config is not None:
+            dispatcher.set_quant_config(current_quant_config)
+
+        if runner is None:
+            runner = self._build_runner_for_runtime_bundle(moe_runner_config)
+
+        if (
+            self.down_gemm_overlap_args is not None
+            and self.meta_overlap_args is not None
+            and runner is not None
+        ):
+            runner.set_overlap_args(
+                self.down_gemm_overlap_args, self.meta_overlap_args
+            )
+
+        bundle = FusedMoERuntimeBundle(
+            variant=variant,
+            moe_runner_config=moe_runner_config,
+            dispatcher=dispatcher,
+            runner=runner,
+            moe_ep_size=moe_ep_size if moe_ep_size is not None else self.moe_ep_size,
+            moe_ep_rank=moe_ep_rank if moe_ep_rank is not None else self.moe_ep_rank,
+            moe_tp_size=moe_tp_size if moe_tp_size is not None else self.moe_tp_size,
+            moe_tp_rank=moe_tp_rank if moe_tp_rank is not None else self.moe_tp_rank,
+            num_local_experts=(
+                num_local_experts
+                if num_local_experts is not None
+                else moe_runner_config.num_local_experts
+            ),
+            active_local_expert_mapping=active_local_expert_mapping,
+            active_tensors=active_tensors,
+        )
+        self._runtime_bundles[variant] = bundle
+        if variant == FusedMoERuntimeVariant.LOCAL:
+            self.local_bundle = bundle
+        elif variant == FusedMoERuntimeVariant.GLOBAL:
+            self.global_bundle = bundle
+        return bundle
+
+    def switch_runtime_bundle(
+        self, variant: Union[FusedMoERuntimeVariant, str]
+    ) -> FusedMoERuntimeBundle:
+        variant = self._normalize_runtime_variant(variant)
+        bundle = self._runtime_bundles[variant]
+        self.runtime_variant = bundle.variant
+        self.moe_runner_config = bundle.moe_runner_config
+        self.dispatcher = bundle.dispatcher
+        self.runner = bundle.runner
+        self.moe_ep_size = bundle.moe_ep_size
+        self.moe_ep_rank = bundle.moe_ep_rank
+        self.moe_tp_size = bundle.moe_tp_size
+        self.moe_tp_rank = bundle.moe_tp_rank
+        self.num_local_experts = bundle.num_local_experts
+        self.active_local_expert_mapping = bundle.active_local_expert_mapping
+        self._active_runtime_tensors = bundle.active_tensors or {}
+
+        if self.quant_method is not None:
+            if hasattr(self.quant_method, "runner"):
+                self.quant_method.runner = bundle.runner
+            if hasattr(self.quant_method, "moe_runner_config"):
+                self.quant_method.moe_runner_config = bundle.moe_runner_config
+        return bundle
+
+    def get_runtime_tensor(self, name: str) -> torch.Tensor:
+        return self._active_runtime_tensors.get(name, getattr(self, name))
+
+    def get_runtime_bias(self, name: str) -> Optional[torch.Tensor]:
+        return self._active_runtime_tensors.get(name, getattr(self, name, None))
 
     def _load_per_tensor_weight_scale(
         self,
@@ -983,11 +1231,14 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
+        local_expert_mapping = getattr(
+            self.dispatcher, "local_expert_mapping", self.active_local_expert_mapping
+        )
+        if _use_aiter and local_expert_mapping is not None:
             self.expert_mask_gpu = (
                 (
-                    (self.dispatcher.local_expert_mapping >= 0)
-                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
+                    (local_expert_mapping >= 0)
+                    & (local_expert_mapping < self.num_local_experts)
                 )
                 .to(torch.int32)
                 .to(device="cuda")
@@ -1113,20 +1364,20 @@ class FusedMoE(torch.nn.Module):
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        if hasattr(self, "runner"):
-            self.runner.set_overlap_args(down_gemm_overlap_args, meta_overlap_args)
-        else:
-            # TODO: remove this branch after MoE refactor
-            self.down_gemm_overlap_args = down_gemm_overlap_args
-            self.meta_overlap_args = meta_overlap_args
+        self.down_gemm_overlap_args = down_gemm_overlap_args
+        self.meta_overlap_args = meta_overlap_args
+        for bundle in self._runtime_bundles.values():
+            if bundle.runner is not None:
+                bundle.runner.set_overlap_args(
+                    down_gemm_overlap_args, meta_overlap_args
+                )
 
     def clear_overlap_args(self) -> None:
-        if hasattr(self, "runner"):
-            self.runner.clear_overlap_args()
-        else:
-            # TODO: remove this branch after MoE refactor
-            self.down_gemm_overlap_args = None
-            self.meta_overlap_args = None
+        self.down_gemm_overlap_args = None
+        self.meta_overlap_args = None
+        for bundle in self._runtime_bundles.values():
+            if bundle.runner is not None:
+                bundle.runner.clear_overlap_args()
 
 
 class FlashInferFusedMoE(FusedMoE):

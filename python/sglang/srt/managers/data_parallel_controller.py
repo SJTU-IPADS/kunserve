@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BlockReqInput,
+    SyncKVCapacityReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -196,6 +197,13 @@ class DataParallelController:
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
 
+    def handle_sync_kv_capacity(self, obj: SyncKVCapacityReqInput):
+        if obj.max_total_num_tokens is not None:
+            self.max_total_num_tokens = int(obj.max_total_num_tokens)
+        else:
+            self.max_total_num_tokens += int(obj.delta_slots)
+        self.send_control_message(obj)
+
     def dispatching_with_trace(self, req: Req):
         if self.server_args.enable_trace:
             trace_set_proc_propagate_context(req.rid, req.trace_context)
@@ -214,6 +222,7 @@ class DataParallelController:
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
+                (SyncKVCapacityReqInput, self.handle_sync_kv_capacity),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )

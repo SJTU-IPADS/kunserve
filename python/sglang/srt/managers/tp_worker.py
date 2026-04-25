@@ -23,13 +23,18 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
+    CommitBalloonReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    GetBalloonStatusReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareBalloonReqInput,
+    RestoreFromBalloonReqInput,
     SendWeightsToRemoteInstanceReqInput,
+    SyncKVCapacityReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -173,6 +178,50 @@ class BaseTpWorker(ABC):
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def get_balloon_status(self, recv_req: GetBalloonStatusReqInput):
+        return self.model_runner.get_balloon_status()
+
+    def prepare_balloon(self, recv_req: PrepareBalloonReqInput):
+        status = self.model_runner.prepare_balloon(
+            target_variant=recv_req.target_variant,
+            runtime_ep_size=recv_req.runtime_ep_size,
+            moe_ep_rank=recv_req.moe_ep_rank,
+            dispatch_ep_rank=recv_req.dispatch_ep_rank,
+            runtime_rank_offset=recv_req.runtime_rank_offset,
+            dispatch_rank_offset=recv_req.dispatch_rank_offset,
+            retained_local_experts=recv_req.retained_local_experts,
+            active_local_expert_mapping=recv_req.active_local_expert_mapping,
+            active_local_expert_mapping_by_layer=recv_req.active_local_expert_mapping_by_layer,
+            physical_to_logical_map=recv_req.physical_to_logical_map,
+            process_group_name=recv_req.process_group_name,
+            capture_cuda_graph=recv_req.capture_cuda_graph,
+        )
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        return status
+
+    def commit_balloon(self, recv_req: CommitBalloonReqInput):
+        status = self.model_runner.commit_balloon(
+            target_variant=recv_req.target_variant,
+            offload_local_experts=recv_req.offload_local_experts,
+            num_slots_to_expand=recv_req.num_slots_to_expand,
+            require_prepared=recv_req.require_prepared,
+        )
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        return status
+
+    def restore_from_balloon(self, recv_req: RestoreFromBalloonReqInput):
+        status = self.model_runner.restore_from_balloon()
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        return status
+
+    def sync_kv_capacity(self, recv_req: SyncKVCapacityReqInput):
+        status = self.model_runner.sync_kv_capacity(
+            max_total_num_tokens=recv_req.max_total_num_tokens,
+            delta_slots=recv_req.delta_slots,
+        )
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        return status
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
         result = self.model_runner.load_lora_adapter(recv_req.to_ref())

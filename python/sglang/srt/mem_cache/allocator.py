@@ -170,6 +170,53 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
+    def expand_by_slots(self, num_slots: int) -> None:
+        num_slots = int(num_slots)
+        if num_slots < 0:
+            raise ValueError(f"num_slots must be non-negative, got {num_slots}")
+        if num_slots == 0:
+            return
+        new_slots = torch.arange(
+            self.size + 1,
+            self.size + num_slots + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.free_pages = torch.cat((self.free_pages, new_slots))
+        self.size += num_slots
+
+    def shrink_tail(self, num_slots: int) -> None:
+        num_slots = int(num_slots)
+        if num_slots < 0:
+            raise ValueError(f"num_slots must be non-negative, got {num_slots}")
+        if num_slots == 0:
+            return
+        if num_slots > self.size:
+            raise ValueError(
+                f"Cannot shrink {num_slots} slots from allocator size {self.size}"
+            )
+        self._sort_all_free_pages()
+        expected_tail = torch.arange(
+            self.size - num_slots + 1,
+            self.size + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if len(self.free_pages) < num_slots or not torch.equal(
+            self.free_pages[-num_slots:], expected_tail
+        ):
+            raise RuntimeError(
+                "Cannot shrink KV allocator tail because the requested tail slots are still in use."
+            )
+        self.free_pages = self.free_pages[:-num_slots]
+        self.size -= num_slots
+
+    def _sort_all_free_pages(self) -> None:
+        if len(self.release_pages) > 0:
+            self.merge_and_sort_free()
+        elif len(self.free_pages) > 1:
+            self.free_pages, _ = torch.sort(self.free_pages)
+
 
 def alloc_extend_naive(
     prefix_lens,
@@ -529,3 +576,62 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def expand_by_slots(self, num_slots: int) -> None:
+        num_slots = int(num_slots)
+        if num_slots < 0:
+            raise ValueError(f"num_slots must be non-negative, got {num_slots}")
+        if num_slots == 0:
+            return
+        if num_slots % self.page_size != 0:
+            raise ValueError(
+                f"num_slots={num_slots} must be page-aligned for page_size={self.page_size}"
+            )
+        num_new_pages = num_slots // self.page_size
+        new_pages = torch.arange(
+            self.num_pages + 1,
+            self.num_pages + num_new_pages + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.free_pages = torch.cat((self.free_pages, new_pages))
+        self.num_pages += num_new_pages
+        self.size += num_slots
+
+    def shrink_tail(self, num_slots: int) -> None:
+        num_slots = int(num_slots)
+        if num_slots < 0:
+            raise ValueError(f"num_slots must be non-negative, got {num_slots}")
+        if num_slots == 0:
+            return
+        if num_slots % self.page_size != 0:
+            raise ValueError(
+                f"num_slots={num_slots} must be page-aligned for page_size={self.page_size}"
+            )
+        if num_slots > self.size:
+            raise ValueError(
+                f"Cannot shrink {num_slots} slots from allocator size {self.size}"
+            )
+        self._sort_all_free_pages()
+        num_remove_pages = num_slots // self.page_size
+        expected_tail_pages = torch.arange(
+            self.num_pages - num_remove_pages + 1,
+            self.num_pages + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if len(self.free_pages) < num_remove_pages or not torch.equal(
+            self.free_pages[-num_remove_pages:], expected_tail_pages
+        ):
+            raise RuntimeError(
+                "Cannot shrink KV allocator tail because the requested tail pages are still in use."
+            )
+        self.free_pages = self.free_pages[:-num_remove_pages]
+        self.num_pages -= num_remove_pages
+        self.size -= num_slots
+
+    def _sort_all_free_pages(self) -> None:
+        if len(self.release_pages) > 0:
+            self.merge_and_sort_free()
+        elif len(self.free_pages) > 1:
+            self.free_pages, _ = torch.sort(self.free_pages)

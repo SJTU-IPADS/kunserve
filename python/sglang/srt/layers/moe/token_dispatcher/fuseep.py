@@ -13,7 +13,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    DeepEPBuffer,
+    DeepEPDispatchMode,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 
@@ -86,7 +89,7 @@ class NpuFuseEPDispatcher(BaseDispatcher):
         pass
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        DeepEPBuffer.set_dispatch_mode_as_low_latency(group=self.group)
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
@@ -94,4 +97,5 @@ class NpuFuseEPDispatcher(BaseDispatcher):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            dispatch_mode=DeepEPDispatchMode.LOW_LATENCY,
         )

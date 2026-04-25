@@ -80,9 +80,19 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 class StandardDispatcher(BaseDispatcher):
 
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(
+        self,
+        moe_runner_config: MoeRunnerConfig,
+        moe_ep_size: Optional[int] = None,
+        moe_ep_rank: Optional[int] = None,
+        local_expert_mapping: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.moe_ep_size = (
+            moe_ep_size
+            if moe_ep_size is not None
+            else get_moe_expert_parallel_world_size()
+        )
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
@@ -91,8 +101,60 @@ class StandardDispatcher(BaseDispatcher):
         self.num_local_routed_experts = (
             moe_runner_config.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
-        self.local_expert_mapping = None
+        self.moe_ep_rank = (
+            moe_ep_rank if moe_ep_rank is not None else get_moe_expert_parallel_rank()
+        )
+        self.local_expert_mapping = self._init_local_expert_mapping(
+            local_expert_mapping
+        )
+        self.active_local_expert_mapping = self.local_expert_mapping
+
+    def _init_local_expert_mapping(
+        self, local_expert_mapping: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if local_expert_mapping is None:
+            return None
+        if not isinstance(local_expert_mapping, torch.Tensor):
+            local_expert_mapping = torch.tensor(local_expert_mapping)
+        if local_expert_mapping.dim() != 1:
+            raise ValueError("local_expert_mapping must be a 1D tensor.")
+        if local_expert_mapping.shape[0] != self.num_experts:
+            raise ValueError(
+                "local_expert_mapping must have one entry for every global expert."
+            )
+        return local_expert_mapping.to(dtype=torch.int32)
+
+    def _get_or_create_local_expert_mapping(
+        self, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        if self.local_expert_mapping is None:
+            self.local_expert_mapping = torch.full(
+                (self.num_experts,), -1, dtype=torch.int32, device=device
+            )
+            self.local_expert_mapping[
+                self.moe_ep_rank
+                * self.num_local_routed_experts : (self.moe_ep_rank + 1)
+                * self.num_local_routed_experts
+            ] = torch.arange(
+                0, self.num_local_routed_experts, dtype=torch.int32, device=device
+            )
+
+            if self.num_local_shared_experts > 0:
+                self.local_expert_mapping[-self.num_local_shared_experts :] = (
+                    torch.arange(
+                        self.num_local_routed_experts,
+                        self.num_local_routed_experts + self.num_local_shared_experts,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                )
+            self.active_local_expert_mapping = self.local_expert_mapping
+        elif self.local_expert_mapping.device != device:
+            self.local_expert_mapping = self.local_expert_mapping.to(
+                device=device, non_blocking=True
+            )
+            self.active_local_expert_mapping = self.local_expert_mapping
+        return self.local_expert_mapping
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -144,30 +206,10 @@ class StandardDispatcher(BaseDispatcher):
             and not self.enable_flashinfer_cutlass_moe
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
-            if self.local_expert_mapping is None:
-                self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device="cuda"
-                )
-                self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
-                    * self.num_local_routed_experts
-                ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device="cuda"
-                )
-
-                if self.num_local_shared_experts > 0:
-                    self.local_expert_mapping[-self.num_local_shared_experts :] = (
-                        torch.arange(
-                            self.num_local_routed_experts,
-                            self.num_local_routed_experts
-                            + self.num_local_shared_experts,
-                            dtype=torch.int32,
-                            device="cpu",
-                        )
-                    )
+            self._get_or_create_local_expert_mapping(topk_output.topk_ids.device)
 
         if self.local_expert_mapping is not None and not _use_aiter:
+            self._get_or_create_local_expert_mapping(topk_output.topk_ids.device)
             if TopKOutputChecker.format_is_standard(topk_output):
                 topk_output = topk_output._replace(
                     topk_ids=self.local_expert_mapping[topk_output.topk_ids]

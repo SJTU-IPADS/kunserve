@@ -28,9 +28,20 @@ def fused_moe_forward_native(
 
     topk_weights, topk_ids, _ = topk_output
 
-    w13_weights = layer.w13_weight[topk_ids]
+    layer_w13_weight = (
+        layer.get_runtime_tensor("w13_weight")
+        if hasattr(layer, "get_runtime_tensor")
+        else layer.w13_weight
+    )
+    layer_w2_weight = (
+        layer.get_runtime_tensor("w2_weight")
+        if hasattr(layer, "get_runtime_tensor")
+        else layer.w2_weight
+    )
+
+    w13_weights = layer_w13_weight[topk_ids]
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
-    w2_weights = layer.w2_weight[topk_ids]
+    w2_weights = layer_w2_weight[topk_ids]
     x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
     if moe_runner_config.activation == "silu":
         x1 = F.silu(x1)
@@ -76,6 +87,17 @@ def moe_forward_native(
     else:
         raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
 
+    layer_w13_weight = (
+        layer.get_runtime_tensor("w13_weight")
+        if hasattr(layer, "get_runtime_tensor")
+        else layer.w13_weight
+    )
+    layer_w2_weight = (
+        layer.get_runtime_tensor("w2_weight")
+        if hasattr(layer, "get_runtime_tensor")
+        else layer.w2_weight
+    )
+
     outputs = []
     start_idx = 0
     for i, num_tokens in enumerate(tokens_per_expert):
@@ -84,12 +106,12 @@ def moe_forward_native(
             continue
         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
 
-        layer_w13_weight = layer.w13_weight[i]
-        layer_w2_weight = layer.w2_weight[i]
+        layer_w13_weight_i = layer_w13_weight[i]
+        layer_w2_weight_i = layer_w2_weight[i]
 
-        gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
+        gate_up = F.linear(tokens_for_this_expert, layer_w13_weight_i)
         gate_up = act(gate_up)
-        expert_out = F.linear(gate_up, layer_w2_weight)
+        expert_out = F.linear(gate_up, layer_w2_weight_i)
         outputs.append(expert_out)
         start_idx = end_idx
 

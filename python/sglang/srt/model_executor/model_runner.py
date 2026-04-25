@@ -13,6 +13,7 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+import copy
 import datetime
 import gc
 import inspect
@@ -23,8 +24,9 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -78,6 +80,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    build_expert_location_metadata_from_mapping,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -115,6 +118,11 @@ from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+from sglang.srt.model_executor.balloon_utils import (
+    build_dispatcher_local_expert_mapping,
+    resolve_balloon_kv_slots_to_expand,
+    slice_rank_local_logical_expert_ids,
+)
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     set_torch_compile_config,
@@ -601,6 +609,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
+        self.init_balloon_runtime_state()
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
@@ -646,6 +655,820 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 device=self.device,
             )
         )
+
+    def init_balloon_runtime_state(self):
+        local_metadata = None
+        if not self.is_draft_worker:
+            expert_location_metadata = get_global_expert_location_metadata()
+            if expert_location_metadata is not None:
+                local_metadata = copy.deepcopy(expert_location_metadata)
+
+        self._balloon_state = "local"
+        self._balloon_runtime_variant = "local"
+        self._balloon_prepared_variant = None
+        self._balloon_graph_replay_enabled = True
+        self._balloon_local_expert_location_metadata = local_metadata
+        self._balloon_global_expert_location_metadata = None
+        self._balloon_prepared_active_mappings: Dict[int, torch.Tensor] = {}
+        self._balloon_unused_donors = None
+        self._balloon_added_slots = 0
+        self._balloon_offloaded_local_experts = 0
+        self._balloon_last_error = None
+        self._balloon_process_group_name = None
+        self._balloon_fused_moe_layers: Optional[List[torch.nn.Module]] = None
+
+    def _iter_fused_moe_layers(self) -> List[torch.nn.Module]:
+        if self._balloon_fused_moe_layers is None:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+            self._balloon_fused_moe_layers = [
+                module for module in self.model.modules() if isinstance(module, FusedMoE)
+            ]
+        return self._balloon_fused_moe_layers
+
+    def _normalize_balloon_variant(self, variant: Union[str, object]) -> str:
+        variant_value = getattr(variant, "value", variant)
+        variant_value = str(variant_value).lower()
+        if variant_value not in ("local", "global"):
+            raise ValueError(f"Unsupported balloon runtime variant: {variant}")
+        return variant_value
+
+    def _resolve_balloon_process_group(self, process_group_name: Optional[str]):
+        if process_group_name is None:
+            return None
+        if process_group_name in self._model_update_group:
+            return self._model_update_group[process_group_name]
+        if process_group_name in self._weights_send_group:
+            return self._weights_send_group[process_group_name]
+        raise ValueError(
+            f"Process group '{process_group_name}' is not initialized on this rank."
+        )
+
+    def _default_balloon_physical_to_logical_map(self):
+        metadata = (
+            self._balloon_local_expert_location_metadata
+            or get_global_expert_location_metadata()
+        )
+        if metadata is None:
+            return None
+        return metadata.physical_to_logical_map_cpu.tolist()
+
+    def _resolve_balloon_rank(
+        self,
+        *,
+        explicit_rank: Optional[int],
+        rank_offset: Optional[int],
+        default_rank: int,
+    ) -> int:
+        if explicit_rank is not None:
+            return int(explicit_rank)
+        if rank_offset is not None:
+            return int(rank_offset) + int(self.tp_rank)
+        return int(default_rank)
+
+    def _normalize_balloon_active_mappings(
+        self,
+        *,
+        retained_local_experts: Optional[int] = None,
+        active_local_expert_mapping: Optional[List[int]] = None,
+        active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None,
+    ) -> Dict[int, torch.Tensor]:
+        fused_layers = self._iter_fused_moe_layers()
+        if not fused_layers:
+            return {}
+
+        base_mapping = None
+        if active_local_expert_mapping_by_layer is not None:
+            mappings = {
+                int(layer_id): torch.tensor(mapping, dtype=torch.int32)
+                for layer_id, mapping in active_local_expert_mapping_by_layer.items()
+            }
+        else:
+            if active_local_expert_mapping is not None:
+                base_mapping = torch.tensor(active_local_expert_mapping, dtype=torch.int32)
+            elif retained_local_experts is not None:
+                if retained_local_experts <= 0:
+                    raise ValueError(
+                        f"retained_local_experts must be positive, got {retained_local_experts}"
+                    )
+                base_mapping = torch.arange(retained_local_experts, dtype=torch.int32)
+            else:
+                raise ValueError(
+                    "Either retained_local_experts or an active_local_expert_mapping must be provided."
+                )
+            mappings = {int(layer.layer_id): base_mapping.clone() for layer in fused_layers}
+
+        for layer in fused_layers:
+            if layer.layer_id not in mappings:
+                raise ValueError(
+                    f"Missing active_local_expert_mapping for fused MoE layer {layer.layer_id}."
+                )
+            mapping = mappings[layer.layer_id]
+            if mapping.dim() != 1 or mapping.numel() == 0:
+                raise ValueError(
+                    f"Layer {layer.layer_id} active_local_expert_mapping must be a non-empty 1D tensor."
+                )
+            expected = torch.arange(
+                int(mapping[0].item()),
+                int(mapping[0].item()) + mapping.numel(),
+                dtype=mapping.dtype,
+            )
+            if not torch.equal(mapping.cpu(), expected.cpu()):
+                raise ValueError(
+                    "Current balloon runtime only supports contiguous active_local_expert_mapping per layer."
+                )
+        return mappings
+
+    def _switch_all_fused_moe_runtime_bundles(self, variant: str) -> None:
+        normalized_variant = self._normalize_balloon_variant(variant)
+        if not self._iter_fused_moe_layers():
+            self._balloon_runtime_variant = normalized_variant
+            return
+        for layer in self._iter_fused_moe_layers():
+            layer.switch_runtime_bundle(normalized_variant)
+        self._balloon_runtime_variant = normalized_variant
+
+    @contextmanager
+    def cuda_graph_capture_variant_scope(self, variant: str):
+        previous_variant = self.get_cuda_graph_runtime_variant()
+        normalized_variant = self._normalize_balloon_variant(variant)
+        if previous_variant != normalized_variant:
+            self._switch_all_fused_moe_runtime_bundles(normalized_variant)
+        try:
+            yield
+        finally:
+            if previous_variant != normalized_variant:
+                self._switch_all_fused_moe_runtime_bundles(previous_variant)
+
+    def get_cuda_graph_capture_variants(self) -> List[str]:
+        variants = ["local"]
+        fused_layers = self._iter_fused_moe_layers()
+        if fused_layers and all(getattr(layer, "global_bundle", None) is not None for layer in fused_layers):
+            variants.append("global")
+        return variants
+
+    def get_cuda_graph_runtime_variant(self) -> str:
+        return self._normalize_balloon_variant(self._balloon_runtime_variant)
+
+    def is_cuda_graph_replay_enabled(self) -> bool:
+        return bool(self._balloon_graph_replay_enabled)
+
+    def _update_live_expert_location_metadata(self, metadata) -> None:
+        if self.is_draft_worker or metadata is None:
+            return
+        live_metadata = get_global_expert_location_metadata()
+        if live_metadata is None:
+            return
+        live_metadata.update(metadata, list(range(live_metadata.num_layers)))
+
+    def _build_balloon_global_metadata(
+        self,
+        *,
+        physical_to_logical_map=None,
+        runtime_ep_size: Optional[int] = None,
+        moe_ep_rank: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
+        runtime_rank_offset: Optional[int] = None,
+        dispatch_rank_offset: Optional[int] = None,
+    ):
+        if self.is_draft_worker:
+            return None
+
+        physical_to_logical_map = (
+            physical_to_logical_map or self._default_balloon_physical_to_logical_map()
+        )
+        if physical_to_logical_map is None:
+            return None
+
+        resolved_moe_ep_rank = self._resolve_balloon_rank(
+            explicit_rank=moe_ep_rank,
+            rank_offset=runtime_rank_offset,
+            default_rank=self.moe_ep_rank,
+        )
+        resolved_dispatch_ep_rank = self._resolve_balloon_rank(
+            explicit_rank=dispatch_ep_rank,
+            rank_offset=dispatch_rank_offset
+            if dispatch_rank_offset is not None
+            else runtime_rank_offset,
+            default_rank=self.moe_ep_rank,
+        )
+
+        return build_expert_location_metadata_from_mapping(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            physical_to_logical_map=physical_to_logical_map,
+            moe_ep_rank=resolved_moe_ep_rank,
+            ep_size=runtime_ep_size,
+            dispatch_ep_rank=resolved_dispatch_ep_rank,
+        )
+
+    def register_balloon_global_runtime_bundle(
+        self,
+        *,
+        runtime_ep_size: Optional[int] = None,
+        moe_ep_rank: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
+        runtime_rank_offset: Optional[int] = None,
+        dispatch_rank_offset: Optional[int] = None,
+        retained_local_experts: Optional[int] = None,
+        active_local_expert_mapping: Optional[List[int]] = None,
+        active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None,
+        physical_to_logical_map=None,
+        process_group_name: Optional[str] = None,
+    ) -> Dict[int, torch.Tensor]:
+        fused_layers = self._iter_fused_moe_layers()
+        if not fused_layers:
+            raise ValueError("Balloon runtime requires a model with FusedMoE layers.")
+
+        active_mappings = self._normalize_balloon_active_mappings(
+            retained_local_experts=retained_local_experts,
+            active_local_expert_mapping=active_local_expert_mapping,
+            active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
+        )
+        runtime_group = self._resolve_balloon_process_group(process_group_name)
+        self._balloon_global_expert_location_metadata = self._build_balloon_global_metadata(
+            physical_to_logical_map=physical_to_logical_map,
+            runtime_ep_size=runtime_ep_size,
+            moe_ep_rank=moe_ep_rank,
+            dispatch_ep_rank=dispatch_ep_rank,
+            runtime_rank_offset=runtime_rank_offset,
+            dispatch_rank_offset=dispatch_rank_offset,
+        )
+        self._balloon_prepared_active_mappings = {
+            layer_id: mapping.clone()
+            for layer_id, mapping in active_mappings.items()
+        }
+        self._balloon_process_group_name = process_group_name
+
+        resolved_ep_size = (
+            int(runtime_ep_size) if runtime_ep_size is not None else self.moe_ep_size
+        )
+        resolved_moe_ep_rank = self._resolve_balloon_rank(
+            explicit_rank=moe_ep_rank,
+            rank_offset=runtime_rank_offset,
+            default_rank=self.moe_ep_rank,
+        )
+        resolved_dispatch_ep_rank = self._resolve_balloon_rank(
+            explicit_rank=dispatch_ep_rank,
+            rank_offset=dispatch_rank_offset
+            if dispatch_rank_offset is not None
+            else runtime_rank_offset,
+            default_rank=self.moe_ep_rank,
+        )
+        local_expert_location_metadata = (
+            self._balloon_local_expert_location_metadata
+            or get_global_expert_location_metadata()
+        )
+        for layer in fused_layers:
+            mapping = active_mappings[layer.layer_id]
+            local_num_physical_experts = int(layer.local_bundle.num_local_experts)
+            if local_expert_location_metadata is not None:
+                local_logical_expert_ids = slice_rank_local_logical_expert_ids(
+                    physical_to_logical_map=local_expert_location_metadata.physical_to_logical_map_cpu,
+                    layer_id=layer.layer_id,
+                    moe_ep_rank=int(layer.local_bundle.moe_ep_rank),
+                    num_local_physical_experts=local_num_physical_experts,
+                )
+                dispatcher_local_expert_mapping = (
+                    build_dispatcher_local_expert_mapping(
+                        num_logical_experts=int(
+                            self._balloon_global_expert_location_metadata.num_logical_experts
+                        ),
+                        local_logical_expert_ids=local_logical_expert_ids,
+                        active_local_expert_mapping=mapping,
+                    )
+                )
+            else:
+                dispatcher_local_expert_mapping = (
+                    build_dispatcher_local_expert_mapping(
+                        num_logical_experts=int(layer.moe_runner_config.num_experts),
+                        local_logical_expert_ids=torch.arange(
+                            int(layer.local_bundle.moe_ep_rank) * local_num_physical_experts,
+                            (int(layer.local_bundle.moe_ep_rank) + 1)
+                            * local_num_physical_experts,
+                            dtype=torch.int32,
+                        ),
+                        active_local_expert_mapping=mapping,
+                    )
+                )
+            global_runner_config = replace(
+                layer.local_bundle.moe_runner_config,
+                num_local_experts=int(mapping.numel()),
+            )
+            layer.register_runtime_bundle(
+                variant="global",
+                moe_runner_config=global_runner_config,
+                group=runtime_group,
+                moe_ep_size=resolved_ep_size,
+                moe_ep_rank=resolved_moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                num_local_experts=int(mapping.numel()),
+                active_local_expert_mapping=mapping,
+                dispatcher_local_expert_mapping=dispatcher_local_expert_mapping,
+            )
+        return active_mappings
+
+    def ensure_cuda_graph_variant_captured(self, variant: str) -> None:
+        if self.graph_runner is None or not hasattr(self.graph_runner, "ensure_variant_captured"):
+            return
+        self.graph_runner.ensure_variant_captured(variant)
+
+    def _get_balloon_kv_cache(self):
+        return self.token_to_kv_pool_allocator.get_kvcache()
+
+    def _bytes_per_balloon_kv_slot(self) -> int:
+        return int(self._get_balloon_kv_cache().bytes_per_slot())
+
+    def _balloon_kv_vmm_headroom_slots(self) -> int:
+        kv_cache = self._get_balloon_kv_cache()
+        if not getattr(kv_cache, "_kv_vmm_enabled", False):
+            return 0
+        reserve_rows = int(
+            getattr(kv_cache, "_kv_reserve_rows", int(kv_cache.size) + self.page_size)
+        )
+        return max(0, reserve_rows - self.page_size - int(kv_cache.size))
+
+    def _moe_weight_vmm_enabled(self) -> bool:
+        fused_layers = self._iter_fused_moe_layers()
+        return bool(fused_layers) and all(
+            bool(getattr(layer, "_sglang_moe_weight_vmm_allocations", {}))
+            for layer in fused_layers
+        )
+
+    def _sync_balloon_weight_allocations(self) -> None:
+        for layer in self._iter_fused_moe_layers():
+            for allocation in getattr(
+                layer, "_sglang_moe_weight_vmm_allocations", {}
+            ).values():
+                allocation.sync_from_region()
+
+    def _validate_global_bundle_for_expert_offload(
+        self, retained_local_experts: int
+    ) -> Dict[int, str]:
+        offload_modes: Dict[int, str] = {}
+        for layer in self._iter_fused_moe_layers():
+            bundle = getattr(layer, "global_bundle", None)
+            if bundle is None:
+                raise ValueError(
+                    f"Layer {layer.layer_id} does not have a registered global runtime bundle."
+                )
+            if layer.num_fused_shared_experts > 0:
+                raise ValueError(
+                    "Balloon tail offload is not implemented for fused shared experts."
+                )
+            mapping = bundle.active_local_expert_mapping
+            if mapping is None:
+                raise ValueError(
+                    f"Layer {layer.layer_id} global bundle is missing active_local_expert_mapping."
+                )
+            if int(mapping.numel()) != retained_local_experts:
+                raise ValueError(
+                    f"Layer {layer.layer_id} retains {int(mapping.numel())} experts, expected {retained_local_experts}."
+                )
+            routed_local_experts = (
+                layer.local_bundle.num_local_experts - layer.num_fused_shared_experts
+            )
+            mapping_start = int(mapping[0].item())
+            mapping_end = int(mapping[-1].item())
+            if mapping_start == 0 and mapping_end == retained_local_experts - 1:
+                offload_modes[layer.layer_id] = "tail"
+                continue
+            if (
+                mapping_start == routed_local_experts - retained_local_experts
+                and mapping_end == routed_local_experts - 1
+            ):
+                offload_modes[layer.layer_id] = "head"
+                continue
+            raise ValueError(
+                "Current balloon offload implementation only supports keeping a contiguous local prefix or suffix."
+            )
+        return offload_modes
+
+    def prepare_balloon(
+        self,
+        *,
+        target_variant: str = "global",
+        runtime_ep_size: Optional[int] = None,
+        moe_ep_rank: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
+        runtime_rank_offset: Optional[int] = None,
+        dispatch_rank_offset: Optional[int] = None,
+        retained_local_experts: Optional[int] = None,
+        active_local_expert_mapping: Optional[List[int]] = None,
+        active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None,
+        physical_to_logical_map=None,
+        process_group_name: Optional[str] = None,
+        capture_cuda_graph: bool = True,
+    ) -> Dict[str, Any]:
+        target_variant = self._normalize_balloon_variant(target_variant)
+        fused_layers = self._iter_fused_moe_layers()
+        logger.info(
+            "Prepare balloon: target_variant=%s runtime_ep_size=%s moe_ep_rank=%s dispatch_ep_rank=%s "
+            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_cuda_graph=%s",
+            target_variant,
+            runtime_ep_size,
+            moe_ep_rank,
+            dispatch_ep_rank,
+            runtime_rank_offset,
+            dispatch_rank_offset,
+            process_group_name,
+            capture_cuda_graph,
+        )
+        if not self.is_draft_worker and self._balloon_state == "local":
+            live_metadata = get_global_expert_location_metadata()
+            if live_metadata is not None:
+                self._balloon_local_expert_location_metadata = copy.deepcopy(
+                    live_metadata
+                )
+        if target_variant == "global":
+            if not fused_layers:
+                raise ValueError("Global balloon runtime requires FusedMoE layers.")
+            if (
+                retained_local_experts is not None
+                or active_local_expert_mapping is not None
+                or active_local_expert_mapping_by_layer is not None
+                or (
+                    fused_layers
+                    and getattr(fused_layers[0], "global_bundle", None) is None
+                )
+            ):
+                self.register_balloon_global_runtime_bundle(
+                    runtime_ep_size=runtime_ep_size,
+                    moe_ep_rank=moe_ep_rank,
+                    dispatch_ep_rank=dispatch_ep_rank,
+                    runtime_rank_offset=runtime_rank_offset,
+                    dispatch_rank_offset=dispatch_rank_offset,
+                    retained_local_experts=retained_local_experts,
+                    active_local_expert_mapping=active_local_expert_mapping,
+                    active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
+                    physical_to_logical_map=physical_to_logical_map,
+                    process_group_name=process_group_name,
+                )
+
+            if capture_cuda_graph:
+                self.ensure_cuda_graph_variant_captured(target_variant)
+
+        self._balloon_prepared_variant = target_variant
+        self._balloon_state = "prepared"
+        self._balloon_graph_replay_enabled = False
+        self._balloon_last_error = None
+        logger.info(
+            "Prepared balloon runtime: state=%s runtime_variant=%s capture_variants=%s",
+            self._balloon_state,
+            self.get_cuda_graph_runtime_variant(),
+            self.get_cuda_graph_capture_variants(),
+        )
+        return self.get_balloon_status()
+
+    def commit_balloon(
+        self,
+        *,
+        target_variant: str = "global",
+        offload_local_experts: int = 0,
+        num_slots_to_expand: Optional[int] = None,
+        require_prepared: bool = True,
+    ) -> Dict[str, Any]:
+        from sglang.srt.utils.cuda_vmm import (
+            DonorLedger,
+            min_granularity_aligned_row_count,
+        )
+
+        target_variant = self._normalize_balloon_variant(target_variant)
+        if self._balloon_state == "balloon":
+            raise ValueError("Model runner is already in balloon mode.")
+        if require_prepared and self._balloon_prepared_variant != target_variant:
+            raise ValueError(
+                f"Balloon variant '{target_variant}' must be prepared before commit."
+            )
+
+        previous_state = self._balloon_state
+        previous_variant = self.get_cuda_graph_runtime_variant()
+        previous_replay_enabled = self._balloon_graph_replay_enabled
+        borrowed = DonorLedger(label="balloon_commit")
+        remaining_donors = None
+        added_slots = 0
+        self._balloon_unused_donors = None
+        self._balloon_graph_replay_enabled = False
+
+        try:
+            if offload_local_experts > 0:
+                retained_local_experts = None
+                offload_modes_by_layer: Dict[int, str] = {}
+                for layer in self._iter_fused_moe_layers():
+                    routed_local_experts = (
+                        layer.local_bundle.num_local_experts - layer.num_fused_shared_experts
+                    )
+                    if offload_local_experts >= routed_local_experts:
+                        raise ValueError(
+                            f"Cannot offload {offload_local_experts} experts from layer {layer.layer_id}; "
+                            f"only {routed_local_experts - 1} routed experts can be removed while keeping at least one active expert."
+                        )
+                    retained_local_experts = routed_local_experts - offload_local_experts
+
+                    allocations = getattr(layer, "_sglang_moe_weight_vmm_allocations", {})
+                    if not allocations:
+                        raise ValueError(
+                            f"Layer {layer.layer_id} does not expose VMM-backed MoE allocations. "
+                            "Enable SGLANG_EXPERIMENTAL_CUDA_VMM=1 and "
+                            "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS=1 before launching the server."
+                        )
+
+                assert retained_local_experts is not None
+                if target_variant == "global":
+                    offload_modes_by_layer = (
+                        self._validate_global_bundle_for_expert_offload(
+                            retained_local_experts
+                        )
+                    )
+                logger.info(
+                    "Commit balloon: target_variant=%s offload_local_experts=%d retained_local_experts=%d offload_modes=%s",
+                    target_variant,
+                    offload_local_experts,
+                    retained_local_experts,
+                    offload_modes_by_layer,
+                )
+
+                for layer in self._iter_fused_moe_layers():
+                    allocations = getattr(layer, "_sglang_moe_weight_vmm_allocations", {})
+                    offload_mode = offload_modes_by_layer.get(layer.layer_id, "tail")
+                    for name in ("w13_weight", "w2_weight"):
+                        allocation = allocations.get(name)
+                        if allocation is None:
+                            continue
+                        rows_per_borrow = min_granularity_aligned_row_count(
+                            allocation.row_bytes, allocation.region.granularity
+                        )
+                        if offload_local_experts % rows_per_borrow != 0:
+                            raise ValueError(
+                                f"Cannot offload {offload_local_experts} experts from "
+                                f"layer {layer.layer_id} param '{name}'; "
+                                f"row_bytes={allocation.row_bytes} requires borrow "
+                                f"chunks of {rows_per_borrow} rows for "
+                                f"granularity={allocation.region.granularity}."
+                            )
+                        borrow_rows = (
+                            allocation.borrow_head_rows
+                            if offload_mode == "head"
+                            else allocation.borrow_tail_rows
+                        )
+                        for expert_offset in range(
+                            0, offload_local_experts, rows_per_borrow
+                        ):
+                            borrowed.add(
+                                borrow_rows(
+                                    rows_per_borrow,
+                                    owner={
+                                        "layer_id": layer.layer_id,
+                                        "param_name": name,
+                                        "num_experts": offload_local_experts,
+                                        "offload_mode": offload_mode,
+                                        "expert_offset": expert_offset,
+                                        "chunk_rows": rows_per_borrow,
+                                    },
+                                )
+                            )
+
+                donor_segments = borrowed.pop_all()
+                remaining_donors = list(donor_segments)
+                total_donor_bytes = sum(segment.size_bytes for segment in donor_segments)
+                kv_cache = self._get_balloon_kv_cache()
+                bytes_per_slot = self._bytes_per_balloon_kv_slot()
+                max_slots_from_donor = total_donor_bytes // bytes_per_slot
+                if self.page_size > 1:
+                    max_slots_from_donor = (
+                        max_slots_from_donor // self.page_size * self.page_size
+                    )
+                kv_vmm_headroom_slots = self._balloon_kv_vmm_headroom_slots()
+                if self.page_size > 1:
+                    kv_vmm_headroom_slots = (
+                        kv_vmm_headroom_slots // self.page_size * self.page_size
+                    )
+                added_slots = resolve_balloon_kv_slots_to_expand(
+                    max_slots_from_donor=max_slots_from_donor,
+                    kv_vmm_headroom_slots=kv_vmm_headroom_slots,
+                    num_slots_to_expand=num_slots_to_expand,
+                )
+                logger.info(
+                    "Balloon donor summary: donor_segments=%d donor_bytes=%d bytes_per_slot=%d "
+                    "max_slots_from_donor=%d kv_vmm_headroom=%d requested_slots=%s final_added_slots=%d",
+                    len(donor_segments),
+                    total_donor_bytes,
+                    bytes_per_slot,
+                    max_slots_from_donor,
+                    kv_vmm_headroom_slots,
+                    num_slots_to_expand,
+                    added_slots,
+                )
+
+                if added_slots > 0:
+                    kv_cache.expand_by_slots(added_slots, donor_segments=remaining_donors)
+                    self.token_to_kv_pool_allocator.expand_by_slots(added_slots)
+                    self.sync_kv_capacity(delta_slots=added_slots)
+
+                unused_donors = DonorLedger(label="balloon_unused")
+                unused_donors.extend(remaining_donors)
+                self._balloon_unused_donors = unused_donors
+            else:
+                self._balloon_unused_donors = DonorLedger(label="balloon_unused")
+
+            if target_variant == "global":
+                if self._balloon_global_expert_location_metadata is not None:
+                    self._update_live_expert_location_metadata(
+                        self._balloon_global_expert_location_metadata
+                    )
+                self._switch_all_fused_moe_runtime_bundles("global")
+            else:
+                if self._balloon_local_expert_location_metadata is not None:
+                    self._update_live_expert_location_metadata(
+                        self._balloon_local_expert_location_metadata
+                    )
+                self._switch_all_fused_moe_runtime_bundles("local")
+
+            self._balloon_state = "balloon"
+            self._balloon_offloaded_local_experts = int(offload_local_experts)
+            self._balloon_added_slots = int(added_slots)
+            self._balloon_last_error = None
+            self._balloon_graph_replay_enabled = True
+            logger.info(
+                "Committed balloon runtime: state=%s runtime_variant=%s offloaded_local_experts=%d added_kv_slots=%d max_total_num_tokens=%d",
+                self._balloon_state,
+                self.get_cuda_graph_runtime_variant(),
+                self._balloon_offloaded_local_experts,
+                self._balloon_added_slots,
+                self.max_total_num_tokens,
+            )
+            return self.get_balloon_status()
+        except Exception as exc:
+            self._balloon_last_error = str(exc)
+            logger.exception(
+                "Commit balloon failed: target_variant=%s offload_local_experts=%d",
+                target_variant,
+                offload_local_experts,
+            )
+            if added_slots > 0:
+                try:
+                    self.token_to_kv_pool_allocator.shrink_tail(added_slots)
+                    returned = self._get_balloon_kv_cache().shrink_tail(
+                        added_slots
+                    )
+                    returned.restore_all()
+                except Exception:
+                    logger.exception("Failed to roll back balloon KV expansion.")
+            if self._balloon_unused_donors is not None:
+                try:
+                    self._balloon_unused_donors.restore_all()
+                except Exception:
+                    logger.exception("Failed to restore unused balloon donor segments.")
+            if remaining_donors is not None:
+                rollback_donors = DonorLedger(label="balloon_commit_rollback")
+                rollback_donors.extend(remaining_donors)
+                rollback_donors.restore_all()
+            else:
+                borrowed.restore_all()
+            self._sync_balloon_weight_allocations()
+            self._switch_all_fused_moe_runtime_bundles(previous_variant)
+            self._balloon_state = previous_state
+            self._balloon_graph_replay_enabled = previous_replay_enabled
+            self._balloon_offloaded_local_experts = 0
+            self._balloon_added_slots = 0
+            raise
+
+    def restore_from_balloon(self) -> Dict[str, Any]:
+        if self._balloon_state == "local":
+            self._balloon_graph_replay_enabled = True
+            return self.get_balloon_status()
+        logger.info(
+            "Restore balloon: current_state=%s added_kv_slots=%d offloaded_local_experts=%d",
+            self._balloon_state,
+            self._balloon_added_slots,
+            self._balloon_offloaded_local_experts,
+        )
+        self._balloon_graph_replay_enabled = False
+        if self._balloon_added_slots > 0:
+            self.token_to_kv_pool_allocator.shrink_tail(self._balloon_added_slots)
+            returned = self._get_balloon_kv_cache().shrink_tail(self._balloon_added_slots)
+            returned.restore_all()
+            self.sync_kv_capacity(
+                max_total_num_tokens=self.token_to_kv_pool_allocator.size
+            )
+
+        if self._balloon_unused_donors is not None:
+            self._balloon_unused_donors.restore_all()
+            self._balloon_unused_donors = None
+
+        self._sync_balloon_weight_allocations()
+        if self._balloon_local_expert_location_metadata is not None:
+            self._update_live_expert_location_metadata(
+                self._balloon_local_expert_location_metadata
+            )
+        self._switch_all_fused_moe_runtime_bundles("local")
+        self._balloon_state = "local"
+        self._balloon_prepared_variant = None
+        self._balloon_offloaded_local_experts = 0
+        self._balloon_added_slots = 0
+        self._balloon_graph_replay_enabled = True
+        self._balloon_last_error = None
+        logger.info(
+            "Restored local runtime: state=%s runtime_variant=%s max_total_num_tokens=%d",
+            self._balloon_state,
+            self.get_cuda_graph_runtime_variant(),
+            self.max_total_num_tokens,
+        )
+        return self.get_balloon_status()
+
+    def sync_kv_capacity(
+        self,
+        *,
+        max_total_num_tokens: Optional[int] = None,
+        delta_slots: int = 0,
+    ) -> Dict[str, Any]:
+        if self.is_hybrid_swa:
+            raise ValueError("Balloon KV capacity sync does not support hybrid SWA.")
+
+        if max_total_num_tokens is None:
+            target = self.max_total_num_tokens + int(delta_slots)
+        else:
+            target = int(max_total_num_tokens)
+        if target < 0:
+            raise ValueError(f"max_total_num_tokens must be non-negative, got {target}")
+        if target > self.token_to_kv_pool_allocator.size:
+            raise ValueError(
+                f"Requested token capacity {target} exceeds allocator size {self.token_to_kv_pool_allocator.size}."
+            )
+        self.max_total_num_tokens = target
+        self.full_max_total_num_tokens = target
+        return self.get_balloon_status()
+
+    def get_balloon_status(self) -> Dict[str, Any]:
+        captured_variants = []
+        fused_layers = self._iter_fused_moe_layers()
+        live_metadata = (
+            self._balloon_local_expert_location_metadata
+            or get_global_expert_location_metadata()
+        )
+        if self.graph_runner is not None and hasattr(
+            self.graph_runner, "get_captured_variants"
+        ):
+            captured_variants = self.graph_runner.get_captured_variants()
+
+        return {
+            "state": self._balloon_state,
+            "runtime_variant": self.get_cuda_graph_runtime_variant(),
+            "prepared_variant": self._balloon_prepared_variant,
+            "graph_replay_enabled": self.is_cuda_graph_replay_enabled(),
+            "capture_variants": self.get_cuda_graph_capture_variants(),
+            "captured_graph_variants": captured_variants,
+            "max_total_num_tokens": int(self.max_total_num_tokens),
+            "allocator_capacity": int(self.token_to_kv_pool_allocator.size),
+            "kv_cache_capacity": int(self._get_balloon_kv_cache().size),
+            "kv_cache_vmm_enabled": bool(
+                getattr(self._get_balloon_kv_cache(), "_kv_vmm_enabled", False)
+            ),
+            "kv_cache_vmm_headroom_slots": int(
+                self._balloon_kv_vmm_headroom_slots()
+            ),
+            "moe_weight_vmm_enabled": bool(self._moe_weight_vmm_enabled()),
+            "offloaded_local_experts": int(self._balloon_offloaded_local_experts),
+            "added_kv_slots": int(self._balloon_added_slots),
+            "fused_moe_layers": len(fused_layers),
+            "global_bundle_ready": all(
+                getattr(layer, "global_bundle", None) is not None
+                for layer in fused_layers
+            )
+            if fused_layers
+            else False,
+            "tp_size": int(self.tp_size),
+            "local_ep_size": int(self.moe_ep_size),
+            "balloon_process_group_name": self._balloon_process_group_name,
+            "local_num_experts_per_layer": {
+                int(layer.layer_id): int(layer.local_bundle.num_local_experts)
+                for layer in fused_layers
+            },
+            "local_routed_experts_per_layer": {
+                int(layer.layer_id): int(
+                    layer.local_bundle.num_local_experts
+                    - layer.num_fused_shared_experts
+                )
+                for layer in fused_layers
+            },
+            "num_fused_shared_experts_per_layer": {
+                int(layer.layer_id): int(layer.num_fused_shared_experts)
+                for layer in fused_layers
+            },
+            "local_active_local_expert_mapping_by_layer": {
+                int(layer.layer_id): layer.local_bundle.active_local_expert_mapping.tolist()
+                if layer.local_bundle.active_local_expert_mapping is not None
+                else None
+                for layer in fused_layers
+            },
+            "local_physical_to_logical_map": (
+                live_metadata.physical_to_logical_map_cpu.tolist()
+                if live_metadata is not None
+                else None
+            ),
+            "last_error": self._balloon_last_error,
+        }
 
     def remote_instance_init_transfer_engine(self):
         try:

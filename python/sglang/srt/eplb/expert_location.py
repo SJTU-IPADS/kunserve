@@ -44,6 +44,8 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    runtime_ep_size: Optional[int] = None
+    dispatch_ep_rank: Optional[int] = None
 
     # -------------------------------- properties ------------------------------------
 
@@ -67,7 +69,8 @@ class ExpertLocationMetadata:
 
     @property
     def ep_size(self):
-        # TODO change when EP size != world size
+        if self.runtime_ep_size is not None:
+            return self.runtime_ep_size
         return torch.distributed.get_world_size()
 
     def __post_init__(self):
@@ -81,15 +84,23 @@ class ExpertLocationMetadata:
         assert num_layers_0 == num_layers_1 == num_layers_2
         assert num_logical_experts_0 == num_logical_experts_1
         assert num_physical_experts_0 == num_physical_experts_1
+        if self.runtime_ep_size is None:
+            self.runtime_ep_size = torch.distributed.get_world_size()
 
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
     def init_trivial(
-        server_args: ServerArgs, model_config: ModelConfig, moe_ep_rank: int
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        moe_ep_rank: int,
+        ep_size_override: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
     ):
         """Trivial location - logical expert i corresponds to physical expert i"""
-        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        common = ExpertLocationMetadata._init_common(
+            server_args, model_config, ep_size_override=ep_size_override
+        )
 
         if common is None:
             return None
@@ -109,6 +120,8 @@ class ExpertLocationMetadata:
             model_config,
             physical_to_logical_map=physical_to_logical_map,
             moe_ep_rank=moe_ep_rank,
+            ep_size_override=ep_size_override,
+            dispatch_ep_rank=dispatch_ep_rank,
         )
 
     @staticmethod
@@ -117,12 +130,16 @@ class ExpertLocationMetadata:
         model_config: ModelConfig,
         physical_to_logical_map,
         moe_ep_rank: int = None,
+        ep_size_override: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
         physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
-        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        common = ExpertLocationMetadata._init_common(
+            server_args, model_config, ep_size_override=ep_size_override
+        )
 
         if common is None:
             return None
@@ -141,11 +158,16 @@ class ExpertLocationMetadata:
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
+            dispatch_ep_rank=dispatch_ep_rank,
         )
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        logical_count: torch.Tensor,
+        ep_size_override: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -153,7 +175,9 @@ class ExpertLocationMetadata:
             logical_count = logical_count.unsqueeze(0)
         logical_count = logical_count.to(server_args.device)
 
-        common = ExpertLocationMetadata._init_common(server_args, model_config)
+        common = ExpertLocationMetadata._init_common(
+            server_args, model_config, ep_size_override=ep_size_override
+        )
 
         if common is None:
             return None
@@ -185,10 +209,15 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 server_args.device
             ),
+            dispatch_ep_rank=dispatch_ep_rank,
         )
 
     @staticmethod
-    def _init_common(server_args: ServerArgs, model_config: ModelConfig):
+    def _init_common(
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        ep_size_override: Optional[int] = None,
+    ):
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -200,7 +229,7 @@ class ExpertLocationMetadata:
             model_config_for_expert_location.num_logical_experts
             + server_args.ep_num_redundant_experts
         )
-        ep_size = server_args.ep_size
+        ep_size = ep_size_override if ep_size_override is not None else server_args.ep_size
         assert num_physical_experts % ep_size == 0
         num_local_physical_experts = num_physical_experts // ep_size
 
@@ -217,6 +246,7 @@ class ExpertLocationMetadata:
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
+        dispatch_ep_rank: Optional[int] = None,
     ):
         _, num_physical_experts = physical_to_logical_map.shape
 
@@ -230,6 +260,9 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
+        if dispatch_ep_rank is None:
+            dispatch_ep_rank = torch.distributed.get_rank() % ep_size
+
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
@@ -242,12 +275,13 @@ class ExpertLocationMetadata:
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     ep_size=ep_size,
                     num_physical_experts=num_physical_experts,
-                    # TODO improve when we have real EP rank
-                    ep_rank=torch.distributed.get_rank() % ep_size,
+                    ep_rank=dispatch_ep_rank,
                 )
                 if server_args.ep_dispatch_algorithm == "static"
                 else None
             ),
+            runtime_ep_size=ep_size,
+            dispatch_ep_rank=dispatch_ep_rank,
         )
 
     # -------------------------------- mutation ------------------------------------
@@ -257,10 +291,12 @@ class ExpertLocationMetadata:
         other: "ExpertLocationMetadata",
         update_layer_ids: List[int],
     ):
-        for field in [
-            "ep_size",
-        ]:
-            assert getattr(self, field) == getattr(other, field)
+        if len(update_layer_ids) != self.num_layers:
+            for field in ["ep_size", "dispatch_ep_rank"]:
+                assert getattr(self, field) == getattr(other, field)
+        else:
+            self.runtime_ep_size = other.runtime_ep_size
+            self.dispatch_ep_rank = other.dispatch_ep_rank
 
         for field in [
             "physical_to_logical_map",
@@ -346,7 +382,7 @@ def _compute_logical_to_all_physical_map(
 
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
-        num_gpus_per_node = server_args.ep_size // server_args.nnodes
+        num_gpus_per_node = ep_size // server_args.nnodes
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
@@ -400,7 +436,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     r = random.Random(seed)
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
-    num_gpus_per_node = server_args.ep_size // server_args.nnodes
+    num_gpus_per_node = ep_size // server_args.nnodes
     num_local_node_physical_experts = num_local_gpu_physical_experts * num_gpus_per_node
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
@@ -571,3 +607,22 @@ def compute_initial_expert_location_metadata(
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"
         )
+
+
+def build_expert_location_metadata_from_mapping(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    physical_to_logical_map,
+    *,
+    moe_ep_rank: Optional[int] = None,
+    ep_size: Optional[int] = None,
+    dispatch_ep_rank: Optional[int] = None,
+) -> Optional[ExpertLocationMetadata]:
+    return ExpertLocationMetadata.init_by_mapping(
+        server_args=server_args,
+        model_config=model_config,
+        physical_to_logical_map=physical_to_logical_map,
+        moe_ep_rank=moe_ep_rank,
+        ep_size_override=ep_size,
+        dispatch_ep_rank=dispatch_ep_rank,
+    )

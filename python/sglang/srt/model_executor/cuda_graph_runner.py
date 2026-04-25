@@ -379,10 +379,59 @@ class CudaGraphRunner:
             for attn_backend in self.model_runner.decode_attn_backend_group:
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
+    def _normalize_runtime_variant(self, variant: Optional[Union[str, object]] = None):
+        runtime_variant = (
+            variant
+            if variant is not None
+            else self.model_runner.get_cuda_graph_runtime_variant()
+        )
+        runtime_variant = getattr(runtime_variant, "value", runtime_variant)
+        return str(runtime_variant).lower()
+
+    def _graph_key(
+        self,
+        variant: Optional[Union[str, object]],
+        bs: int,
+        stream_idx: Optional[int] = None,
+    ):
+        normalized_variant = self._normalize_runtime_variant(variant)
+        if stream_idx is None:
+            return (normalized_variant, int(bs))
+        return (int(stream_idx), normalized_variant, int(bs))
+
+    def has_captured_variant(self, variant: Optional[Union[str, object]]) -> bool:
+        normalized_variant = self._normalize_runtime_variant(variant)
+        return any(
+            (
+                key[0] == normalized_variant
+                if len(key) == 2
+                else key[1] == normalized_variant
+            )
+            for key in self.graphs
+        )
+
+    def get_captured_variants(self) -> list[str]:
+        variants = set()
+        for key in self.graphs:
+            if len(key) == 2:
+                variants.add(key[0])
+            else:
+                variants.add(key[1])
+        return sorted(variants)
+
+    def ensure_variant_captured(self, variant: Optional[Union[str, object]]) -> None:
+        normalized_variant = self._normalize_runtime_variant(variant)
+        if self.has_captured_variant(normalized_variant):
+            return
+        with model_capture_mode():
+            self.capture(variants=[normalized_variant], clear_existing=False)
+
     def _cache_loc_dtype(self):
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if not self.model_runner.is_cuda_graph_replay_enabled():
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -393,15 +442,19 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
-
-        is_bs_supported = (
-            graph_key in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+        runtime_variant = self.model_runner.get_cuda_graph_runtime_variant()
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        if self.disable_padding:
+            graph_key = self._graph_key(runtime_variant, cuda_graph_bs, stream_idx)
+            is_bs_supported = graph_key in self.graphs
+        else:
+            index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
+            if index >= len(self.capture_bs):
+                is_bs_supported = False
+            else:
+                padded_bs = self.capture_bs[index]
+                graph_key = self._graph_key(runtime_variant, padded_bs, stream_idx)
+                is_bs_supported = graph_key in self.graphs
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -473,12 +526,24 @@ class CudaGraphRunner:
         )
         logger.info(log_message)
 
-    def capture(self) -> None:
+    def capture(
+        self,
+        *,
+        variants: Optional[list[str]] = None,
+        clear_existing: bool = True,
+    ) -> None:
+        if clear_existing:
+            self.graphs = {}
+            self.output_buffers = {}
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
+        capture_variants = variants or self.model_runner.get_cuda_graph_capture_variants()
+        capture_variants = [self._normalize_runtime_variant(variant) for variant in capture_variants]
 
-        def _capture_one_stream(stream_idx: Optional[int] = None):
+        def _capture_one_stream(
+            variant: str, stream_idx: Optional[int] = None
+        ):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -498,7 +563,7 @@ class CudaGraphRunner:
                         empty_cache=False,
                     )
                     capture_range.set_description(
-                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                        f"Capturing batches ({variant=} {bs=} {avail_mem=:.2f} GB)"
                     )
 
                 with patch_model(
@@ -512,7 +577,7 @@ class CudaGraphRunner:
                         output_buffers,
                     ) = self.capture_one_batch_size(bs, forward, stream_idx)
                     # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                    key = self._graph_key(variant, bs, stream_idx)
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
 
@@ -520,18 +585,25 @@ class CudaGraphRunner:
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    _capture_one_stream()
-            else:
-                set_pdmux_status(False)
-                for i, sg in enumerate(self.stream_groups):
-                    with graph_capture(
-                        stream=sg[1]
-                    ) as graph_capture_context, profile_context as prof:
+            with profile_context as prof:
+                if not self.enable_pdmux:
+                    with graph_capture() as graph_capture_context:
                         self.stream = graph_capture_context.stream
-                        _capture_one_stream(i)
+                        for variant in capture_variants:
+                            with self.model_runner.cuda_graph_capture_variant_scope(
+                                variant
+                            ):
+                                _capture_one_stream(variant)
+                else:
+                    set_pdmux_status(False)
+                    for i, sg in enumerate(self.stream_groups):
+                        with graph_capture(stream=sg[1]) as graph_capture_context:
+                            self.stream = graph_capture_context.stream
+                            for variant in capture_variants:
+                                with self.model_runner.cuda_graph_capture_variant_scope(
+                                    variant
+                                ):
+                                    _capture_one_stream(variant, i)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
@@ -860,9 +932,15 @@ class CudaGraphRunner:
 
         # Replay
         if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+            graph_key = self._graph_key(
+                self.model_runner.get_cuda_graph_runtime_variant(),
+                self.bs,
+                get_current_stream_idx(),
+            )
         else:
-            graph_key = self.bs
+            graph_key = self._graph_key(
+                self.model_runner.get_cuda_graph_runtime_variant(), self.bs
+            )
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
