@@ -368,7 +368,37 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            try:
+                result.copy_done.synchronize()
+            except Exception as exc:
+                # IDLE-batch synchronize failures during BALLOON mode are
+                # almost always a shutdown race: the peer replica was killed
+                # by Ray slightly earlier, so the cross-replica NCCL collective
+                # returned garbage and the subsequent CUDA event sync fails
+                # with cudaErrorIllegalAddress. The rollout's user-visible
+                # results are already streamed by this point — there are no
+                # live requests in an IDLE batch — so we re-raise to let the
+                # scheduler subprocess exit cleanly while leaving a clear
+                # message in the log. This keeps the shutdown traceback
+                # informative instead of looking like a data-correctness bug.
+                in_balloon = False
+                try:
+                    runner = getattr(self.tp_worker, "model_runner", None)
+                    in_balloon = (
+                        getattr(runner, "_balloon_state", "local") == "balloon"
+                    )
+                except Exception:
+                    pass
+                if in_balloon:
+                    import logging as _l
+
+                    _l.getLogger(__name__).error(
+                        "[KUNSERVE-MS] IDLE batch synchronize failed in BALLOON; "
+                        "this is a shutdown race (peer replica likely already exited). "
+                        "Rollout outputs are unaffected. Underlying error: %s",
+                        exc,
+                    )
+                raise
 
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True

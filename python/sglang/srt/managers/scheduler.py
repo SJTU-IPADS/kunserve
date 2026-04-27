@@ -231,6 +231,33 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
+def _kunserve_ms(message: str, *args) -> None:
+    """Mirror of model_runner._kunserve_ms for the scheduler subprocess.
+
+    Writes the milestone to logger.warning AND to the file pointed at by
+    KUNSERVE_DETAIL_LOG so it survives the multiprocessing fork that hides
+    the scheduler's stdout from Ray's actor capture stream.
+    """
+    logger.warning(message, *args)
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    if not path:
+        return
+    try:
+        rendered = message % args if args else message
+    except Exception:
+        rendered = message
+    try:
+        import datetime as _dt
+
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        line = f"[{ts} pid={os.getpid()}] {rendered}\n"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
 _BATCH_TIMING_LOG = os.environ.get("SGLANG_BATCH_TIMING_LOG", "").strip()
 _REPLICA_RANK = os.environ.get("SGLANG_REPLICA_RANK", "") 
 _REQ_LIFECYCLE_LOG = os.environ.get("SGLANG_REQ_LIFECYCLE_LOG", "").strip()
@@ -2318,17 +2345,32 @@ class Scheduler(
                 prev_expand_requested = self.expand_requested
                 self.expand_requested = True
                 self.expand_request_reason = "retract_decode"
-                logger.info(
-                    "[KunServeScheduler] expand requested by retract_decode: "
-                    "prev_expand=%s available_tokens=%d gained_tokens=%d "
-                    "running=%d waiting=%d max_total_num_tokens=%d",
-                    prev_expand_requested,
-                    new_available_tokens,
-                    new_token_gained,
-                    len(batch.reqs),
-                    len(self.waiting_queue),
-                    int(self.max_total_num_tokens),
-                )
+                # Promote the very first transition to a milestone-level
+                # warning so it shows up clearly in training.log; subsequent
+                # ticks where expand_requested is already True stay info-level
+                # to avoid noise.
+                if not prev_expand_requested:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] expand_requested fired by retract_decode: "
+                        "available_tokens=%d gained_tokens=%d running=%d waiting=%d max_total=%d",
+                        new_available_tokens,
+                        new_token_gained,
+                        len(batch.reqs),
+                        len(self.waiting_queue),
+                        int(self.max_total_num_tokens),
+                    )
+                else:
+                    logger.info(
+                        "[KunServeScheduler] expand requested by retract_decode: "
+                        "prev_expand=%s available_tokens=%d gained_tokens=%d "
+                        "running=%d waiting=%d max_total_num_tokens=%d",
+                        prev_expand_requested,
+                        new_available_tokens,
+                        new_token_gained,
+                        len(batch.reqs),
+                        len(self.waiting_queue),
+                        int(self.max_total_num_tokens),
+                    )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
             if kv_full_retract_flag:
                 msg_details += (
@@ -2646,6 +2688,11 @@ class Scheduler(
                 "extra_prefill_ms": extra_prefill_ms,
                 "ideal_e2e_ms_estimate": ideal_e2e_ms_estimate,
                 "e2e_saved_ms_estimate": e2e_saved_ms_estimate,
+                # KunServe per-request decode-step accounting. Counters are
+                # incremented in _log_decode_step_timing each time the request
+                # appears in a decode batch.
+                "decode_steps_local": int(getattr(req, "_kunserve_decode_steps_local", 0)),
+                "decode_steps_balloon": int(getattr(req, "_kunserve_decode_steps_balloon", 0)),
             }
             records.append(record)
             self._queue_wait_ms_cumulative.pop(req.rid, None)
@@ -3476,9 +3523,44 @@ class Scheduler(
             len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
         )
 
+        # KunServe BALLOON-state tags. Reading these is cheap (plain attribute
+        # access). Tagging per-step lets the analyzer split the step_ms
+        # distribution by (balloon_state, batch_size) and compute the
+        # cross-replica EP overhead by comparing matched buckets.
+        balloon_state = "unknown"
+        runtime_variant = "unknown"
+        num_offloaded_local_experts = 0
+        try:
+            mr = getattr(self.tp_worker, "model_runner", None)
+            if mr is not None:
+                balloon_state = str(getattr(mr, "_balloon_state", "local"))
+                num_offloaded_local_experts = int(
+                    getattr(mr, "_balloon_offloaded_local_experts", 0) or 0
+                )
+                # get_cuda_graph_runtime_variant() returns "local"/"global"
+                # but is only present if cuda graph capture is enabled.
+                getter = getattr(mr, "get_cuda_graph_runtime_variant", None)
+                if callable(getter):
+                    runtime_variant = str(getter())
+        except Exception:
+            pass
+
+        # Per-request decode-step counters for the lifecycle log. Cheap, and
+        # enables computing per-request BALLOON overhead in post-processing
+        # (decode_steps_balloon × avg(step_ms_balloon − step_ms_local @ matched batch_size)).
+        for req in batch.reqs:
+            if balloon_state == "balloon":
+                req._kunserve_decode_steps_balloon = (
+                    int(getattr(req, "_kunserve_decode_steps_balloon", 0)) + 1
+                )
+            else:
+                req._kunserve_decode_steps_local = (
+                    int(getattr(req, "_kunserve_decode_steps_local", 0)) + 1
+                )
+
         record = {
             "ts": time.time(),
-            "replica_rank": _REPLICA_RANK, 
+            "replica_rank": _REPLICA_RANK,
             "batch_size": batch_size,
             "total_kv_tokens": int(total_kv_tokens),
             "avg_kv_tokens_per_req": round(total_kv_tokens / max(batch_size, 1), 3),
@@ -3490,6 +3572,9 @@ class Scheduler(
             "tok_per_s_per_req": round(tok_per_s / max(batch_size, 1), 3),
             "forward_mode": str(batch.forward_mode),
             "effective_tok_per_s_per_req": round(effective_tok_per_s_per_req, 3),
+            "balloon_state": balloon_state,
+            "runtime_variant": runtime_variant,
+            "num_offloaded_local_experts": num_offloaded_local_experts,
         }
 
         try:

@@ -256,6 +256,38 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+def _kunserve_ms(message: str, *args) -> None:
+    """Emit a [KUNSERVE-MS] milestone line.
+
+    The scheduler runs as a forked subprocess of the SGLangHttpServer Ray
+    actor; its stdout/stderr does not propagate to Ray's (SGLangHttpServer
+    pid=...) capture stream, so logger.warning() alone is invisible from the
+    training driver's log. To make milestones reliably visible regardless of
+    fork/IPC plumbing we ALSO append them directly to the file pointed at by
+    the KUNSERVE_DETAIL_LOG env var. The file write is best-effort and never
+    raises. Signature mirrors logger.warning(msg, *args) so callsites can be
+    a drop-in replacement.
+    """
+    logger.warning(message, *args)
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    if not path:
+        return
+    try:
+        rendered = message % args if args else message
+    except Exception:
+        rendered = message
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        line = f"[{ts} pid={os.getpid()}] {rendered}\n"
+        # Append mode; concurrent writers from different scheduler subprocesses
+        # may interleave whole lines but POSIX guarantees atomicity for small
+        # writes so individual lines never tear.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -1063,6 +1095,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Dict[str, Any]:
         target_variant = self._normalize_balloon_variant(target_variant)
         fused_layers = self._iter_fused_moe_layers()
+        _kunserve_ms(
+            "[KUNSERVE-MS] prepare start: target_variant=%s pg=%s capture_cuda_graph=%s "
+            "runtime_ep_size=%s rank_offset=%s",
+            target_variant,
+            process_group_name,
+            capture_cuda_graph,
+            runtime_ep_size,
+            runtime_rank_offset,
+        )
         logger.info(
             "Prepare balloon: target_variant=%s runtime_ep_size=%s moe_ep_rank=%s dispatch_ep_rank=%s "
             "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_cuda_graph=%s",
@@ -1113,10 +1154,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_state = "prepared"
         self._balloon_graph_replay_enabled = False
         self._balloon_last_error = None
-        logger.info(
-            "Prepared balloon runtime: state=%s runtime_variant=%s capture_variants=%s",
-            self._balloon_state,
-            self.get_cuda_graph_runtime_variant(),
+        _kunserve_ms(
+            "[KUNSERVE-MS] prepare done: state=prepared target_variant=%s captured_variants=%s graph_replay_enabled=False",
+            target_variant,
             self.get_cuda_graph_capture_variants(),
         )
         return self.get_balloon_status()
@@ -1169,6 +1209,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         added_slots = 0
         self._balloon_unused_donors = None
         self._balloon_graph_replay_enabled = False
+        _kunserve_ms(
+            "[KUNSERVE-MS] commit start: target_variant=%s offload=%d (graph replay PAUSED)",
+            target_variant,
+            offload_local_experts,
+        )
 
         try:
             if offload_local_experts > 0:
@@ -1290,6 +1335,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     added_slots,
                 )
 
+                _kunserve_ms(
+                    "[KUNSERVE-MS] donors collected: layers=%d segments=%d donor_bytes=%d "
+                    "bytes_per_slot=%d candidate_slots=%d",
+                    len(self._iter_fused_moe_layers()),
+                    len(donor_segments),
+                    total_donor_bytes,
+                    bytes_per_slot,
+                    added_slots,
+                )
+
                 kv_cache_expanded = False
                 allocator_expanded = False
                 if added_slots > 0:
@@ -1298,6 +1353,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.token_to_kv_pool_allocator.expand_by_slots(added_slots)
                     allocator_expanded = True
                     self.sync_kv_capacity(delta_slots=added_slots)
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] KV expanded: added_slots=%d max_total_num_tokens=%d (gain ~%.2f GiB)",
+                        added_slots,
+                        self.max_total_num_tokens,
+                        added_slots * bytes_per_slot / (1024.0 ** 3),
+                    )
 
                 unused_donors = DonorLedger(label="balloon_unused")
                 unused_donors.extend(remaining_donors)
@@ -1317,12 +1378,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self._balloon_local_expert_location_metadata
                     )
                 self._switch_all_fused_moe_runtime_bundles("local")
+            _kunserve_ms(
+                "[KUNSERVE-MS] variant switched to %s (FusedMoE bundles re-bound)",
+                target_variant,
+            )
 
             self._balloon_state = "balloon"
             self._balloon_offloaded_local_experts = int(offload_local_experts)
             self._balloon_added_slots = int(added_slots)
             self._balloon_last_error = None
             self._balloon_graph_replay_enabled = True
+            _kunserve_ms(
+                "[KUNSERVE-MS] commit done: state=balloon variant=%s offloaded=%d added_kv_slots=%d max_total_num_tokens=%d (graph replay RESUMED)",
+                self.get_cuda_graph_runtime_variant(),
+                self._balloon_offloaded_local_experts,
+                self._balloon_added_slots,
+                self.max_total_num_tokens,
+            )
             logger.info(
                 "Committed balloon runtime: state=%s runtime_variant=%s offloaded_local_experts=%d added_kv_slots=%d max_total_num_tokens=%d",
                 self._balloon_state,
@@ -2158,6 +2230,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         rank = rank_offset + self.tp_rank
 
+        # Idempotent: if a group with the same name is already initialized,
+        # return success. Callers (e.g. KunServeController) may retry the same
+        # request and we must not double-init or fail the second call.
+        if group_name in self._model_update_group:
+            logger.info(
+                f"init custom process group: group_name={group_name} already initialized, returning success."
+            )
+            return True, "Process group already initialized."
+
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
             f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
@@ -2175,6 +2256,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
             logger.error(message)
+            # Best-effort cleanup so a retry with a fresh group_name/port has a
+            # clean torch.distributed state. The TCPStore created inside
+            # rendezvous() may still be holding the master port until its
+            # Python ref is dropped; force gc to release it sooner.
+            half_pg = self._model_update_group.pop(group_name, None)
+            if half_pg is not None:
+                try:
+                    torch.distributed.destroy_process_group(half_pg)
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up half-initialized process group %s",
+                        group_name,
+                    )
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
             return False, message
 
     def destroy_weights_update_group(self, group_name):
