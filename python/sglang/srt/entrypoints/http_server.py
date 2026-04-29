@@ -127,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     SyncKVCapacityReqInput,
+    WarmupBalloonReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -655,6 +656,12 @@ async def get_balloon_status():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def prepare_balloon(obj: PrepareBalloonReqInput, request: Request):
     return await _global_state.tokenizer_manager.prepare_balloon(obj)
+
+
+@app.api_route("/kunserve/warmup_balloon", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def warmup_balloon(obj: WarmupBalloonReqInput, request: Request):
+    return await _global_state.tokenizer_manager.warmup_balloon(obj)
 
 
 @app.api_route("/kunserve/commit_balloon", methods=["POST"])

@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     RestoreFromBalloonReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SyncKVCapacityReqInput,
+    WarmupBalloonReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -197,6 +198,27 @@ class BaseTpWorker(ABC):
             process_group_name=recv_req.process_group_name,
             capture_cuda_graph=recv_req.capture_cuda_graph,
         )
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        return status
+
+    def warmup_balloon(self, recv_req: WarmupBalloonReqInput):
+        status = self.model_runner.warmup_balloon(
+            target_variant=recv_req.target_variant,
+            runtime_ep_size=recv_req.runtime_ep_size,
+            moe_ep_rank=recv_req.moe_ep_rank,
+            dispatch_ep_rank=recv_req.dispatch_ep_rank,
+            runtime_rank_offset=recv_req.runtime_rank_offset,
+            dispatch_rank_offset=recv_req.dispatch_rank_offset,
+            retained_local_experts=recv_req.retained_local_experts,
+            active_local_expert_mapping=recv_req.active_local_expert_mapping,
+            active_local_expert_mapping_by_layer=recv_req.active_local_expert_mapping_by_layer,
+            physical_to_logical_map=recv_req.physical_to_logical_map,
+            process_group_name=recv_req.process_group_name,
+            capture_cuda_graph=recv_req.capture_cuda_graph,
+        )
+        # Warmup does not change max_total_num_tokens, but mirror the pattern
+        # used by other balloon entry points so any future internal cache stays
+        # in sync.
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         return status
 

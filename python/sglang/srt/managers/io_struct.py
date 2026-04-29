@@ -1589,6 +1589,30 @@ class PrepareBalloonReqInput(BaseReq):
 
 
 @dataclass
+class WarmupBalloonReqInput(BaseReq):
+    """Idempotent eager-warmup of the GLOBAL runtime + CUDA graph.
+
+    Carries the same layout payload as PrepareBalloonReqInput. The handler
+    performs the bundle registration and graph capture without flipping
+    `_balloon_state` or disabling graph replay, so the engine stays usable
+    in LOCAL mode after warmup completes.
+    """
+
+    target_variant: str = "global"
+    runtime_ep_size: Optional[int] = None
+    moe_ep_rank: Optional[int] = None
+    dispatch_ep_rank: Optional[int] = None
+    runtime_rank_offset: Optional[int] = None
+    dispatch_rank_offset: Optional[int] = None
+    retained_local_experts: Optional[int] = None
+    active_local_expert_mapping: Optional[List[int]] = None
+    active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None
+    physical_to_logical_map: Optional[List[List[int]]] = None
+    process_group_name: Optional[str] = None
+    capture_cuda_graph: bool = True
+
+
+@dataclass
 class CommitBalloonReqInput(BaseReq):
     target_variant: str = "global"
     offload_local_experts: int = 0
@@ -1609,6 +1633,13 @@ class SyncKVCapacityReqInput(BaseReq):
 
 @dataclass
 class PrepareBalloonReqOutput(BaseReq):
+    success: bool
+    message: str
+    status: Dict[str, Any]
+
+
+@dataclass
+class WarmupBalloonReqOutput(BaseReq):
     success: bool
     message: str
     status: Dict[str, Any]

@@ -125,6 +125,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     RestoreFromBalloonReqInput,
     RestoreFromBalloonReqOutput,
+    WarmupBalloonReqInput,
+    WarmupBalloonReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -1123,6 +1125,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetBalloonStatusReqInput, self.get_balloon_status),
                 (PrepareBalloonReqInput, self.prepare_balloon),
+                (WarmupBalloonReqInput, self.warmup_balloon),
                 (CommitBalloonReqInput, self.commit_balloon),
                 (RestoreFromBalloonReqInput, self.restore_from_balloon),
                 (SyncKVCapacityReqInput, self.sync_kv_capacity),
@@ -3037,6 +3040,40 @@ class Scheduler(
                 recv_req.process_group_name,
             )
             return PrepareBalloonReqOutput(
+                success=False,
+                message=str(exc),
+                status=self.get_balloon_status(GetBalloonStatusReqInput()).status,
+            )
+
+    def warmup_balloon(self, recv_req: WarmupBalloonReqInput):
+        logger.info(
+            "[KunServeScheduler] warmup_balloon request: target=%s runtime_ep_size=%s "
+            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_graph=%s",
+            recv_req.target_variant,
+            recv_req.runtime_ep_size,
+            recv_req.runtime_rank_offset,
+            recv_req.dispatch_rank_offset,
+            recv_req.process_group_name,
+            recv_req.capture_cuda_graph,
+        )
+        try:
+            status = self.tp_worker.warmup_balloon(recv_req)
+            logger.info(
+                "[KunServeScheduler] warmup_balloon success: %s",
+                self._format_balloon_status(status),
+            )
+            return WarmupBalloonReqOutput(
+                success=True,
+                message="Warmed up balloon runtime.",
+                status=status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[KunServeScheduler] warmup_balloon failed: target=%s process_group=%s",
+                recv_req.target_variant,
+                recv_req.process_group_name,
+            )
+            return WarmupBalloonReqOutput(
                 success=False,
                 message=str(exc),
                 status=self.get_balloon_status(GetBalloonStatusReqInput()).status,

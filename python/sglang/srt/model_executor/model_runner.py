@@ -1077,6 +1077,77 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         return offload_modes
 
+    def _warmup_balloon_global_runtime(
+        self,
+        *,
+        target_variant: str,
+        runtime_ep_size: Optional[int],
+        moe_ep_rank: Optional[int],
+        dispatch_ep_rank: Optional[int],
+        runtime_rank_offset: Optional[int],
+        dispatch_rank_offset: Optional[int],
+        retained_local_experts: Optional[int],
+        active_local_expert_mapping: Optional[List[int]],
+        active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]],
+        physical_to_logical_map,
+        process_group_name: Optional[str],
+        capture_cuda_graph: bool,
+    ) -> List[torch.nn.Module]:
+        """Idempotent setup that prepares the global runtime bundle and CUDA graph.
+
+        Shared by `prepare_balloon` (state-changing path) and `warmup_balloon`
+        (state-preserving path). Does NOT touch `_balloon_state` or
+        `_balloon_graph_replay_enabled`. Returns the list of FusedMoE layers
+        in case the caller needs them.
+        """
+        fused_layers = self._iter_fused_moe_layers()
+
+        # Snapshot the live LOCAL expert-location metadata while we're still
+        # in `local` state so restore_from_balloon can put it back later.
+        # `prepared` state retains this snapshot; we re-take it here so that
+        # warmup-only (state stays local) is consistent with prepare's
+        # behavior.
+        if not self.is_draft_worker and self._balloon_state == "local":
+            live_metadata = get_global_expert_location_metadata()
+            if live_metadata is not None:
+                self._balloon_local_expert_location_metadata = copy.deepcopy(
+                    live_metadata
+                )
+
+        if target_variant != "global":
+            return fused_layers
+
+        if not fused_layers:
+            raise ValueError("Global balloon runtime requires FusedMoE layers.")
+
+        # Re-register the global bundle when callers gave us a layout (idempotent
+        # — overwrites the prior bundle) or when none has been registered yet.
+        if (
+            retained_local_experts is not None
+            or active_local_expert_mapping is not None
+            or active_local_expert_mapping_by_layer is not None
+            or getattr(fused_layers[0], "global_bundle", None) is None
+        ):
+            self.register_balloon_global_runtime_bundle(
+                runtime_ep_size=runtime_ep_size,
+                moe_ep_rank=moe_ep_rank,
+                dispatch_ep_rank=dispatch_ep_rank,
+                runtime_rank_offset=runtime_rank_offset,
+                dispatch_rank_offset=dispatch_rank_offset,
+                retained_local_experts=retained_local_experts,
+                active_local_expert_mapping=active_local_expert_mapping,
+                active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
+                physical_to_logical_map=physical_to_logical_map,
+                process_group_name=process_group_name,
+            )
+
+        # ensure_cuda_graph_variant_captured short-circuits when the graph for
+        # this variant is already in `self.graphs`.
+        if capture_cuda_graph:
+            self.ensure_cuda_graph_variant_captured(target_variant)
+
+        return fused_layers
+
     def prepare_balloon(
         self,
         *,
@@ -1094,7 +1165,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capture_cuda_graph: bool = True,
     ) -> Dict[str, Any]:
         target_variant = self._normalize_balloon_variant(target_variant)
-        fused_layers = self._iter_fused_moe_layers()
         _kunserve_ms(
             "[KUNSERVE-MS] prepare start: target_variant=%s pg=%s capture_cuda_graph=%s "
             "runtime_ep_size=%s rank_offset=%s",
@@ -1116,39 +1186,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             process_group_name,
             capture_cuda_graph,
         )
-        if not self.is_draft_worker and self._balloon_state == "local":
-            live_metadata = get_global_expert_location_metadata()
-            if live_metadata is not None:
-                self._balloon_local_expert_location_metadata = copy.deepcopy(
-                    live_metadata
-                )
-        if target_variant == "global":
-            if not fused_layers:
-                raise ValueError("Global balloon runtime requires FusedMoE layers.")
-            if (
-                retained_local_experts is not None
-                or active_local_expert_mapping is not None
-                or active_local_expert_mapping_by_layer is not None
-                or (
-                    fused_layers
-                    and getattr(fused_layers[0], "global_bundle", None) is None
-                )
-            ):
-                self.register_balloon_global_runtime_bundle(
-                    runtime_ep_size=runtime_ep_size,
-                    moe_ep_rank=moe_ep_rank,
-                    dispatch_ep_rank=dispatch_ep_rank,
-                    runtime_rank_offset=runtime_rank_offset,
-                    dispatch_rank_offset=dispatch_rank_offset,
-                    retained_local_experts=retained_local_experts,
-                    active_local_expert_mapping=active_local_expert_mapping,
-                    active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
-                    physical_to_logical_map=physical_to_logical_map,
-                    process_group_name=process_group_name,
-                )
 
-            if capture_cuda_graph:
-                self.ensure_cuda_graph_variant_captured(target_variant)
+        self._warmup_balloon_global_runtime(
+            target_variant=target_variant,
+            runtime_ep_size=runtime_ep_size,
+            moe_ep_rank=moe_ep_rank,
+            dispatch_ep_rank=dispatch_ep_rank,
+            runtime_rank_offset=runtime_rank_offset,
+            dispatch_rank_offset=dispatch_rank_offset,
+            retained_local_experts=retained_local_experts,
+            active_local_expert_mapping=active_local_expert_mapping,
+            active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
+            physical_to_logical_map=physical_to_logical_map,
+            process_group_name=process_group_name,
+            capture_cuda_graph=capture_cuda_graph,
+        )
 
         self._balloon_prepared_variant = target_variant
         self._balloon_state = "prepared"
@@ -1156,6 +1208,94 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_last_error = None
         _kunserve_ms(
             "[KUNSERVE-MS] prepare done: state=prepared target_variant=%s captured_variants=%s graph_replay_enabled=False",
+            target_variant,
+            self.get_cuda_graph_capture_variants(),
+        )
+        return self.get_balloon_status()
+
+    def warmup_balloon(
+        self,
+        *,
+        target_variant: str = "global",
+        runtime_ep_size: Optional[int] = None,
+        moe_ep_rank: Optional[int] = None,
+        dispatch_ep_rank: Optional[int] = None,
+        runtime_rank_offset: Optional[int] = None,
+        dispatch_rank_offset: Optional[int] = None,
+        retained_local_experts: Optional[int] = None,
+        active_local_expert_mapping: Optional[List[int]] = None,
+        active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None,
+        physical_to_logical_map=None,
+        process_group_name: Optional[str] = None,
+        capture_cuda_graph: bool = True,
+    ) -> Dict[str, Any]:
+        """Pre-build the GLOBAL runtime bundle and capture its CUDA graph
+        without changing balloon state.
+
+        Designed for the KunServe controller to call once at startup, after
+        the cross-replica process group is up. After this returns, a
+        subsequent prepare_balloon → commit_balloon transition skips the
+        ~30s graph capture (it's already cached).
+
+        Idempotency:
+        - State must be `local`. Calling from `prepared` or `balloon` is a
+          no-op (those paths already did or are doing the work).
+        - The underlying `ensure_cuda_graph_variant_captured` is idempotent
+          via `has_captured_variant`; calling warmup twice is cheap.
+        """
+        target_variant = self._normalize_balloon_variant(target_variant)
+        if self._balloon_state != "local":
+            logger.info(
+                "Warmup balloon skipped: current state=%s (not local).",
+                self._balloon_state,
+            )
+            return self.get_balloon_status()
+
+        _kunserve_ms(
+            "[KUNSERVE-MS] warmup start: target_variant=%s pg=%s capture_cuda_graph=%s "
+            "runtime_ep_size=%s rank_offset=%s",
+            target_variant,
+            process_group_name,
+            capture_cuda_graph,
+            runtime_ep_size,
+            runtime_rank_offset,
+        )
+        logger.info(
+            "Warmup balloon: target_variant=%s runtime_ep_size=%s moe_ep_rank=%s "
+            "runtime_rank_offset=%s process_group=%s capture_cuda_graph=%s",
+            target_variant,
+            runtime_ep_size,
+            moe_ep_rank,
+            runtime_rank_offset,
+            process_group_name,
+            capture_cuda_graph,
+        )
+
+        try:
+            self._warmup_balloon_global_runtime(
+                target_variant=target_variant,
+                runtime_ep_size=runtime_ep_size,
+                moe_ep_rank=moe_ep_rank,
+                dispatch_ep_rank=dispatch_ep_rank,
+                runtime_rank_offset=runtime_rank_offset,
+                dispatch_rank_offset=dispatch_rank_offset,
+                retained_local_experts=retained_local_experts,
+                active_local_expert_mapping=active_local_expert_mapping,
+                active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
+                physical_to_logical_map=physical_to_logical_map,
+                process_group_name=process_group_name,
+                capture_cuda_graph=capture_cuda_graph,
+            )
+        except Exception as exc:
+            self._balloon_last_error = str(exc)
+            logger.exception(
+                "Warmup balloon failed: target_variant=%s", target_variant
+            )
+            raise
+
+        self._balloon_last_error = None
+        _kunserve_ms(
+            "[KUNSERVE-MS] warmup done: state=local target_variant=%s captured_variants=%s graph_replay_enabled=True",
             target_variant,
             self.get_cuda_graph_capture_variants(),
         )

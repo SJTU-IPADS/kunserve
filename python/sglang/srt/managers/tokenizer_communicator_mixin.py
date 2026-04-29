@@ -82,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     SyncKVCapacityReqInput,
     SyncKVCapacityReqOutput,
+    WarmupBalloonReqInput,
+    WarmupBalloonReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -233,6 +235,9 @@ class TokenizerCommunicatorMixin:
         self.prepare_balloon_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.warmup_balloon_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.commit_balloon_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -344,6 +349,10 @@ class TokenizerCommunicatorMixin:
                 (
                     PrepareBalloonReqOutput,
                     self.prepare_balloon_communicator.handle_recv,
+                ),
+                (
+                    WarmupBalloonReqOutput,
+                    self.warmup_balloon_communicator.handle_recv,
                 ),
                 (
                     CommitBalloonReqOutput,
@@ -912,6 +921,12 @@ class TokenizerCommunicatorMixin:
     ) -> List[PrepareBalloonReqOutput]:
         self.auto_create_handle_loop()
         return await self.prepare_balloon_communicator(obj)
+
+    async def warmup_balloon(
+        self: TokenizerManager, obj: WarmupBalloonReqInput
+    ) -> List[WarmupBalloonReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.warmup_balloon_communicator(obj)
 
     async def commit_balloon(
         self: TokenizerManager, obj: CommitBalloonReqInput
