@@ -34,12 +34,13 @@ static int current_device() {
     return dev;
 }
 
+// API: reserve virtual memory of given size, returning the base virtual address as int64
 static int64_t vmm_reserve(int64_t size) {
     CUdeviceptr ptr = 0;
     CHECK_CU(cuMemAddressReserve(&ptr, (size_t)size, 0, 0, 0));
     return (int64_t)ptr;
 }
-
+// API: create a physical allocation handle of given size, returning the handle as int64
 static int64_t vmm_create_phys(int64_t size) {
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -49,7 +50,8 @@ static int64_t vmm_create_phys(int64_t size) {
     CHECK_CU(cuMemCreate(&h, (size_t)size, &prop, 0));
     return (int64_t)h;
 }
-
+// API: map a physical handle into a reserved virtual address range with given offsets and size,
+// then allow this device to access the mapping with read/write permissions.
 static void vmm_map_with_offset(
     int64_t va,
     int64_t va_offset,
