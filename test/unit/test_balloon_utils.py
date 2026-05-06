@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.model_executor.balloon_utils import (
     build_dispatcher_local_expert_mapping,
+    build_dispatcher_physical_expert_mapping,
     resolve_balloon_kv_slots_to_expand,
     resolve_balloon_kv_slots_to_whole_donor_segments,
     slice_rank_local_logical_expert_ids,
@@ -50,6 +51,38 @@ class TestBuildDispatcherLocalExpertMapping(unittest.TestCase):
         expected = torch.full((128,), -1, dtype=torch.int32)
         expected[96:128] = torch.arange(32, dtype=torch.int32)
         self.assertTrue(torch.equal(dispatcher_mapping, expected))
+
+
+class TestBuildDispatcherPhysicalExpertMapping(unittest.TestCase):
+    def test_reindexes_global_physical_ids_for_active_suffix(self):
+        dispatcher_mapping = build_dispatcher_physical_expert_mapping(
+            num_physical_experts=128,
+            runtime_ep_rank=2,
+            active_local_expert_mapping=list(range(32, 64)),
+        )
+
+        expected = torch.full((128,), -1, dtype=torch.int32)
+        expected[64:96] = torch.arange(32, dtype=torch.int32)
+        self.assertTrue(torch.equal(dispatcher_mapping, expected))
+
+    def test_reindexes_global_physical_ids_for_active_prefix(self):
+        dispatcher_mapping = build_dispatcher_physical_expert_mapping(
+            num_physical_experts=128,
+            runtime_ep_rank=1,
+            active_local_expert_mapping=list(range(0, 32)),
+        )
+
+        expected = torch.full((128,), -1, dtype=torch.int32)
+        expected[32:64] = torch.arange(32, dtype=torch.int32)
+        self.assertTrue(torch.equal(dispatcher_mapping, expected))
+
+    def test_rejects_rank_outside_runtime_ep_size(self):
+        with self.assertRaisesRegex(ValueError, "outside"):
+            build_dispatcher_physical_expert_mapping(
+                num_physical_experts=128,
+                runtime_ep_rank=4,
+                active_local_expert_mapping=list(range(32)),
+            )
 
 
 class TestResolveBalloonKvSlotsToExpand(unittest.TestCase):

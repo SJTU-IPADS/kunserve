@@ -69,7 +69,9 @@ def build_dispatcher_local_expert_mapping(
         )
 
     local_logical_expert_ids = local_logical_expert_ids.to(dtype=torch.int32).cpu()
-    active_local_expert_mapping = active_local_expert_mapping.to(dtype=torch.int32).cpu()
+    active_local_expert_mapping = active_local_expert_mapping.to(
+        dtype=torch.int32
+    ).cpu()
 
     start = int(active_local_expert_mapping[0].item())
     expected = torch.arange(
@@ -111,6 +113,69 @@ def build_dispatcher_local_expert_mapping(
         dispatcher_local_expert_mapping[logical_expert_id] = compact_local_idx
 
     return dispatcher_local_expert_mapping
+
+
+def build_dispatcher_physical_expert_mapping(
+    *,
+    num_physical_experts: int,
+    runtime_ep_rank: int,
+    active_local_expert_mapping: Union[torch.Tensor, Sequence[int]],
+) -> torch.Tensor:
+    if num_physical_experts <= 0:
+        raise ValueError(
+            f"num_physical_experts must be positive, got {num_physical_experts}"
+        )
+    if runtime_ep_rank < 0:
+        raise ValueError(f"runtime_ep_rank must be non-negative, got {runtime_ep_rank}")
+    if not isinstance(active_local_expert_mapping, torch.Tensor):
+        active_local_expert_mapping = torch.tensor(active_local_expert_mapping)
+    if (
+        active_local_expert_mapping.dim() != 1
+        or active_local_expert_mapping.numel() == 0
+    ):
+        raise ValueError(
+            "active_local_expert_mapping must be a non-empty 1D tensor or sequence."
+        )
+
+    active_local_expert_mapping = active_local_expert_mapping.to(
+        dtype=torch.int32
+    ).cpu()
+    start = int(active_local_expert_mapping[0].item())
+    expected = torch.arange(
+        start,
+        start + active_local_expert_mapping.numel(),
+        dtype=active_local_expert_mapping.dtype,
+    )
+    if not torch.equal(active_local_expert_mapping, expected):
+        raise ValueError(
+            "active_local_expert_mapping must describe a contiguous local expert slice."
+        )
+
+    num_runtime_local_experts = int(active_local_expert_mapping.numel())
+    if num_physical_experts % num_runtime_local_experts != 0:
+        raise ValueError(
+            "num_physical_experts must be divisible by the active local expert count: "
+            f"{num_physical_experts} vs {num_runtime_local_experts}"
+        )
+
+    runtime_ep_size = num_physical_experts // num_runtime_local_experts
+    if runtime_ep_rank >= runtime_ep_size:
+        raise ValueError(
+            f"runtime_ep_rank {runtime_ep_rank} is outside [0, {runtime_ep_size})."
+        )
+
+    dispatcher_mapping = torch.full(
+        (num_physical_experts,),
+        -1,
+        dtype=torch.int32,
+    )
+    physical_start = int(runtime_ep_rank) * num_runtime_local_experts
+    physical_end = physical_start + num_runtime_local_experts
+    dispatcher_mapping[physical_start:physical_end] = torch.arange(
+        num_runtime_local_experts,
+        dtype=torch.int32,
+    )
+    return dispatcher_mapping
 
 
 def resolve_balloon_kv_slots_to_expand(
@@ -188,9 +253,8 @@ def resolve_balloon_kv_slots_to_whole_donor_segments(
 
         for row_bytes in allocation_row_bytes:
             required_boundary_bytes += candidate_slots * row_bytes
-            while (
-                donor_bytes_used < required_boundary_bytes
-                and donor_idx < len(donor_segment_sizes)
+            while donor_bytes_used < required_boundary_bytes and donor_idx < len(
+                donor_segment_sizes
             ):
                 donor_bytes_used += donor_segment_sizes[donor_idx]
                 donor_idx += 1

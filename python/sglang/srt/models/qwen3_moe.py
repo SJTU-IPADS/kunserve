@@ -301,7 +301,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        expert_location_dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if get_global_server_args().ep_dispatch_algorithm is not None
+            else None
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
         final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             self.tp_size > 1

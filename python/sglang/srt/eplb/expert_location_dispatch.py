@@ -12,6 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
+import datetime
+import logging
+import os
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -20,8 +23,34 @@ import torch
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.server_args import get_global_server_args
 
-
 _KUNSERVE_DBG_LAST_SIG = {}
+_logger = logging.getLogger(__name__)
+
+
+def _is_cuda_graph_capturing(tensor: Optional[torch.Tensor]) -> bool:
+    if tensor is None or not tensor.is_cuda or not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return True
+
+
+def _kunserve_dbg(message: str, *args) -> None:
+    _logger.warning(message, *args)
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    if not path:
+        return
+    try:
+        rendered = message % args if args else message
+    except Exception:
+        rendered = message
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"[{ts} pid={os.getpid()}] {rendered}\n")
+    except Exception:
+        pass
 
 
 @dataclass
@@ -37,9 +66,6 @@ class ExpertLocationDispatchInfo:
 
     @classmethod
     def init_new(cls, layer_id: int):
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
-
         ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
@@ -50,7 +76,7 @@ class ExpertLocationDispatchInfo:
             # can see if the static-remap path is silently disabled.
             sig = ("none", layer_id)
             if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-                _logger.warning(
+                _kunserve_dbg(
                     "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new: "
                     "ep_dispatch_algorithm=None (no logical->physical remap will be applied) layer_id=%d",
                     layer_id,
@@ -59,9 +85,7 @@ class ExpertLocationDispatchInfo:
             return None
 
         partial_dispatch = (
-            expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                layer_id, :
-            ]
+            expert_location_metadata.logical_to_rank_dispatch_physical_map[layer_id, :]
             if expert_location_metadata.logical_to_rank_dispatch_physical_map
             is not None
             else None
@@ -72,32 +96,59 @@ class ExpertLocationDispatchInfo:
         # LOCAL identity (logical i -> i) to GLOBAL complementary (e.g. logical
         # 32 -> physical 64) at commit_balloon time.
         if layer_id == 0:
-            sig = ("layer0", id(partial_dispatch))
-            if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-                _KUNSERVE_DBG_LAST_SIG[sig] = True
-                if partial_dispatch is None:
-                    _logger.warning(
+            if partial_dispatch is None:
+                sig = ("layer0_none", ep_dispatch_algorithm)
+                if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
+                    _KUNSERVE_DBG_LAST_SIG[sig] = True
+                    _kunserve_dbg(
                         "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0: "
                         "partial_logical_to_rank_dispatch_physical_map is None (algo=%s)",
                         ep_dispatch_algorithm,
                     )
+            else:
+                if _is_cuda_graph_capturing(partial_dispatch):
+                    sig = ("layer0_capture", ep_dispatch_algorithm)
+                    if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
+                        _KUNSERVE_DBG_LAST_SIG[sig] = True
+                        _kunserve_dbg(
+                            "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
+                            "first8=<skipped: cuda graph capture> logical32->phys=None "
+                            "logical64->phys=None",
+                            ep_dispatch_algorithm,
+                        )
                 else:
-                    sample = partial_dispatch[:8].tolist() if partial_dispatch.numel() >= 8 else partial_dispatch.tolist()
+                    sample = (
+                        partial_dispatch[:8].tolist()
+                        if partial_dispatch.numel() >= 8
+                        else partial_dispatch.tolist()
+                    )
                     sample32 = (
-                        int(partial_dispatch[32].item()) if partial_dispatch.numel() > 32 else None
+                        int(partial_dispatch[32].item())
+                        if partial_dispatch.numel() > 32
+                        else None
                     )
                     sample64 = (
-                        int(partial_dispatch[64].item()) if partial_dispatch.numel() > 64 else None
+                        int(partial_dispatch[64].item())
+                        if partial_dispatch.numel() > 64
+                        else None
                     )
-                    _logger.warning(
-                        "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
-                        "first8=%s logical32->phys=%s logical64->phys=%s map_id=0x%x",
+                    sig = (
+                        "layer0_values",
                         ep_dispatch_algorithm,
-                        sample,
+                        tuple(sample),
                         sample32,
                         sample64,
-                        id(partial_dispatch),
                     )
+                    if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
+                        _KUNSERVE_DBG_LAST_SIG[sig] = True
+                        _kunserve_dbg(
+                            "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
+                            "first8=%s logical32->phys=%s logical64->phys=%s",
+                            ep_dispatch_algorithm,
+                            sample,
+                            sample32,
+                            sample64,
+                        )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,

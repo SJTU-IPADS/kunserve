@@ -119,9 +119,8 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.balloon_utils import (
-    build_dispatcher_local_expert_mapping,
+    build_dispatcher_physical_expert_mapping,
     resolve_balloon_kv_slots_to_expand,
-    slice_rank_local_logical_expert_ids,
 )
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
@@ -714,7 +713,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
             self._balloon_fused_moe_layers = [
-                module for module in self.model.modules() if isinstance(module, FusedMoE)
+                module
+                for module in self.model.modules()
+                if isinstance(module, FusedMoE)
             ]
         return self._balloon_fused_moe_layers
 
@@ -777,7 +778,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             }
         else:
             if active_local_expert_mapping is not None:
-                base_mapping = torch.tensor(active_local_expert_mapping, dtype=torch.int32)
+                base_mapping = torch.tensor(
+                    active_local_expert_mapping, dtype=torch.int32
+                )
             elif retained_local_experts is not None:
                 if retained_local_experts <= 0:
                     raise ValueError(
@@ -788,7 +791,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     "Either retained_local_experts or an active_local_expert_mapping must be provided."
                 )
-            mappings = {int(layer.layer_id): base_mapping.clone() for layer in fused_layers}
+            mappings = {
+                int(layer.layer_id): base_mapping.clone() for layer in fused_layers
+            }
 
         for layer in fused_layers:
             if layer.layer_id not in mappings:
@@ -835,7 +840,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def get_cuda_graph_capture_variants(self) -> List[str]:
         variants = ["local"]
         fused_layers = self._iter_fused_moe_layers()
-        if fused_layers and all(getattr(layer, "global_bundle", None) is not None for layer in fused_layers):
+        if fused_layers and all(
+            getattr(layer, "global_bundle", None) is not None for layer in fused_layers
+        ):
             variants.append("global")
         return variants
 
@@ -847,7 +854,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _update_live_expert_location_metadata(self, metadata) -> None:
         if self.is_draft_worker or metadata is None:
-            logger.warning(
+            _kunserve_ms(
                 "[KUNSERVE-DBG] _update_live_expert_location_metadata SKIPPED "
                 "is_draft_worker=%s metadata_is_none=%s tp_rank=%s",
                 self.is_draft_worker,
@@ -857,7 +864,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
         live_metadata = get_global_expert_location_metadata()
         if live_metadata is None:
-            logger.warning(
+            _kunserve_ms(
                 "[KUNSERVE-DBG] _update_live_expert_location_metadata SKIPPED: "
                 "live_metadata is None tp_rank=%s",
                 getattr(self, "tp_rank", None),
@@ -874,10 +881,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         before = None
         after_other = None
         if live_map is not None and live_map.numel() >= 65:
-            before = (int(live_map[0, 0].item()), int(live_map[0, 32].item()), int(live_map[0, 64].item()))
+            before = (
+                int(live_map[0, 0].item()),
+                int(live_map[0, 32].item()),
+                int(live_map[0, 64].item()),
+            )
         if other_map is not None and other_map.numel() >= 65:
-            after_other = (int(other_map[0, 0].item()), int(other_map[0, 32].item()), int(other_map[0, 64].item()))
-        logger.warning(
+            after_other = (
+                int(other_map[0, 0].item()),
+                int(other_map[0, 32].item()),
+                int(other_map[0, 64].item()),
+            )
+        _kunserve_ms(
             "[KUNSERVE-DBG] _update_live_expert_location_metadata BEFORE: "
             "tp_rank=%s live_map_is_none=%s other_map_is_none=%s "
             "live[layer0,(0,32,64)]=%s other[layer0,(0,32,64)]=%s",
@@ -890,7 +905,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         live_metadata.update(metadata, list(range(live_metadata.num_layers)))
 
-        live_map_after = getattr(live_metadata, "logical_to_rank_dispatch_physical_map", None)
+        live_map_after = getattr(
+            live_metadata, "logical_to_rank_dispatch_physical_map", None
+        )
         after = None
         if live_map_after is not None and live_map_after.numel() >= 65:
             after = (
@@ -898,12 +915,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 int(live_map_after[0, 32].item()),
                 int(live_map_after[0, 64].item()),
             )
-        logger.warning(
+        _kunserve_ms(
             "[KUNSERVE-DBG] _update_live_expert_location_metadata AFTER: "
             "tp_rank=%s live[layer0,(0,32,64)]=%s same_storage=%s",
             getattr(self, "tp_rank", None),
             after,
-            (live_map is live_map_after) if (live_map is not None and live_map_after is not None) else None,
+            (
+                (live_map is live_map_after)
+                if (live_map is not None and live_map_after is not None)
+                else None
+            ),
         )
 
     def _build_balloon_global_metadata(
@@ -932,9 +953,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         resolved_dispatch_ep_rank = self._resolve_balloon_rank(
             explicit_rank=dispatch_ep_rank,
-            rank_offset=dispatch_rank_offset
-            if dispatch_rank_offset is not None
-            else runtime_rank_offset,
+            rank_offset=(
+                dispatch_rank_offset
+                if dispatch_rank_offset is not None
+                else runtime_rank_offset
+            ),
             default_rank=self.moe_ep_rank,
         )
 
@@ -967,15 +990,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # KunServe BALLOON publishes a complementary physical_to_logical_map
         # across replicas (e.g. replica 0 retains [0..31, 64..95] while replica
-        # 1 retains [32..63, 96..127]). DeepEP routes by `topk_id //
-        # num_local_experts`, which only matches the canonical contiguous
-        # layout. Without `ep_dispatch_algorithm="static"` the
+        # 1 retains [32..63, 96..127]). GLOBAL runtime bundles use physical
+        # expert ids as the dispatch domain. Without
+        # `ep_dispatch_algorithm="static"` the
         # `logical_to_rank_dispatch_physical_map` table is not built, the
         # model's `topk_ids_logical_to_physical` step is a no-op, and BALLOON
-        # forward sends every cross-replica token to the wrong owner — the
-        # observable symptom is the model collapsing into repeated-character
-        # output until it hits max_new_tokens. Fail loudly instead of
-        # silently producing garbage; the fix is a CLI flag, not a code fix.
+        # forward indexes/routes against the wrong expert rows. The observable
+        # symptom is the model collapsing into repeated-character output until
+        # it hits max_new_tokens. Fail loudly instead of silently producing
+        # garbage.
         if str(getattr(self.server_args, "ep_dispatch_algorithm", None)) != "static":
             raise ValueError(
                 "Balloon GLOBAL bundle requires server_args.ep_dispatch_algorithm='static' "
@@ -984,6 +1007,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "engine_kwargs.sglang.ep_dispatch_algorithm=static (verl). Current value: "
                 f"{getattr(self.server_args, 'ep_dispatch_algorithm', None)!r}."
             )
+        moe_a2a_backend = get_moe_a2a_backend()
+        if moe_a2a_backend.is_none():
+            raise ValueError(
+                "Balloon GLOBAL bundle requires a cross-rank MoE A2A backend. "
+                "moe_a2a_backend='none' only computes rank-local expert outputs "
+                "and combines them inside the local TP group; it cannot route "
+                "tokens to experts retained by the peer KunServe replica. Pass "
+                "engine_kwargs.sglang.moe_a2a_backend=deepep and "
+                "engine_kwargs.sglang.moe_runner_backend=deep_gemm for the "
+                "current Qwen3 KunServe setup."
+            )
+        if (moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake()) and str(
+            getattr(self.server_args, "moe_runner_backend", None)
+        ) != "deep_gemm":
+            raise ValueError(
+                "Balloon GLOBAL bundle with moe_a2a_backend="
+                f"{moe_a2a_backend.value!r} requires "
+                "server_args.moe_runner_backend='deep_gemm'. This sglang build "
+                "only registers DeepEP/Mooncake MoE pre/post permutation paths "
+                "for the deep_gemm runner; leaving the runner as 'auto' or "
+                "'triton' can crash the scheduler during warmup/cuda-graph "
+                "capture. Pass engine_kwargs.sglang.moe_runner_backend=deep_gemm. "
+                f"Current value: {getattr(self.server_args, 'moe_runner_backend', None)!r}."
+            )
 
         active_mappings = self._normalize_balloon_active_mappings(
             retained_local_experts=retained_local_experts,
@@ -991,13 +1038,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
         )
         runtime_group = self._resolve_balloon_process_group(process_group_name)
-        self._balloon_global_expert_location_metadata = self._build_balloon_global_metadata(
-            physical_to_logical_map=physical_to_logical_map,
-            runtime_ep_size=runtime_ep_size,
-            moe_ep_rank=moe_ep_rank,
-            dispatch_ep_rank=dispatch_ep_rank,
-            runtime_rank_offset=runtime_rank_offset,
-            dispatch_rank_offset=dispatch_rank_offset,
+        runtime_group_size = None
+        if runtime_group is not None:
+            try:
+                runtime_group_size = (
+                    int(runtime_group.world_size)
+                    if hasattr(runtime_group, "world_size")
+                    else int(dist.get_world_size(group=runtime_group))
+                )
+            except Exception:
+                runtime_group_size = "unknown"
+        self._balloon_global_expert_location_metadata = (
+            self._build_balloon_global_metadata(
+                physical_to_logical_map=physical_to_logical_map,
+                runtime_ep_size=runtime_ep_size,
+                moe_ep_rank=moe_ep_rank,
+                dispatch_ep_rank=dispatch_ep_rank,
+                runtime_rank_offset=runtime_rank_offset,
+                dispatch_rank_offset=dispatch_rank_offset,
+            )
         )
 
         # KUNSERVE-DBG: confirm the GLOBAL metadata's
@@ -1007,7 +1066,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # ep_dispatch_algorithm=static set on the CLI.
         gmeta = self._balloon_global_expert_location_metadata
         if gmeta is None:
-            logger.warning(
+            _kunserve_ms(
                 "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
                 "global metadata is None tp_rank=%s",
                 self.tp_rank,
@@ -1015,7 +1074,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             gmap = getattr(gmeta, "logical_to_rank_dispatch_physical_map", None)
             if gmap is None:
-                logger.warning(
+                _kunserve_ms(
                     "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
                     "GLOBAL metadata.logical_to_rank_dispatch_physical_map is None "
                     "tp_rank=%s ep_dispatch_algorithm=%s -- topk will NOT remap, "
@@ -1024,23 +1083,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     getattr(self.server_args, "ep_dispatch_algorithm", None),
                 )
             else:
-                logger.warning(
+                _kunserve_ms(
                     "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
                     "tp_rank=%s GLOBAL_dispatch_map shape=%s "
                     "layer0[(0,32,64,96)]=(%d,%d,%d,%d) "
-                    "p2l_layer0[:8]=%s",
+                    "p2l_layer0[:8]=%s a2a_backend=%s",
                     self.tp_rank,
                     tuple(gmap.shape),
                     int(gmap[0, 0].item()),
                     int(gmap[0, 32].item()) if gmap.shape[1] > 32 else -1,
                     int(gmap[0, 64].item()) if gmap.shape[1] > 64 else -1,
                     int(gmap[0, 96].item()) if gmap.shape[1] > 96 else -1,
-                    gmeta.physical_to_logical_map_cpu[0, :8].tolist()
-                    if hasattr(gmeta, "physical_to_logical_map_cpu") else "?",
+                    (
+                        gmeta.physical_to_logical_map_cpu[0, :8].tolist()
+                        if hasattr(gmeta, "physical_to_logical_map_cpu")
+                        else "?"
+                    ),
+                    get_moe_a2a_backend().value,
                 )
         self._balloon_prepared_active_mappings = {
-            layer_id: mapping.clone()
-            for layer_id, mapping in active_mappings.items()
+            layer_id: mapping.clone() for layer_id, mapping in active_mappings.items()
         }
         self._balloon_process_group_name = process_group_name
 
@@ -1054,46 +1116,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         resolved_dispatch_ep_rank = self._resolve_balloon_rank(
             explicit_rank=dispatch_ep_rank,
-            rank_offset=dispatch_rank_offset
-            if dispatch_rank_offset is not None
-            else runtime_rank_offset,
+            rank_offset=(
+                dispatch_rank_offset
+                if dispatch_rank_offset is not None
+                else runtime_rank_offset
+            ),
             default_rank=self.moe_ep_rank,
-        )
-        local_expert_location_metadata = (
-            self._balloon_local_expert_location_metadata
-            or get_global_expert_location_metadata()
         )
         for layer in fused_layers:
             mapping = active_mappings[layer.layer_id]
-            local_num_physical_experts = int(layer.local_bundle.num_local_experts)
-            if local_expert_location_metadata is not None:
-                local_logical_expert_ids = slice_rank_local_logical_expert_ids(
-                    physical_to_logical_map=local_expert_location_metadata.physical_to_logical_map_cpu,
-                    layer_id=layer.layer_id,
-                    moe_ep_rank=int(layer.local_bundle.moe_ep_rank),
-                    num_local_physical_experts=local_num_physical_experts,
-                )
-                dispatcher_local_expert_mapping = (
-                    build_dispatcher_local_expert_mapping(
-                        num_logical_experts=int(
-                            self._balloon_global_expert_location_metadata.num_logical_experts
-                        ),
-                        local_logical_expert_ids=local_logical_expert_ids,
-                        active_local_expert_mapping=mapping,
+            num_dispatch_experts = (
+                int(self._balloon_global_expert_location_metadata.num_physical_experts)
+                if self._balloon_global_expert_location_metadata is not None
+                else int(layer.moe_runner_config.num_experts)
+            )
+            dispatcher_local_expert_mapping = build_dispatcher_physical_expert_mapping(
+                num_physical_experts=num_dispatch_experts,
+                runtime_ep_rank=resolved_moe_ep_rank,
+                active_local_expert_mapping=mapping,
+            )
+            if int(layer.layer_id) == 0:
+                probe_ids = [0, 32, 64, 96]
+                probe_values = {
+                    idx: (
+                        int(dispatcher_local_expert_mapping[idx].item())
+                        if idx < int(dispatcher_local_expert_mapping.numel())
+                        else None
                     )
-                )
-            else:
-                dispatcher_local_expert_mapping = (
-                    build_dispatcher_local_expert_mapping(
-                        num_logical_experts=int(layer.moe_runner_config.num_experts),
-                        local_logical_expert_ids=torch.arange(
-                            int(layer.local_bundle.moe_ep_rank) * local_num_physical_experts,
-                            (int(layer.local_bundle.moe_ep_rank) + 1)
-                            * local_num_physical_experts,
-                            dtype=torch.int32,
-                        ),
-                        active_local_expert_mapping=mapping,
-                    )
+                    for idx in probe_ids
+                }
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] register_balloon_global_runtime_bundle layer0 dispatcher_map: "
+                    "tp_rank=%s runtime_ep_rank=%s dispatch_ep_rank=%s active_rows=(%s,%s) "
+                    "num_dispatch_experts=%s runtime_reduce_group_size=%s dispatcher_map%s=%s",
+                    self.tp_rank,
+                    resolved_moe_ep_rank,
+                    resolved_dispatch_ep_rank,
+                    int(mapping[0].item()),
+                    int(mapping[-1].item()),
+                    num_dispatch_experts,
+                    runtime_group_size,
+                    tuple(probe_ids),
+                    probe_values,
                 )
             global_runner_config = replace(
                 layer.local_bundle.moe_runner_config,
@@ -1114,7 +1178,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return active_mappings
 
     def ensure_cuda_graph_variant_captured(self, variant: str) -> None:
-        if self.graph_runner is None or not hasattr(self.graph_runner, "ensure_variant_captured"):
+        if self.graph_runner is None or not hasattr(
+            self.graph_runner, "ensure_variant_captured"
+        ):
             return
         self.graph_runner.ensure_variant_captured(variant)
 
@@ -1400,9 +1466,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         except Exception as exc:
             self._balloon_last_error = str(exc)
-            logger.exception(
-                "Warmup balloon failed: target_variant=%s", target_variant
-            )
+            logger.exception("Warmup balloon failed: target_variant=%s", target_variant)
             raise
 
         self._balloon_last_error = None
@@ -1473,16 +1537,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 offload_modes_by_layer: Dict[int, str] = {}
                 for layer in self._iter_fused_moe_layers():
                     routed_local_experts = (
-                        layer.local_bundle.num_local_experts - layer.num_fused_shared_experts
+                        layer.local_bundle.num_local_experts
+                        - layer.num_fused_shared_experts
                     )
                     if offload_local_experts >= routed_local_experts:
                         raise ValueError(
                             f"Cannot offload {offload_local_experts} experts from layer {layer.layer_id}; "
                             f"only {routed_local_experts - 1} routed experts can be removed while keeping at least one active expert."
                         )
-                    retained_local_experts = routed_local_experts - offload_local_experts
+                    retained_local_experts = (
+                        routed_local_experts - offload_local_experts
+                    )
 
-                    allocations = getattr(layer, "_sglang_moe_weight_vmm_allocations", {})
+                    allocations = getattr(
+                        layer, "_sglang_moe_weight_vmm_allocations", {}
+                    )
                     if not allocations:
                         raise ValueError(
                             f"Layer {layer.layer_id} does not expose VMM-backed MoE allocations. "
@@ -1506,7 +1575,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
                 for layer in self._iter_fused_moe_layers():
-                    allocations = getattr(layer, "_sglang_moe_weight_vmm_allocations", {})
+                    allocations = getattr(
+                        layer, "_sglang_moe_weight_vmm_allocations", {}
+                    )
                     offload_mode = offload_modes_by_layer.get(layer.layer_id, "tail")
                     for name in ("w13_weight", "w2_weight"):
                         allocation = allocations.get(name)
@@ -1547,7 +1618,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 donor_segments = borrowed.pop_all()
                 remaining_donors = list(donor_segments)
-                total_donor_bytes = sum(segment.size_bytes for segment in donor_segments)
+                total_donor_bytes = sum(
+                    segment.size_bytes for segment in donor_segments
+                )
                 kv_cache = self._get_balloon_kv_cache()
                 bytes_per_slot = self._bytes_per_balloon_kv_slot()
                 max_slots_from_donor = total_donor_bytes // bytes_per_slot
@@ -1565,8 +1638,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     kv_vmm_headroom_slots=kv_vmm_headroom_slots,
                     num_slots_to_expand=num_slots_to_expand,
                 )
-                donor_compatible_slots = kv_cache.quantize_slots_to_whole_donor_segments(
-                    added_slots, remaining_donors
+                donor_compatible_slots = (
+                    kv_cache.quantize_slots_to_whole_donor_segments(
+                        added_slots, remaining_donors
+                    )
                 )
                 if donor_compatible_slots != added_slots:
                     logger.info(
@@ -1600,7 +1675,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 kv_cache_expanded = False
                 allocator_expanded = False
                 if added_slots > 0:
-                    kv_cache.expand_by_slots(added_slots, donor_segments=remaining_donors)
+                    kv_cache.expand_by_slots(
+                        added_slots, donor_segments=remaining_donors
+                    )
                     kv_cache_expanded = True
                     self.token_to_kv_pool_allocator.expand_by_slots(added_slots)
                     allocator_expanded = True
@@ -1609,7 +1686,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "[KUNSERVE-MS] KV expanded: added_slots=%d max_total_num_tokens=%d (gain ~%.2f GiB)",
                         added_slots,
                         self.max_total_num_tokens,
-                        added_slots * bytes_per_slot / (1024.0 ** 3),
+                        added_slots * bytes_per_slot / (1024.0**3),
                     )
 
                 unused_donors = DonorLedger(label="balloon_unused")
@@ -1619,12 +1696,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._balloon_unused_donors = DonorLedger(label="balloon_unused")
 
             if target_variant == "global":
-                logger.warning(
+                _kunserve_ms(
                     "[KUNSERVE-DBG] commit_balloon variant=global: "
                     "tp_rank=%s _balloon_global_expert_location_metadata is %s, "
                     "ep_dispatch_algorithm=%s, will_call_update=%s",
                     self.tp_rank,
-                    "None" if self._balloon_global_expert_location_metadata is None else "set",
+                    (
+                        "None"
+                        if self._balloon_global_expert_location_metadata is None
+                        else "set"
+                    ),
                     getattr(self.server_args, "ep_dispatch_algorithm", None),
                     self._balloon_global_expert_location_metadata is not None,
                 )
@@ -1672,16 +1753,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_variant,
                 offload_local_experts,
             )
-            if added_slots > 0 and 'allocator_expanded' in locals() and allocator_expanded:
+            if (
+                added_slots > 0
+                and "allocator_expanded" in locals()
+                and allocator_expanded
+            ):
                 try:
                     self.token_to_kv_pool_allocator.shrink_tail(added_slots)
                 except Exception:
-                    logger.exception("Failed to roll back balloon KV allocator expansion.")
-            if added_slots > 0 and 'kv_cache_expanded' in locals() and kv_cache_expanded:
-                try:
-                    returned = self._get_balloon_kv_cache().shrink_tail(
-                        added_slots
+                    logger.exception(
+                        "Failed to roll back balloon KV allocator expansion."
                     )
+            if (
+                added_slots > 0
+                and "kv_cache_expanded" in locals()
+                and kv_cache_expanded
+            ):
+                try:
+                    returned = self._get_balloon_kv_cache().shrink_tail(added_slots)
                     returned.restore_all()
                 except Exception:
                     logger.exception("Failed to roll back balloon KV expansion.")
@@ -1717,7 +1806,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_graph_replay_enabled = False
         if self._balloon_added_slots > 0:
             self.token_to_kv_pool_allocator.shrink_tail(self._balloon_added_slots)
-            returned = self._get_balloon_kv_cache().shrink_tail(self._balloon_added_slots)
+            returned = self._get_balloon_kv_cache().shrink_tail(
+                self._balloon_added_slots
+            )
             returned.restore_all()
             self.sync_kv_capacity(
                 max_total_num_tokens=self.token_to_kv_pool_allocator.size
@@ -1795,19 +1886,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "kv_cache_vmm_enabled": bool(
                 getattr(self._get_balloon_kv_cache(), "_kv_vmm_enabled", False)
             ),
-            "kv_cache_vmm_headroom_slots": int(
-                self._balloon_kv_vmm_headroom_slots()
-            ),
+            "kv_cache_vmm_headroom_slots": int(self._balloon_kv_vmm_headroom_slots()),
             "moe_weight_vmm_enabled": bool(self._moe_weight_vmm_enabled()),
             "offloaded_local_experts": int(self._balloon_offloaded_local_experts),
             "added_kv_slots": int(self._balloon_added_slots),
             "fused_moe_layers": len(fused_layers),
-            "global_bundle_ready": all(
-                getattr(layer, "global_bundle", None) is not None
-                for layer in fused_layers
-            )
-            if fused_layers
-            else False,
+            "global_bundle_ready": (
+                all(
+                    getattr(layer, "global_bundle", None) is not None
+                    for layer in fused_layers
+                )
+                if fused_layers
+                else False
+            ),
             "tp_size": int(self.tp_size),
             "local_ep_size": int(self.moe_ep_size),
             "balloon_process_group_name": self._balloon_process_group_name,
@@ -1827,9 +1918,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 for layer in fused_layers
             },
             "local_active_local_expert_mapping_by_layer": {
-                int(layer.layer_id): layer.local_bundle.active_local_expert_mapping.tolist()
-                if layer.local_bundle.active_local_expert_mapping is not None
-                else None
+                int(layer.layer_id): (
+                    layer.local_bundle.active_local_expert_mapping.tolist()
+                    if layer.local_bundle.active_local_expert_mapping is not None
+                    else None
+                )
                 for layer in fused_layers
             },
             "local_physical_to_logical_map": (

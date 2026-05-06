@@ -374,7 +374,7 @@ class FusedMoE(torch.nn.Module):
 
     @staticmethod
     def _normalize_runtime_variant(
-        variant: Union[FusedMoERuntimeVariant, str]
+        variant: Union[FusedMoERuntimeVariant, str],
     ) -> FusedMoERuntimeVariant:
         if isinstance(variant, FusedMoERuntimeVariant):
             return variant
@@ -383,7 +383,9 @@ class FusedMoE(torch.nn.Module):
     def _build_runner_for_runtime_bundle(
         self, moe_runner_config: MoeRunnerConfig
     ) -> Optional[object]:
-        if self.quant_method is None or not hasattr(self.quant_method, "create_moe_runner"):
+        if self.quant_method is None or not hasattr(
+            self.quant_method, "create_moe_runner"
+        ):
             return getattr(self, "runner", None)
 
         prev_runner = getattr(self.quant_method, "runner", None)
@@ -409,7 +411,10 @@ class FusedMoE(torch.nn.Module):
     ) -> Dict[str, torch.Tensor]:
         if not isinstance(active_local_expert_mapping, torch.Tensor):
             active_local_expert_mapping = torch.tensor(active_local_expert_mapping)
-        if active_local_expert_mapping.dim() != 1 or active_local_expert_mapping.numel() == 0:
+        if (
+            active_local_expert_mapping.dim() != 1
+            or active_local_expert_mapping.numel() == 0
+        ):
             raise ValueError(
                 "active_local_expert_mapping must be a non-empty 1D tensor."
             )
@@ -456,7 +461,9 @@ class FusedMoE(torch.nn.Module):
         moe_tp_size: Optional[int] = None,
         moe_tp_rank: Optional[int] = None,
         num_local_experts: Optional[int] = None,
-        active_local_expert_mapping: Optional[Union[torch.Tensor, Sequence[int]]] = None,
+        active_local_expert_mapping: Optional[
+            Union[torch.Tensor, Sequence[int]]
+        ] = None,
         dispatcher_local_expert_mapping: Optional[
             Union[torch.Tensor, Sequence[int]]
         ] = None,
@@ -512,9 +519,7 @@ class FusedMoE(torch.nn.Module):
             and self.meta_overlap_args is not None
             and runner is not None
         ):
-            runner.set_overlap_args(
-                self.down_gemm_overlap_args, self.meta_overlap_args
-            )
+            runner.set_overlap_args(self.down_gemm_overlap_args, self.meta_overlap_args)
 
         bundle = FusedMoERuntimeBundle(
             variant=variant,
