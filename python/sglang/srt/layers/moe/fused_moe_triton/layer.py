@@ -438,6 +438,8 @@ class FusedMoE(torch.nn.Module):
             "w2_weight_bias",
             "w13_weight_scale",
             "w2_weight_scale",
+            "w13_weight_scale_inv",
+            "w2_weight_scale_inv",
         )
         active_tensors: Dict[str, torch.Tensor] = {}
         length = int(active_local_expert_mapping.numel())

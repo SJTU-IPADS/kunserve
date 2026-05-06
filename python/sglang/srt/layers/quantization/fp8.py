@@ -1446,13 +1446,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.runner.runner_backend.is_deep_gemm():
 
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
+            get_runtime_tensor = getattr(layer, "get_runtime_tensor", None)
+            if get_runtime_tensor is None:
+
+                def get_runtime_tensor(name):
+                    return getattr(layer, name)
+
+            w13_weight = get_runtime_tensor("w13_weight")
+            w2_weight = get_runtime_tensor("w2_weight")
 
             if self.block_quant:
                 block_shape = self.quant_config.weight_block_size
-                w13_scale = layer.w13_weight_scale_inv
-                w2_scale = layer.w2_weight_scale_inv
+                w13_scale = get_runtime_tensor("w13_weight_scale_inv")
+                w2_scale = get_runtime_tensor("w2_weight_scale_inv")
             else:
                 # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
                 scale_block_size = 128
@@ -1460,7 +1466,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
                 w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
                 w13_scale = (
-                    layer.w13_weight_scale.unsqueeze(1)
+                    get_runtime_tensor("w13_weight_scale")
+                    .unsqueeze(1)
                     .repeat_interleave(w13_scale_n, dim=1)
                     .unsqueeze(2)
                     .repeat_interleave(w13_scale_k, dim=2)
@@ -1468,7 +1475,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
                 w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
                 w2_scale = (
-                    layer.w2_weight_scale.unsqueeze(1)
+                    get_runtime_tensor("w2_weight_scale")
+                    .unsqueeze(1)
                     .repeat_interleave(w2_scale_n, dim=1)
                     .unsqueeze(2)
                     .repeat_interleave(w2_scale_k, dim=2)
