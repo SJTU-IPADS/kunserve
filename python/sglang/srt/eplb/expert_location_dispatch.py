@@ -21,6 +21,9 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.server_args import get_global_server_args
 
 
+_KUNSERVE_DBG_LAST_SIG = {}
+
+
 @dataclass
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
@@ -34,23 +37,71 @@ class ExpertLocationDispatchInfo:
 
     @classmethod
     def init_new(cls, layer_id: int):
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+
         ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
+            # KUNSERVE-DBG: noisy on every call, but only at the warning level
+            # the first time this branch is taken per layer per process so we
+            # can see if the static-remap path is silently disabled.
+            sig = ("none", layer_id)
+            if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
+                _logger.warning(
+                    "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new: "
+                    "ep_dispatch_algorithm=None (no logical->physical remap will be applied) layer_id=%d",
+                    layer_id,
+                )
+                _KUNSERVE_DBG_LAST_SIG[sig] = True
             return None
+
+        partial_dispatch = (
+            expert_location_metadata.logical_to_rank_dispatch_physical_map[
+                layer_id, :
+            ]
+            if expert_location_metadata.logical_to_rank_dispatch_physical_map
+            is not None
+            else None
+        )
+
+        # KUNSERVE-DBG: log the first 8 entries of the dispatch map for layer 0
+        # once per (process, layer_id) so we can confirm the values flip from
+        # LOCAL identity (logical i -> i) to GLOBAL complementary (e.g. logical
+        # 32 -> physical 64) at commit_balloon time.
+        if layer_id == 0:
+            sig = ("layer0", id(partial_dispatch))
+            if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
+                _KUNSERVE_DBG_LAST_SIG[sig] = True
+                if partial_dispatch is None:
+                    _logger.warning(
+                        "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0: "
+                        "partial_logical_to_rank_dispatch_physical_map is None (algo=%s)",
+                        ep_dispatch_algorithm,
+                    )
+                else:
+                    sample = partial_dispatch[:8].tolist() if partial_dispatch.numel() >= 8 else partial_dispatch.tolist()
+                    sample32 = (
+                        int(partial_dispatch[32].item()) if partial_dispatch.numel() > 32 else None
+                    )
+                    sample64 = (
+                        int(partial_dispatch[64].item()) if partial_dispatch.numel() > 64 else None
+                    )
+                    _logger.warning(
+                        "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
+                        "first8=%s logical32->phys=%s logical64->phys=%s map_id=0x%x",
+                        ep_dispatch_algorithm,
+                        sample,
+                        sample32,
+                        sample64,
+                        id(partial_dispatch),
+                    )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
-            partial_logical_to_rank_dispatch_physical_map=(
-                expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                    layer_id, :
-                ]
-                if expert_location_metadata.logical_to_rank_dispatch_physical_map
-                is not None
-                else None
-            ),
+            partial_logical_to_rank_dispatch_physical_map=partial_dispatch,
             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
                 layer_id, :
             ],

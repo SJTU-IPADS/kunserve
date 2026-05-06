@@ -2345,29 +2345,46 @@ class Scheduler(
                 else "Testing retraction. "
             )
             if kv_full_retract_flag:
-                prev_expand_requested = self.expand_requested
-                self.expand_requested = True
-                self.expand_request_reason = "retract_decode"
-                # Promote the very first transition to a milestone-level
-                # warning so it shows up clearly in training.log; subsequent
-                # ticks where expand_requested is already True stay info-level
-                # to avoid noise.
-                if not prev_expand_requested:
-                    _kunserve_ms(
-                        "[KUNSERVE-MS] expand_requested fired by retract_decode: "
-                        "available_tokens=%d gained_tokens=%d running=%d waiting=%d max_total=%d",
-                        new_available_tokens,
-                        new_token_gained,
-                        len(batch.reqs),
-                        len(self.waiting_queue),
-                        int(self.max_total_num_tokens),
-                    )
+                # Once we have already entered (or are entering) the BALLOON
+                # runtime, there is no second expansion available — additional
+                # retracts mean the workload genuinely exceeds the enlarged
+                # KV pool. Suppress further expand_requested fires so the
+                # controller stops re-polling and the metric counts reflect
+                # the actual one-shot transition.
+                mr = getattr(self.tp_worker, "model_runner", None)
+                balloon_state = str(getattr(mr, "_balloon_state", "local")) if mr is not None else "local"
+                if balloon_state == "local":
+                    prev_expand_requested = self.expand_requested
+                    self.expand_requested = True
+                    self.expand_request_reason = "retract_decode"
+                    if not prev_expand_requested:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] expand_requested fired by retract_decode: "
+                            "available_tokens=%d gained_tokens=%d running=%d waiting=%d max_total=%d",
+                            new_available_tokens,
+                            new_token_gained,
+                            len(batch.reqs),
+                            len(self.waiting_queue),
+                            int(self.max_total_num_tokens),
+                        )
+                    else:
+                        logger.info(
+                            "[KunServeScheduler] expand requested by retract_decode: "
+                            "prev_expand=%s available_tokens=%d gained_tokens=%d "
+                            "running=%d waiting=%d max_total_num_tokens=%d",
+                            prev_expand_requested,
+                            new_available_tokens,
+                            new_token_gained,
+                            len(batch.reqs),
+                            len(self.waiting_queue),
+                            int(self.max_total_num_tokens),
+                        )
                 else:
                     logger.info(
-                        "[KunServeScheduler] expand requested by retract_decode: "
-                        "prev_expand=%s available_tokens=%d gained_tokens=%d "
-                        "running=%d waiting=%d max_total_num_tokens=%d",
-                        prev_expand_requested,
+                        "[KunServeScheduler] retract_decode under BALLOON state=%s; "
+                        "not re-firing expand_requested. available_tokens=%d gained=%d "
+                        "running=%d waiting=%d max_total=%d",
+                        balloon_state,
                         new_available_tokens,
                         new_token_gained,
                         len(batch.reqs),

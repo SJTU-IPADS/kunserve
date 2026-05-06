@@ -847,11 +847,64 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _update_live_expert_location_metadata(self, metadata) -> None:
         if self.is_draft_worker or metadata is None:
+            logger.warning(
+                "[KUNSERVE-DBG] _update_live_expert_location_metadata SKIPPED "
+                "is_draft_worker=%s metadata_is_none=%s tp_rank=%s",
+                self.is_draft_worker,
+                metadata is None,
+                getattr(self, "tp_rank", None),
+            )
             return
         live_metadata = get_global_expert_location_metadata()
         if live_metadata is None:
+            logger.warning(
+                "[KUNSERVE-DBG] _update_live_expert_location_metadata SKIPPED: "
+                "live_metadata is None tp_rank=%s",
+                getattr(self, "tp_rank", None),
+            )
             return
+
+        # Snapshot a few entries before/after to verify the in-place update
+        # actually flips logical->physical from LOCAL (identity) to GLOBAL
+        # (complementary). The captured cuda graph reads from this storage at
+        # replay time, so a missing flip here is the same as the topk kernel
+        # baking in identity values.
+        live_map = getattr(live_metadata, "logical_to_rank_dispatch_physical_map", None)
+        other_map = getattr(metadata, "logical_to_rank_dispatch_physical_map", None)
+        before = None
+        after_other = None
+        if live_map is not None and live_map.numel() >= 65:
+            before = (int(live_map[0, 0].item()), int(live_map[0, 32].item()), int(live_map[0, 64].item()))
+        if other_map is not None and other_map.numel() >= 65:
+            after_other = (int(other_map[0, 0].item()), int(other_map[0, 32].item()), int(other_map[0, 64].item()))
+        logger.warning(
+            "[KUNSERVE-DBG] _update_live_expert_location_metadata BEFORE: "
+            "tp_rank=%s live_map_is_none=%s other_map_is_none=%s "
+            "live[layer0,(0,32,64)]=%s other[layer0,(0,32,64)]=%s",
+            getattr(self, "tp_rank", None),
+            live_map is None,
+            other_map is None,
+            before,
+            after_other,
+        )
+
         live_metadata.update(metadata, list(range(live_metadata.num_layers)))
+
+        live_map_after = getattr(live_metadata, "logical_to_rank_dispatch_physical_map", None)
+        after = None
+        if live_map_after is not None and live_map_after.numel() >= 65:
+            after = (
+                int(live_map_after[0, 0].item()),
+                int(live_map_after[0, 32].item()),
+                int(live_map_after[0, 64].item()),
+            )
+        logger.warning(
+            "[KUNSERVE-DBG] _update_live_expert_location_metadata AFTER: "
+            "tp_rank=%s live[layer0,(0,32,64)]=%s same_storage=%s",
+            getattr(self, "tp_rank", None),
+            after,
+            (live_map is live_map_after) if (live_map is not None and live_map_after is not None) else None,
+        )
 
     def _build_balloon_global_metadata(
         self,
@@ -912,6 +965,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not fused_layers:
             raise ValueError("Balloon runtime requires a model with FusedMoE layers.")
 
+        # KunServe BALLOON publishes a complementary physical_to_logical_map
+        # across replicas (e.g. replica 0 retains [0..31, 64..95] while replica
+        # 1 retains [32..63, 96..127]). DeepEP routes by `topk_id //
+        # num_local_experts`, which only matches the canonical contiguous
+        # layout. Without `ep_dispatch_algorithm="static"` the
+        # `logical_to_rank_dispatch_physical_map` table is not built, the
+        # model's `topk_ids_logical_to_physical` step is a no-op, and BALLOON
+        # forward sends every cross-replica token to the wrong owner — the
+        # observable symptom is the model collapsing into repeated-character
+        # output until it hits max_new_tokens. Fail loudly instead of
+        # silently producing garbage; the fix is a CLI flag, not a code fix.
+        if str(getattr(self.server_args, "ep_dispatch_algorithm", None)) != "static":
+            raise ValueError(
+                "Balloon GLOBAL bundle requires server_args.ep_dispatch_algorithm='static' "
+                "so the logical->physical remap is applied at topk time. Pass "
+                "--ep-dispatch-algorithm=static (sglang CLI) or "
+                "engine_kwargs.sglang.ep_dispatch_algorithm=static (verl). Current value: "
+                f"{getattr(self.server_args, 'ep_dispatch_algorithm', None)!r}."
+            )
+
         active_mappings = self._normalize_balloon_active_mappings(
             retained_local_experts=retained_local_experts,
             active_local_expert_mapping=active_local_expert_mapping,
@@ -926,6 +999,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             runtime_rank_offset=runtime_rank_offset,
             dispatch_rank_offset=dispatch_rank_offset,
         )
+
+        # KUNSERVE-DBG: confirm the GLOBAL metadata's
+        # logical_to_rank_dispatch_physical_map was actually built and contains
+        # the complementary inverse map (logical 32 -> physical 64 etc.). If
+        # this is None the static remap can't kick in even with
+        # ep_dispatch_algorithm=static set on the CLI.
+        gmeta = self._balloon_global_expert_location_metadata
+        if gmeta is None:
+            logger.warning(
+                "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
+                "global metadata is None tp_rank=%s",
+                self.tp_rank,
+            )
+        else:
+            gmap = getattr(gmeta, "logical_to_rank_dispatch_physical_map", None)
+            if gmap is None:
+                logger.warning(
+                    "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
+                    "GLOBAL metadata.logical_to_rank_dispatch_physical_map is None "
+                    "tp_rank=%s ep_dispatch_algorithm=%s -- topk will NOT remap, "
+                    "DeepEP will route by raw logical id and corrupt outputs",
+                    self.tp_rank,
+                    getattr(self.server_args, "ep_dispatch_algorithm", None),
+                )
+            else:
+                logger.warning(
+                    "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
+                    "tp_rank=%s GLOBAL_dispatch_map shape=%s "
+                    "layer0[(0,32,64,96)]=(%d,%d,%d,%d) "
+                    "p2l_layer0[:8]=%s",
+                    self.tp_rank,
+                    tuple(gmap.shape),
+                    int(gmap[0, 0].item()),
+                    int(gmap[0, 32].item()) if gmap.shape[1] > 32 else -1,
+                    int(gmap[0, 64].item()) if gmap.shape[1] > 64 else -1,
+                    int(gmap[0, 96].item()) if gmap.shape[1] > 96 else -1,
+                    gmeta.physical_to_logical_map_cpu[0, :8].tolist()
+                    if hasattr(gmeta, "physical_to_logical_map_cpu") else "?",
+                )
         self._balloon_prepared_active_mappings = {
             layer_id: mapping.clone()
             for layer_id, mapping in active_mappings.items()
@@ -1507,6 +1619,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._balloon_unused_donors = DonorLedger(label="balloon_unused")
 
             if target_variant == "global":
+                logger.warning(
+                    "[KUNSERVE-DBG] commit_balloon variant=global: "
+                    "tp_rank=%s _balloon_global_expert_location_metadata is %s, "
+                    "ep_dispatch_algorithm=%s, will_call_update=%s",
+                    self.tp_rank,
+                    "None" if self._balloon_global_expert_location_metadata is None else "set",
+                    getattr(self.server_args, "ep_dispatch_algorithm", None),
+                    self._balloon_global_expert_location_metadata is not None,
+                )
                 if self._balloon_global_expert_location_metadata is not None:
                     self._update_live_expert_location_metadata(
                         self._balloon_global_expert_location_metadata
