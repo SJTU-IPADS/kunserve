@@ -708,6 +708,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_process_group_name = None
         self._balloon_fused_moe_layers: Optional[List[torch.nn.Module]] = None
 
+        # KunServe-specific: when balloon will eventually pull cross-replica
+        # expert weights (signal = SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), we
+        # need to keep the LOCAL bundle off DeepEP so its NVSHMEM init never
+        # happens. The GLOBAL bundle (registered later in
+        # register_balloon_global_runtime_bundle) is the only place we want
+        # NVSHMEM, ensuring the per-process singleton init runs exactly once.
+        # Without this override the LOCAL bundle inherits the DeepEP dispatcher
+        # from FusedMoE.__init__ (because moe_a2a_backend=deepep), and the
+        # first decode-batch cuda graph capture pulls in a low-latency Buffer
+        # that initializes NVSHMEM for the local TP group; a later GLOBAL
+        # init then trips the `nvshmem_rank == internode::init(...)` assert.
+        if envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get():
+            self._force_local_bundle_to_standard_dispatcher()
+
+    def _force_local_bundle_to_standard_dispatcher(self) -> None:
+        """Replace each FusedMoE layer's LOCAL bundle with a StandardDispatcher.
+
+        Called when KunServe is in play (SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS=1).
+        Standard dispatch keeps fixed shapes (cuda-graph friendly), runs purely
+        through tp_group all-reduce (no NVSHMEM), and matches the runner via
+        the registered ``standard -> deep_gemm`` permute path. The companion
+        ``reduce_results=True`` flag tells FusedMoE.forward_impl to finish the
+        TP all-reduce internally — qwen3_moe.forward_deepep does not add one
+        on top, and the per-bundle dispatcher abstraction means model-level
+        code does not need to know which mode the layer is currently in.
+        """
+        if self.is_draft_worker:
+            return
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            FusedMoERuntimeVariant,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatcher,
+        )
+
+        layers = self._iter_fused_moe_layers()
+        if not layers:
+            return
+
+        for layer in layers:
+            standard = StandardDispatcher(
+                layer.local_bundle.moe_runner_config,
+                moe_ep_size=layer.local_bundle.moe_ep_size,
+                moe_ep_rank=layer.local_bundle.moe_ep_rank,
+                # local_expert_mapping is built lazily by StandardDispatcher
+                # on first dispatch using moe_ep_rank — leave None so it
+                # picks up the correct mapping for the live layer.
+                local_expert_mapping=None,
+            )
+            # Re-register so self._runtime_bundles[LOCAL] points at the new
+            # bundle. We reuse the existing runner so deep_gemm precompile
+            # caches survive (no second 16k-shape warmup loop). The runner is
+            # dispatcher-agnostic — see PermuteMethodPool registrations in
+            # moe_runner/deep_gemm.py for both standard->deep_gemm and
+            # deepep_ll->deep_gemm.
+            layer.register_runtime_bundle(
+                variant=FusedMoERuntimeVariant.LOCAL,
+                moe_runner_config=layer.local_bundle.moe_runner_config,
+                dispatcher=standard,
+                runner=layer.local_bundle.runner,
+                moe_ep_size=layer.local_bundle.moe_ep_size,
+                moe_ep_rank=layer.local_bundle.moe_ep_rank,
+                moe_tp_size=layer.local_bundle.moe_tp_size,
+                moe_tp_rank=layer.local_bundle.moe_tp_rank,
+                num_local_experts=layer.local_bundle.num_local_experts,
+                # Standard dispatch leaves partial sums on each rank, so
+                # FusedMoE.forward_impl must run tp_group all-reduce.
+                reduce_results=True,
+            )
+            # Refresh self.dispatcher / self.reduce_results / etc. on the
+            # FusedMoE layer so the very next forward (graph capture or live)
+            # actually picks up the new bundle.
+            layer.switch_runtime_bundle(FusedMoERuntimeVariant.LOCAL)
+        # Use _kunserve_ms (writes to KUNSERVE_DETAIL_LOG and goes through
+        # logger.warning) instead of logger.info — sglang's Ray-actor stdout
+        # capture suppresses INFO-level lines, which made it impossible to
+        # confirm this override actually fired in the previous run.
+        _kunserve_ms(
+            "[KUNSERVE-MS] forced LOCAL bundle to StandardDispatcher "
+            "(reduce_results=True) on %d FusedMoE layers; NVSHMEM will only "
+            "init when the GLOBAL bundle is created.",
+            len(layers),
+        )
+
     def _iter_fused_moe_layers(self) -> List[torch.nn.Module]:
         if self._balloon_fused_moe_layers is None:
             from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -1011,12 +1095,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if moe_a2a_backend.is_none():
             raise ValueError(
                 "Balloon GLOBAL bundle requires a cross-rank MoE A2A backend. "
-                "moe_a2a_backend='none' only computes rank-local expert outputs "
-                "and combines them inside the local TP group; it cannot route "
-                "tokens to experts retained by the peer KunServe replica. Pass "
+                "moe_a2a_backend='none' would make the GLOBAL bundle's "
+                "auto-registered dispatcher fall back to StandardDispatcher, "
+                "which only does rank-local expert compute + intra-TP "
+                "all-reduce; it cannot route tokens to experts retained by "
+                "the peer KunServe replica. Pass "
                 "engine_kwargs.sglang.moe_a2a_backend=deepep and "
-                "engine_kwargs.sglang.moe_runner_backend=deep_gemm for the "
-                "current Qwen3 KunServe setup."
+                "engine_kwargs.sglang.moe_runner_backend=deep_gemm. NOTE: the "
+                "LOCAL bundle is intentionally overridden back to Standard by "
+                "_force_local_bundle_to_standard_dispatcher (gated on "
+                "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), so this flag only "
+                "affects the GLOBAL bundle's default."
             )
         if (moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake()) and str(
             getattr(self.server_args, "moe_runner_backend", None)
@@ -1174,6 +1263,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_local_experts=int(mapping.numel()),
                 active_local_expert_mapping=mapping,
                 dispatcher_local_expert_mapping=dispatcher_local_expert_mapping,
+                # GLOBAL bundle uses a DeepEP dispatcher whose combine step
+                # already aggregates each token's expert outputs across the
+                # whole cross-replica EP world. Adding the FusedMoE-level
+                # tp_group all-reduce on top would double-reduce within the
+                # local TP group. Companion: LOCAL bundle (StandardDispatcher)
+                # registered in _force_local_bundle_to_standard_dispatcher
+                # passes reduce_results=True because Standard's combine is a
+                # no-op and partial sums need a final tp_group all-reduce.
+                reduce_results=False,
             )
         return active_mappings
 
@@ -1201,10 +1299,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _moe_weight_vmm_enabled(self) -> bool:
         fused_layers = self._iter_fused_moe_layers()
-        return bool(fused_layers) and all(
-            bool(getattr(layer, "_sglang_moe_weight_vmm_allocations", {}))
+        if not fused_layers:
+            return False
+        missing = [
+            layer
             for layer in fused_layers
-        )
+            if not bool(getattr(layer, "_sglang_moe_weight_vmm_allocations", {}))
+        ]
+        if missing:
+            if not getattr(self, "_kunserve_logged_missing_moe_weight_vmm", False):
+                sample = missing[:4]
+                _kunserve_ms(
+                    "[KUNSERVE-MS] MoE weight VMM unavailable on %d/%d layers; "
+                    "sample=%s",
+                    len(missing),
+                    len(fused_layers),
+                    [
+                        {
+                            "layer_id": getattr(layer, "layer_id", None),
+                            "quant_method": type(
+                                getattr(layer, "quant_method", None)
+                            ).__name__,
+                            "w13_dtype": str(
+                                getattr(getattr(layer, "w13_weight", None), "dtype", None)
+                            ),
+                            "w2_dtype": str(
+                                getattr(getattr(layer, "w2_weight", None), "dtype", None)
+                            ),
+                        }
+                        for layer in sample
+                    ],
+                )
+                self._kunserve_logged_missing_moe_weight_vmm = True
+            return False
+        return True
 
     def _sync_balloon_weight_allocations(self) -> None:
         for layer in self._iter_fused_moe_layers():

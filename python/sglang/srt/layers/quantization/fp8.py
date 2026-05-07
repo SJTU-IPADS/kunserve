@@ -82,6 +82,11 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.cuda_vmm import (
+    ExpandableVmmTensor,
+    MoeWeightDonorManager,
+    cuda_vmm_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -106,6 +111,85 @@ if _use_aiter or _use_hip_int4:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+_FP8_MOE_VMM_SKIP_REASONS: set[str] = set()
+
+
+def _log_fp8_moe_vmm_skip_once(message: str) -> None:
+    if message in _FP8_MOE_VMM_SKIP_REASONS:
+        return
+    _FP8_MOE_VMM_SKIP_REASONS.add(message)
+    logger.warning(message)
+
+
+def _should_enable_fp8_moe_weight_vmm() -> bool:
+    if not (
+        envs.SGLANG_EXPERIMENTAL_CUDA_VMM.get()
+        and envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get()
+    ):
+        return False
+    if not _is_cuda:
+        _log_fp8_moe_vmm_skip_once(
+            "Skipping experimental FP8 MoE VMM weights because CUDA is unavailable."
+        )
+        return False
+    if get_moe_runner_backend().is_flashinfer_trtllm():
+        _log_fp8_moe_vmm_skip_once(
+            "Skipping experimental FP8 MoE VMM weights because flashinfer TRT-LLM MoE may reshape expert weights after loading."
+        )
+        return False
+    if _use_aiter:
+        _log_fp8_moe_vmm_skip_once(
+            "Skipping experimental FP8 MoE VMM weights because the aiter post-load shuffle replaces parameter storage."
+        )
+        return False
+    if not cuda_vmm_available():
+        _log_fp8_moe_vmm_skip_once(
+            "Skipping experimental FP8 MoE VMM weights because CUDA VMM support is unavailable."
+        )
+        return False
+    return True
+
+
+def _ensure_fp8_moe_weight_vmm(layer: Module) -> None:
+    if not _should_enable_fp8_moe_weight_vmm():
+        return
+
+    existing = getattr(layer, "_sglang_moe_weight_vmm_allocations", None)
+    if existing:
+        return
+
+    allocations: dict[str, ExpandableVmmTensor] = {}
+    for name in ("w13_weight", "w2_weight"):
+        param = getattr(layer, name, None)
+        if param is None:
+            continue
+        if not param.data.is_cuda:
+            _log_fp8_moe_vmm_skip_once(
+                "Skipping experimental FP8 MoE VMM weights because MoE weights are not on CUDA when post-load processing runs."
+            )
+            return
+        source = param.data.contiguous()
+        allocation = ExpandableVmmTensor(
+            reserve_shape=tuple(source.shape),
+            dtype=source.dtype,
+            active_rows=int(source.shape[0]),
+            label=f"moe_layer_{getattr(layer, 'layer_id', -1)}_{name}",
+            wrap_full_tensor=True,
+        )
+        allocation.tensor.copy_(source)
+        param.data = allocation.tensor
+        param.requires_grad_(False)
+        allocations[name] = allocation
+
+    layer._sglang_moe_weight_vmm_allocations = allocations
+    layer._sglang_moe_weight_donor_manager = (
+        MoeWeightDonorManager(
+            layer_id=getattr(layer, "layer_id", -1),
+            allocations=allocations,
+        )
+        if allocations
+        else None
+    )
 
 
 class Fp8Config(QuantizationConfig):
@@ -713,6 +797,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.with_bias = with_bias
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        layer._sglang_moe_weight_vmm_allocations = {}
+        layer._sglang_moe_weight_donor_manager = None
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
@@ -1134,11 +1221,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
+            _ensure_fp8_moe_weight_vmm(layer)
             return
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+            _ensure_fp8_moe_weight_vmm(layer)
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -1169,6 +1258,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
+            _ensure_fp8_moe_weight_vmm(layer)
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -1260,6 +1350,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+            _ensure_fp8_moe_weight_vmm(layer)
             return
 
     def process_weights_hip_int4(self, layer: Module):

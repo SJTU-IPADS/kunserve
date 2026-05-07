@@ -181,6 +181,14 @@ class FusedMoERuntimeBundle:
     moe_tp_size: int
     moe_tp_rank: int
     num_local_experts: int
+    # Whether FusedMoE.forward_impl should run a TP all-reduce after combine.
+    # Set per-bundle so a kunserve LOCAL bundle backed by StandardDispatcher
+    # (which leaves partial sums on each rank) can request the all-reduce while
+    # a GLOBAL bundle backed by DeepEP (whose combine already reduces across the
+    # whole EP world) keeps it disabled. Default False preserves existing
+    # behavior — older callers that don't set this rely on model-level
+    # tensor_model_parallel_all_reduce after experts.
+    reduce_results: bool = False
     active_local_expert_mapping: Optional[torch.Tensor] = None
     active_tensors: Optional[Dict[str, torch.Tensor]] = None
 
@@ -368,6 +376,12 @@ class FusedMoE(torch.nn.Module):
             moe_tp_size=self.moe_tp_size,
             moe_tp_rank=self.moe_tp_rank,
             num_local_experts=self.num_local_experts,
+            # Carry the constructor's reduce_results into the auto-registered
+            # LOCAL bundle so switch_runtime_bundle doesn't clobber it back to
+            # the dataclass default. Without this, models that pass
+            # reduce_results=True (or False by default) would silently lose the
+            # value once the bundle propagates back into self.
+            reduce_results=self.reduce_results,
         )
         self.global_bundle: Optional[FusedMoERuntimeBundle] = None
         self.switch_runtime_bundle(FusedMoERuntimeVariant.LOCAL)
@@ -470,6 +484,7 @@ class FusedMoE(torch.nn.Module):
             Union[torch.Tensor, Sequence[int]]
         ] = None,
         active_tensors: Optional[Dict[str, torch.Tensor]] = None,
+        reduce_results: bool = False,
     ) -> FusedMoERuntimeBundle:
         variant = self._normalize_runtime_variant(variant)
         if active_local_expert_mapping is not None and not isinstance(
@@ -537,6 +552,7 @@ class FusedMoE(torch.nn.Module):
                 if num_local_experts is not None
                 else moe_runner_config.num_local_experts
             ),
+            reduce_results=reduce_results,
             active_local_expert_mapping=active_local_expert_mapping,
             active_tensors=active_tensors,
         )
@@ -561,6 +577,11 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_size = bundle.moe_tp_size
         self.moe_tp_rank = bundle.moe_tp_rank
         self.num_local_experts = bundle.num_local_experts
+        # Per-bundle TP all-reduce control. LOCAL bundles backed by
+        # StandardDispatcher need self.reduce_results=True so forward_impl
+        # finishes the reduction; GLOBAL bundles backed by DeepEP keep it False
+        # because DeepEP combine already aggregated across the EP world.
+        self.reduce_results = bundle.reduce_results
         self.active_local_expert_mapping = bundle.active_local_expert_mapping
         self._active_runtime_tensors = bundle.active_tensors or {}
 

@@ -427,7 +427,7 @@ def post_permute_deep_gemm_to_standard(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
-    output = torch.empty(
+    output = torch.zeros(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
     post_reorder_triton_kernel[(hidden_states_shape[0],)](

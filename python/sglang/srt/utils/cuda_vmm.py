@@ -115,6 +115,22 @@ static torch::ScalarType parse_dtype(const std::string& dtype_name) {
     if (dtype_name == "int64") {
         return torch::kInt64;
     }
+    // FP8 variants used by KunServe + DeepGEMM. All are 1-byte and stored as
+    // raw bytes in the VMM region; we just need from_blob to interpret the
+    // memory with the correct ScalarType so downstream FP8 grouped GEMM
+    // kernels accept it.
+    if (dtype_name == "float8_e4m3fn") {
+        return torch::kFloat8_e4m3fn;
+    }
+    if (dtype_name == "float8_e5m2") {
+        return torch::kFloat8_e5m2;
+    }
+    if (dtype_name == "float8_e4m3fnuz") {
+        return torch::kFloat8_e4m3fnuz;
+    }
+    if (dtype_name == "float8_e5m2fnuz") {
+        return torch::kFloat8_e5m2fnuz;
+    }
     throw std::runtime_error("Unsupported wrap dtype: " + dtype_name);
 }
 
@@ -149,6 +165,15 @@ _WRAP_DTYPE_NAMES = {
     torch.int32: "int32",
     torch.int64: "int64",
 }
+# FP8 dtypes are present on all torch builds we support (>= 2.2). Probe with
+# getattr so this module still imports cleanly on older torch where one of the
+# names is missing — the entry just isn't added in that case and the original
+# "Unsupported CUDA VMM dtype" error path is preserved.
+for _fp8_name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
+    _fp8_dtype = getattr(torch, _fp8_name, None)
+    if _fp8_dtype is not None:
+        _WRAP_DTYPE_NAMES[_fp8_dtype] = _fp8_name
+del _fp8_name, _fp8_dtype
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
