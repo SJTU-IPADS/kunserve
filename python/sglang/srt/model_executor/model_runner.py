@@ -726,28 +726,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Replace each FusedMoE layer's LOCAL bundle with a StandardDispatcher.
 
         Called when KunServe is in play (SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS=1).
-        Standard dispatch keeps fixed shapes (cuda-graph friendly), runs purely
-        through tp_group all-reduce (no NVSHMEM), and matches the runner via
-        the registered ``standard -> deep_gemm`` permute path. The companion
-        ``reduce_results=True`` flag tells FusedMoE.forward_impl to finish the
-        TP all-reduce internally — qwen3_moe.forward_deepep does not add one
-        on top, and the per-bundle dispatcher abstraction means model-level
-        code does not need to know which mode the layer is currently in.
+        Standard dispatch keeps fixed shapes (cuda-graph friendly) and runs
+        without NVSHMEM. LOCAL intentionally uses the Triton runner instead of
+        reusing the original DeepGEMM runner: the standard->deep_gemm permute
+        path is unsafe for EP-local execution with -1 non-local expert ids and
+        can corrupt hidden states before any KunServe GLOBAL commit happens.
+        The companion ``reduce_results=True`` flag tells FusedMoE.forward_impl
+        to finish the TP all-reduce internally; qwen3_moe.forward_deepep does
+        not add one on top, and the per-bundle dispatcher abstraction means
+        model-level code does not need to know which mode the layer is using.
         """
         if self.is_draft_worker:
             return
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
             FusedMoERuntimeVariant,
         )
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardDispatcher,
         )
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         layers = self._iter_fused_moe_layers()
         if not layers:
             return
 
         for layer in layers:
+            local_runner = MoeRunner(
+                MoeRunnerBackend.TRITON,
+                layer.local_bundle.moe_runner_config,
+            )
             standard = StandardDispatcher(
                 layer.local_bundle.moe_runner_config,
                 moe_ep_size=layer.local_bundle.moe_ep_size,
@@ -758,16 +766,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 local_expert_mapping=None,
             )
             # Re-register so self._runtime_bundles[LOCAL] points at the new
-            # bundle. We reuse the existing runner so deep_gemm precompile
-            # caches survive (no second 16k-shape warmup loop). The runner is
-            # dispatcher-agnostic — see PermuteMethodPool registrations in
-            # moe_runner/deep_gemm.py for both standard->deep_gemm and
-            # deepep_ll->deep_gemm.
+            # bundle. Do not reuse the original runner here: in KunServe FP8
+            # runs it is DeepGEMM, while LOCAL standard dispatch has already
+            # converted non-local experts to -1 ids. The Triton standard path
+            # is the normal local EP fallback and keeps LOCAL independent from
+            # DeepEP/NVSHMEM.
             layer.register_runtime_bundle(
                 variant=FusedMoERuntimeVariant.LOCAL,
                 moe_runner_config=layer.local_bundle.moe_runner_config,
                 dispatcher=standard,
-                runner=layer.local_bundle.runner,
+                runner=local_runner,
                 moe_ep_size=layer.local_bundle.moe_ep_size,
                 moe_ep_rank=layer.local_bundle.moe_ep_rank,
                 moe_tp_size=layer.local_bundle.moe_tp_size,
@@ -787,8 +795,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # confirm this override actually fired in the previous run.
         _kunserve_ms(
             "[KUNSERVE-MS] forced LOCAL bundle to StandardDispatcher "
-            "(reduce_results=True) on %d FusedMoE layers; NVSHMEM will only "
-            "init when the GLOBAL bundle is created.",
+            "+ Triton runner (reduce_results=True) on %d FusedMoE layers; "
+            "NVSHMEM will only init when the GLOBAL bundle is created.",
             len(layers),
         )
 
@@ -1252,9 +1260,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 layer.local_bundle.moe_runner_config,
                 num_local_experts=int(mapping.numel()),
             )
+
+            # When SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL is on (default), build
+            # the GLOBAL bundle's dispatcher in DeepEP NORMAL mode explicitly
+            # (NOT LL). Reason: this host's container does not expose
+            # /dev/infiniband/, so NVSHMEM's IBGDA transport fails to init.
+            # NVSHMEM falls back to NVL/SHM which is enough for the symmetric
+            # heap setup, but LL atomic ops still loop on completion via
+            # IBGDA-style signaling and deadlock silently after a few hundred
+            # decode steps (see ab_20260507_053135 — BALLOON forward runs 7s
+            # then both replicas freeze without any NCCL/Python exception).
+            # NORMAL mode for cross-replica intra-node has rdma_ranks=1 and
+            # low_latency_mode=False, so DeepEP buffer.py:96 skips NVSHMEM
+            # init entirely. Trade-off: dynamic-shape dispatch can't be cuda
+            # graph captured, so GLOBAL forward runs eager. LOCAL forward
+            # (StandardDispatcher) keeps its cuda graph.
+            explicit_global_dispatcher = None
+            if envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get():
+                from sglang.srt.batch_overlap.two_batch_overlap import (
+                    MaybeTboDeepEPDispatcher,
+                )
+                from sglang.srt.layers.moe.utils import DeepEPMode
+                explicit_global_dispatcher = MaybeTboDeepEPDispatcher(
+                    group=runtime_group,
+                    router_topk=global_runner_config.top_k,
+                    permute_fusion=True,
+                    num_experts=global_runner_config.num_experts,
+                    num_local_experts=int(mapping.numel()),
+                    hidden_size=global_runner_config.hidden_size,
+                    params_dtype=global_runner_config.params_dtype,
+                    deepep_mode=DeepEPMode.NORMAL,  # ← key: force NORMAL, no NVSHMEM
+                    async_finish=True,
+                    return_recv_hook=True,
+                )
+
             layer.register_runtime_bundle(
                 variant="global",
                 moe_runner_config=global_runner_config,
+                dispatcher=explicit_global_dispatcher,  # None ⇒ default DeepEP via create_moe_dispatcher
                 group=runtime_group,
                 moe_ep_size=resolved_ep_size,
                 moe_ep_rank=resolved_moe_ep_rank,
@@ -1450,7 +1493,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # ensure_cuda_graph_variant_captured short-circuits when the graph for
         # this variant is already in `self.graphs`.
         if capture_cuda_graph:
-            self.ensure_cuda_graph_variant_captured(target_variant)
+            # When the GLOBAL bundle is forced into DeepEP NORMAL mode
+            # (SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=True, the default), its
+            # dispatch_a/dispatch_b output has dynamic shape — the cuda graph
+            # capture path would either error out on shape mismatch or bake
+            # in stale shapes. We skip GLOBAL capture in that case and let
+            # BALLOON forward run eager. LOCAL graph (StandardDispatcher,
+            # fixed-shape) is unaffected because it was captured at server
+            # startup before this code path runs.
+            skip_capture = (
+                target_variant == "global"
+                and envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
+            )
+            if not skip_capture:
+                self.ensure_cuda_graph_variant_captured(target_variant)
+            else:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] skip GLOBAL cuda graph capture: "
+                    "GLOBAL bundle is in DeepEP NORMAL mode (dynamic shape, "
+                    "non-capturable). BALLOON forward will run eager.",
+                )
 
         return fused_layers
 

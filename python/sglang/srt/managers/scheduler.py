@@ -2958,7 +2958,32 @@ class Scheduler(
                 local_status.get("runtime_variant"),
             )
 
-        return self.get_idle_batch()
+        keepalive_batch = self.get_idle_batch()
+        # Force attn_tp_size dummy tokens so model_runner.forward calls
+        # prepare_mlp_sync_batch and pads input_ids to attn_tp_size
+        # (tensor_split then yields [1, 1] on TP=2 instead of [1, 0]).
+        # Without this the keepalive idle batch ships input_ids=empty(0)
+        # while the peer replica's GLOBAL EP dispatch routes 1 real token
+        # into our experts; DeepEP combine returns rank0=[1] rank1=[0]
+        # but residual stays at [0] (prepare_attn line 426 sets
+        # residual=hidden_states when shape[0]==0). The next layer's
+        # _scatter_hidden_states_and_residual then crashes:
+        #   CHECK_EQ(input.size(0), residual.size(0)) failed. 1 vs 0.
+        # We bypass maybe_prepare_mlp_sync_batch's all_gather here because
+        # both TP ranks of this replica enter this branch in lockstep and
+        # set the same constants (their num_tokens already match without
+        # extra sync), and the all_gather path would overwrite our
+        # global_num_tokens with [0] for IDLE batches (scheduler_dp_attn_
+        # mixin.py:148 falls into extend_num_tokens=0 for IDLE).
+        # Repro: ab_20260507_113241 R1 crash at 12:47:16.
+        if self.require_mlp_sync:
+            attn_tp_size = max(self.attn_tp_size, 1)
+            keepalive_batch.global_num_tokens = [attn_tp_size]
+            keepalive_batch.global_num_tokens_for_logprob = [attn_tp_size]
+            keepalive_batch.is_extend_in_batch = False
+            keepalive_batch.global_forward_mode = ForwardMode.IDLE
+            keepalive_batch.can_run_dp_cuda_graph = False
+        return keepalive_batch
 
     def flush_cache(self):
         """Flush the memory pool and cache."""

@@ -684,6 +684,19 @@ class CommunicateSimpleFn:
             get_local_dp_buffer(),
             hidden_states,
         )
+        expected_local_tokens = hidden_states.shape[0] // context.attn_tp_size
+        if local_hidden_states.shape[0] != expected_local_tokens:
+            padded_local_hidden_states = local_hidden_states.new_zeros(
+                expected_local_tokens, *local_hidden_states.shape[1:]
+            )
+            num_tokens_to_copy = min(
+                local_hidden_states.shape[0], expected_local_tokens
+            )
+            if num_tokens_to_copy > 0:
+                padded_local_hidden_states[:num_tokens_to_copy].copy_(
+                    local_hidden_states[:num_tokens_to_copy]
+                )
+            local_hidden_states = padded_local_hidden_states
         attn_tp_all_gather_into_tensor(
             hidden_states,
             local_hidden_states,
