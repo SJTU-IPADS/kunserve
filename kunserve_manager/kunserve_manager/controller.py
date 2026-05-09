@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence
 from urllib.parse import urlsplit
 
@@ -21,6 +24,7 @@ def get_free_port(host: str = "") -> tuple[int, socket.socket]:
     port = int(sock.getsockname()[1])
     sock.close()
     return port, sock
+
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +60,9 @@ class KunServeReplicaClient(Protocol):
 
     async def restore_from_balloon(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
-    async def init_weights_update_group(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def init_weights_update_group(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
     async def destroy_weights_update_group(self, group_name: str) -> dict[str, Any]: ...
 
@@ -111,8 +117,7 @@ def _status_matches_balloon_target(
         str(status.get("state", "")).lower() == "balloon"
         and str(status.get("runtime_variant", "")).lower()
         == str(target_variant).lower()
-        and int(status.get("offloaded_local_experts", -1))
-        == int(offload_local_experts)
+        and int(status.get("offloaded_local_experts", -1)) == int(offload_local_experts)
     )
 
 
@@ -350,11 +355,15 @@ class KunServeHttpReplicaClient:
     async def restore_from_balloon(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("kunserve/restore_from_balloon", payload)
 
-    async def init_weights_update_group(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def init_weights_update_group(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         return await self._request("init_weights_update_group", payload)
 
     async def destroy_weights_update_group(self, group_name: str) -> dict[str, Any]:
-        return await self._request("destroy_weights_update_group", {"group_name": group_name})
+        return await self._request(
+            "destroy_weights_update_group", {"group_name": group_name}
+        )
 
 
 class KunServeController:
@@ -371,6 +380,8 @@ class KunServeController:
         pg_init_max_attempts: int = 8,
         pg_init_retry_delay: float = 1.0,
         eager_warmup: bool = True,
+        output_dir: Optional[str] = None,
+        write_bw_log: Optional[bool] = None,
     ):
         if len(replicas) != 2:
             raise ValueError(
@@ -401,6 +412,23 @@ class KunServeController:
         # behaviour where prepare_balloon does the capture lazily.
         self.eager_warmup = bool(eager_warmup)
         self._warmup_done = False
+        self.output_dir = Path(
+            output_dir
+            or os.environ.get("KUNSERVE_MANAGER_OUTPUT_DIR")
+            or os.environ.get("SGLANG_KUNSERVE_OUTPUT_DIR")
+            or "/workspace/sglang/output"
+        )
+        self._bw_log_path = self.output_dir / "bw_throughput.jsonl"
+        if write_bw_log is None:
+            write_bw_log = os.environ.get(
+                "KUNSERVE_MANAGER_WRITE_BW_LOG", "1"
+            ).lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self.write_bw_log = bool(write_bw_log)
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -410,7 +438,9 @@ class KunServeController:
         self._balloon_active = False
         self._process_group_initialized = False
         self._layout_plan: Optional[KunServeLayoutPlan] = None
-        self._last_asymmetric_balloon_signature: Optional[tuple[tuple[int, int], ...]] = None
+        self._last_asymmetric_balloon_signature: Optional[
+            tuple[tuple[int, int], ...]
+        ] = None
         self._tick_count = 0
         self._last_decision: Optional[str] = None
 
@@ -482,6 +512,14 @@ class KunServeController:
             )
         )
 
+        # The manager can be elected by whichever replica HTTP process reaches
+        # lifespan startup first.  At that moment the discovery file may already
+        # contain both host:port entries, but the peer HTTP server can still be
+        # finishing model/cuda-graph warmup and may not answer /kunserve/status
+        # yet.  Treat this as normal bootstrap skew and wait here instead of
+        # letting a single early status probe permanently kill the manager.
+        initial_statuses = await self._wait_for_replicas_ready()
+
         # Bring up the cross-replica EP process group exactly once, before the
         # polling thread starts. Doing it here (rather than lazily inside
         # enter_balloon) means:
@@ -493,7 +531,6 @@ class KunServeController:
         # If the initial status fetch or layout planning fails, we surface the
         # error here. The replicas must be healthy by the time the
         # AgentLoopManager calls start().
-        initial_statuses = await self._fetch_statuses()
         plan = self._ensure_layout_plan(initial_statuses)
         await self._ensure_process_group(plan)
 
@@ -530,6 +567,47 @@ class KunServeController:
         if not started or self._loop is None:
             self._running = False
             raise RuntimeError("KunServeController thread failed to start.")
+
+    async def _wait_for_replicas_ready(self) -> list[dict[str, Any]]:
+        deadline = time.time() + max(
+            float(getattr(replica, "max_start_wait_time", 300.0))
+            for replica in self._replicas
+        )
+        attempt = 0
+        last_error: Optional[BaseException] = None
+        while True:
+            attempt += 1
+            try:
+                statuses = await self._fetch_statuses()
+                self._emit(
+                    "replicas ready after %d status probe(s): %s"
+                    % (attempt, self._summarize_statuses(statuses))
+                )
+                return statuses
+            except Exception as exc:
+                last_error = exc
+                now = time.time()
+                if now >= deadline:
+                    break
+                if attempt == 1 or attempt % 10 == 0:
+                    self._emit(
+                        "waiting for replica /kunserve/status endpoints "
+                        "to become ready: attempt=%d error=%r" % (attempt, exc)
+                    )
+                await asyncio.sleep(
+                    min(
+                        5.0,
+                        max(
+                            float(getattr(replica, "retry_delay", 2.0))
+                            for replica in self._replicas
+                        ),
+                    )
+                )
+
+        raise RuntimeError(
+            "replicas did not become ready before KunServe manager startup "
+            f"deadline; last_error={last_error!r}"
+        )
 
     async def stop(self) -> None:
         self._emit("stopping")
@@ -573,6 +651,7 @@ class KunServeController:
     async def tick(self) -> list[dict[str, Any]]:
         statuses = await self._fetch_statuses()
         self._tick_count += 1
+        self._write_bw_status_sample(statuses)
         status_summary = self._summarize_statuses(statuses)
         if self._tick_count <= 5 or self._tick_count % 30 == 0:
             self._emit(f"tick#{self._tick_count} statuses: {status_summary}")
@@ -584,7 +663,9 @@ class KunServeController:
             await self._rollback_prepared_replicas(statuses)
             statuses = await self._fetch_statuses()
 
-        self._balloon_active = any(status.get("state") == "balloon" for status in statuses)
+        self._balloon_active = any(
+            status.get("state") == "balloon" for status in statuses
+        )
         self._log_asymmetric_balloon_risk(statuses)
         enter_ok, enter_reason = self._should_enter_balloon(statuses)
         if not self._balloon_active:
@@ -617,6 +698,44 @@ class KunServeController:
                     self._last_decision = decision
         return statuses
 
+    def _write_bw_status_sample(self, statuses: Sequence[dict[str, Any]]) -> None:
+        """Write a lightweight bw_throughput-compatible status sample.
+
+        The old verl wrapper generated bw_throughput.jsonl from an external
+        scraper.  After moving the control plane into the standalone
+        kunserve_manager, keep producing the fields needed by the existing
+        analysis scripts from the manager's regular /kunserve/status poll.
+        GPU SM/HBM fields are intentionally best-effort and may be absent; the
+        plotting code already tolerates samples that contain only
+        running/token_usage/throughput.
+        """
+
+        if not self.write_bw_log:
+            return
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            row: dict[str, Any] = {"ts": time.time()}
+            for idx, status in enumerate(statuses, start=1):
+                suffix = f"sglang{idx}"
+                row[f"running_{suffix}"] = float(
+                    status.get("num_running_requests", 0) or 0
+                )
+                row[f"waiting_{suffix}"] = float(
+                    status.get("num_waiting_requests", 0) or 0
+                )
+                row[f"token_usage_{suffix}"] = float(
+                    status.get("token_usage", 0.0) or 0.0
+                )
+                row[f"throughput_{suffix}"] = float(
+                    status.get("gen_throughput", 0.0) or 0.0
+                )
+                row[f"state_{suffix}"] = status.get("state")
+                row[f"variant_{suffix}"] = status.get("runtime_variant")
+            with self._bw_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.debug("failed to write bw status sample", exc_info=True)
+
     def _log_asymmetric_balloon_risk(self, statuses: Sequence[dict[str, Any]]) -> None:
         if not self._balloon_active:
             self._last_asymmetric_balloon_signature = None
@@ -629,8 +748,12 @@ class KunServeController:
             )
             for status in statuses
         )
-        any_idle = any(running == 0 and waiting == 0 for running, waiting in running_waiting)
-        any_busy = any(running > 0 or waiting > 0 for running, waiting in running_waiting)
+        any_idle = any(
+            running == 0 and waiting == 0 for running, waiting in running_waiting
+        )
+        any_busy = any(
+            running > 0 or waiting > 0 for running, waiting in running_waiting
+        )
         if any_idle and any_busy:
             if running_waiting != self._last_asymmetric_balloon_signature:
                 logger.warning(
@@ -661,7 +784,9 @@ class KunServeController:
                     "runtime_ep_size": plan.global_world_size,
                     "runtime_rank_offset": replica_idx * plan.local_ep_size,
                     "dispatch_rank_offset": replica_idx * plan.local_ep_size,
-                    "active_local_expert_mapping": plan.replica_active_mappings[replica_idx],
+                    "active_local_expert_mapping": plan.replica_active_mappings[
+                        replica_idx
+                    ],
                     "physical_to_logical_map": plan.global_physical_to_logical_map,
                     "process_group_name": self.group_name,
                     "capture_cuda_graph": bool(capture_cuda_graph),
@@ -706,9 +831,7 @@ class KunServeController:
                 errors.append(f"{self._replicas[idx].name}: {result!r}")
                 continue
             if not _response_succeeded(result):
-                errors.append(
-                    f"{self._replicas[idx].name}: {_response_error(result)}"
-                )
+                errors.append(f"{self._replicas[idx].name}: {_response_error(result)}")
         if errors:
             raise RuntimeError(f"warmup_balloon failed: {'; '.join(errors)}")
         logger.warning(
@@ -719,7 +842,9 @@ class KunServeController:
     async def enter_balloon(
         self, *, statuses: Optional[Sequence[dict[str, Any]]] = None
     ) -> list[dict[str, Any]]:
-        current_statuses = list(statuses) if statuses is not None else await self._fetch_statuses()
+        current_statuses = (
+            list(statuses) if statuses is not None else await self._fetch_statuses()
+        )
         plan = self._ensure_layout_plan(current_statuses)
         # Process group is brought up once in start(); _ensure_process_group is
         # a no-op if already initialized but kept here as a safety net in case
@@ -741,7 +866,9 @@ class KunServeController:
                     {
                         "replica": replica_idx,
                         "runtime_rank_offset": payload["runtime_rank_offset"],
-                        "active_local_expert_mapping": payload["active_local_expert_mapping"],
+                        "active_local_expert_mapping": payload[
+                            "active_local_expert_mapping"
+                        ],
                     }
                     for replica_idx, payload in enumerate(prepare_payloads)
                 ],
@@ -757,11 +884,15 @@ class KunServeController:
         prepare_results = await asyncio.gather(
             *[
                 replica.prepare_balloon(payload)
-                for replica, payload in zip(self._replicas, prepare_payloads, strict=True)
+                for replica, payload in zip(
+                    self._replicas, prepare_payloads, strict=True
+                )
             ]
         )
         prepared_indices = [
-            idx for idx, result in enumerate(prepare_results) if _response_succeeded(result)
+            idx
+            for idx, result in enumerate(prepare_results)
+            if _response_succeeded(result)
         ]
         if len(prepared_indices) != len(self._replicas):
             await self._restore_replicas(prepared_indices, require_idle=False)
@@ -826,7 +957,11 @@ class KunServeController:
         per_replica_added = []
         for idx, result in enumerate(commit_results):
             outputs = _unwrap_output_list(result)
-            status = outputs[0].get("status") if outputs and isinstance(outputs[0], dict) else None
+            status = (
+                outputs[0].get("status")
+                if outputs and isinstance(outputs[0], dict)
+                else None
+            )
             added = (status or {}).get("added_kv_slots", "?")
             cap = (status or {}).get("max_total_num_tokens", "?")
             per_replica_added.append(f"r{idx}(added={added} max_total={cap})")
@@ -847,7 +982,9 @@ class KunServeController:
 
     async def restore_balloon(self, *, require_idle: bool) -> list[dict[str, Any]]:
         self._emit(f"restoring balloon require_idle={require_idle}")
-        await self._restore_replicas(list(range(len(self._replicas))), require_idle=require_idle)
+        await self._restore_replicas(
+            list(range(len(self._replicas))), require_idle=require_idle
+        )
         self._balloon_active = False
         self._emit("restored local runtime")
         return await self._fetch_statuses()
@@ -906,7 +1043,9 @@ class KunServeController:
         if self._layout_plan is not None:
             return self._layout_plan
 
-        local_maps = [status.get("local_physical_to_logical_map") for status in statuses]
+        local_maps = [
+            status.get("local_physical_to_logical_map") for status in statuses
+        ]
         if any(local_map is None for local_map in local_maps):
             raise ValueError("Balloon status is missing local_physical_to_logical_map.")
         if local_maps[0] != local_maps[1]:
@@ -948,7 +1087,11 @@ class KunServeController:
         )
         replica_active_mappings = [
             list(range(retained_local_experts)),
-            list(range(local_routed_experts - retained_local_experts, local_routed_experts)),
+            list(
+                range(
+                    local_routed_experts - retained_local_experts, local_routed_experts
+                )
+            ),
         ]
         self._layout_plan = KunServeLayoutPlan(
             local_ep_size=local_ep_size,
@@ -1026,9 +1169,7 @@ class KunServeController:
             for idx, result in enumerate(init_results):
                 if isinstance(result, Exception):
                     ok = False
-                    attempt_errors.append(
-                        f"{self._replicas[idx].name}: {result!r}"
-                    )
+                    attempt_errors.append(f"{self._replicas[idx].name}: {result!r}")
                     continue
                 if not bool(result.get("success")):
                     ok = False
@@ -1097,7 +1238,9 @@ class KunServeController:
         self._process_group_initialized = False
         logger.info("[KunServeController] process group destroyed.")
 
-    def _should_enter_balloon(self, statuses: Sequence[dict[str, Any]]) -> tuple[bool, str]:
+    def _should_enter_balloon(
+        self, statuses: Sequence[dict[str, Any]]
+    ) -> tuple[bool, str]:
         if not any(bool(status.get("expand_requested")) for status in statuses):
             return False, "no replica requested expansion"
         if any(status.get("state") not in ("local", "prepared") for status in statuses):
@@ -1119,7 +1262,9 @@ class KunServeController:
             )
         return True, "expand_requested and running thresholds satisfied"
 
-    def _should_restore_balloon(self, statuses: Sequence[dict[str, Any]]) -> tuple[bool, str]:
+    def _should_restore_balloon(
+        self, statuses: Sequence[dict[str, Any]]
+    ) -> tuple[bool, str]:
         should_restore = all(
             int(status.get("num_running_requests", 0)) == 0
             and int(status.get("num_waiting_requests", 0)) == 0
@@ -1133,7 +1278,9 @@ class KunServeController:
         self, statuses: Sequence[dict[str, Any]]
     ) -> None:
         prepared_indices = [
-            idx for idx, status in enumerate(statuses) if status.get("state") == "prepared"
+            idx
+            for idx, status in enumerate(statuses)
+            if status.get("state") == "prepared"
         ]
         if prepared_indices:
             logger.warning(
@@ -1164,8 +1311,8 @@ class KunServeController:
             if isinstance(result, Exception):
                 failures.append(f"{self._replicas[idx].name}: {result!r}")
             elif not _response_succeeded(result):
-                failures.append(f"{self._replicas[idx].name}: {_response_error(result)}")
+                failures.append(
+                    f"{self._replicas[idx].name}: {_response_error(result)}"
+                )
         if failures:
-            raise RuntimeError(
-                f"restore_from_balloon failed: {'; '.join(failures)}"
-            )
+            raise RuntimeError(f"restore_from_balloon failed: {'; '.join(failures)}")

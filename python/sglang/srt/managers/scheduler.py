@@ -261,8 +261,13 @@ def _kunserve_ms(message: str, *args) -> None:
 
 
 _BATCH_TIMING_LOG = os.environ.get("SGLANG_BATCH_TIMING_LOG", "").strip()
-_REPLICA_RANK = os.environ.get("SGLANG_REPLICA_RANK", "") 
+_REPLICA_RANK = os.environ.get("SGLANG_REPLICA_RANK", "")
 _REQ_LIFECYCLE_LOG = os.environ.get("SGLANG_REQ_LIFECYCLE_LOG", "").strip()
+if not _REQ_LIFECYCLE_LOG and os.environ.get("SGLANG_KUNSERVE_OUTPUT_DIR"):
+    _REQ_LIFECYCLE_LOG = os.path.join(
+        os.environ["SGLANG_KUNSERVE_OUTPUT_DIR"],
+        f"req_lifecycle_r{_REPLICA_RANK or '0'}.jsonl",
+    )
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -459,7 +464,7 @@ class Scheduler(
         self.is_initializing = False
         self._last_run_batch_end_ts = None
         self.req_lifecycle_log = _REQ_LIFECYCLE_LOG
-        self._dumped_rids: set = set()   # 防止同一 rid 重复 dump
+        self._dumped_rids: set = set()  # 防止同一 rid 重复 dump
         self._queue_wait_ms_cumulative: Dict[str, float] = {}
         self._queue_wait_ms_last_dequeue: Dict[str, float] = {}
 
@@ -2352,7 +2357,11 @@ class Scheduler(
                 # controller stops re-polling and the metric counts reflect
                 # the actual one-shot transition.
                 mr = getattr(self.tp_worker, "model_runner", None)
-                balloon_state = str(getattr(mr, "_balloon_state", "local")) if mr is not None else "local"
+                balloon_state = (
+                    str(getattr(mr, "_balloon_state", "local"))
+                    if mr is not None
+                    else "local"
+                )
                 if balloon_state == "local":
                     prev_expand_requested = self.expand_requested
                     self.expand_requested = True
@@ -2633,7 +2642,9 @@ class Scheduler(
             finish_host = completion if completion is not None else now_host
 
             try:
-                finish_json = req.finished_reason.to_json() if req.finished_reason else {}
+                finish_json = (
+                    req.finished_reason.to_json() if req.finished_reason else {}
+                )
             except Exception:
                 finish_json = {}
 
@@ -2644,9 +2655,7 @@ class Scheduler(
                 finish_host, lb_enter if lb_enter is not None else wait_enter
             )
             prefill_count = max(1, int(getattr(req, "_prefill_count", 1)))
-            retract_wasted_ms = round(
-                float(getattr(req, "_retract_wasted_ms", 0.0)), 3
-            )
+            retract_wasted_ms = round(float(getattr(req, "_retract_wasted_ms", 0.0)), 3)
             extra_prefill_ms = (
                 round(prefill_ms * max(0, prefill_count - 1), 3)
                 if isinstance(prefill_ms, (int, float))
@@ -2675,13 +2684,19 @@ class Scheduler(
                 "ts": wall_now,
                 "replica_rank": _REPLICA_RANK,
                 "rid": req.rid,
-                "prompt_len": len(req.origin_input_ids_unpadded)
-                if hasattr(req, "origin_input_ids_unpadded")
-                else None,
-                "prompt_len_padded": len(req.origin_input_ids)
-                if hasattr(req, "origin_input_ids")
-                else None,
-                "output_len": len(req.output_ids) if hasattr(req, "output_ids") else None,
+                "prompt_len": (
+                    len(req.origin_input_ids_unpadded)
+                    if hasattr(req, "origin_input_ids_unpadded")
+                    else None
+                ),
+                "prompt_len_padded": (
+                    len(req.origin_input_ids)
+                    if hasattr(req, "origin_input_ids")
+                    else None
+                ),
+                "output_len": (
+                    len(req.output_ids) if hasattr(req, "output_ids") else None
+                ),
                 "finish_type": finish_json.get("type", "unknown"),
                 "finish_reason": finish_json,
                 "t_lb_entry": lb_enter,
@@ -2711,8 +2726,12 @@ class Scheduler(
                 # KunServe per-request decode-step accounting. Counters are
                 # incremented in _log_decode_step_timing each time the request
                 # appears in a decode batch.
-                "decode_steps_local": int(getattr(req, "_kunserve_decode_steps_local", 0)),
-                "decode_steps_balloon": int(getattr(req, "_kunserve_decode_steps_balloon", 0)),
+                "decode_steps_local": int(
+                    getattr(req, "_kunserve_decode_steps_local", 0)
+                ),
+                "decode_steps_balloon": int(
+                    getattr(req, "_kunserve_decode_steps_balloon", 0)
+                ),
             }
             records.append(record)
             self._queue_wait_ms_cumulative.pop(req.rid, None)
@@ -2722,11 +2741,13 @@ class Scheduler(
             return
 
         try:
+            os.makedirs(os.path.dirname(self.req_lifecycle_log) or ".", exist_ok=True)
             with open(self.req_lifecycle_log, "a", encoding="utf-8") as f:
                 for r in records:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.debug("Failed to write req lifecycle log: %s", e)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult]:
@@ -3040,12 +3061,20 @@ class Scheduler(
 
     def get_balloon_status(self, recv_req: GetBalloonStatusReqInput):
         status = self.tp_worker.get_balloon_status(recv_req)
+        try:
+            _, token_usage, _, _ = self._get_token_info()
+        except Exception:
+            token_usage = getattr(self.stats, "token_usage", 0.0)
         status.update(
             {
                 "expand_requested": bool(self.expand_requested),
                 "expand_request_reason": self.expand_request_reason,
                 "num_waiting_requests": len(self.waiting_queue),
                 "num_running_requests": len(self.running_batch.reqs),
+                "token_usage": float(token_usage or 0.0),
+                "gen_throughput": float(
+                    getattr(self, "last_gen_throughput", 0.0) or 0.0
+                ),
                 "scheduler_max_total_num_tokens": int(self.max_total_num_tokens),
                 "balloon_keepalive_steps": int(self.balloon_keepalive_step_ct),
                 "balloon_keepalive_active": bool(self._balloon_keepalive_active),
@@ -3645,8 +3674,8 @@ class Scheduler(
             "avg_kv_tokens_per_req": round(total_kv_tokens / max(batch_size, 1), 3),
             "step_ms": round(step_ms, 3),
             "launch_ms": round(step_ms, 3),
-            "gap_ms": round(gap_ms, 3),            # ← 新增（很有用，见 Q3）
-            "iter_ms": round(step_ms + gap_ms, 3), # ← 新增（真正的墙钟时间）
+            "gap_ms": round(gap_ms, 3),  # ← 新增（很有用，见 Q3）
+            "iter_ms": round(step_ms + gap_ms, 3),  # ← 新增（真正的墙钟时间）
             "tok_per_s": round(tok_per_s, 3),
             "tok_per_s_per_req": round(tok_per_s / max(batch_size, 1), 3),
             "forward_mode": str(batch.forward_mode),

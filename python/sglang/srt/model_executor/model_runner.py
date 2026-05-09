@@ -708,18 +708,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_process_group_name = None
         self._balloon_fused_moe_layers: Optional[List[torch.nn.Module]] = None
 
-        # KunServe-specific: when balloon will eventually pull cross-replica
-        # expert weights (signal = SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), we
-        # need to keep the LOCAL bundle off DeepEP so its NVSHMEM init never
-        # happens. The GLOBAL bundle (registered later in
-        # register_balloon_global_runtime_bundle) is the only place we want
-        # NVSHMEM, ensuring the per-process singleton init runs exactly once.
-        # Without this override the LOCAL bundle inherits the DeepEP dispatcher
-        # from FusedMoE.__init__ (because moe_a2a_backend=deepep), and the
-        # first decode-batch cuda graph capture pulls in a low-latency Buffer
-        # that initializes NVSHMEM for the local TP group; a later GLOBAL
-        # init then trips the `nvshmem_rank == internode::init(...)` assert.
-        if envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get():
+        # KunServe LOCAL/GLOBAL split:
+        #
+        # The original concern: with moe_a2a_backend=deepep + deepep_mode=auto,
+        # FusedMoE.__init__ creates a LOCAL DeepEP dispatcher whose first
+        # decode forward initializes NVSHMEM for the local TP group; if
+        # register_balloon_global_runtime_bundle later builds a GLOBAL DeepEP
+        # dispatcher in LL mode, NVSHMEM's per-process singleton trips on the
+        # `nvshmem_rank == internode::init(...)` assert (one process can only
+        # init one NVSHMEM context).
+        #
+        # Why we don't need the override anymore: with
+        # SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=1 (the default in this repo),
+        # register_balloon_global_runtime_bundle below builds the GLOBAL
+        # dispatcher with DeepEPMode.NORMAL only — NORMAL skips NVSHMEM init
+        # entirely (DeepEP buffer.py:96 gate). So LOCAL is free to use the
+        # default DeepEP+DeepGEMM path that baseline (FP8 + deepep + deep_gemm
+        # without kunserve) is known to run correctly. Forcing LOCAL to
+        # StandardDispatcher+Triton was producing ~25% degenerate outputs in
+        # ab_20260507_163750 (sample-7 r1 first request, 4 tokens of garbage)
+        # while a same-config baseline (ab_20260509_015613/baseline) was clean.
+        #
+        # If someone ever flips SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0 to use
+        # LL for GLOBAL (e.g., once IBGDA + peermem are properly set up), the
+        # double-init assert returns and the override needs to be re-enabled.
+        # Gate the override on that condition only.
+        if (
+            envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get()
+            and not envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
+        ):
             self._force_local_bundle_to_standard_dispatcher()
 
     def _force_local_bundle_to_standard_dispatcher(self) -> None:

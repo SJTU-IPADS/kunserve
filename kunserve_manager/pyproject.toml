@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kunserve_manager"
+version = "0.1.0"
+description = "Standalone control plane for KunServe-enabled sglang replica groups"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+kunserve-manager = "kunserve_manager.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kunserve_manager*"]

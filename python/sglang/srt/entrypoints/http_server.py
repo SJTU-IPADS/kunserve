@@ -96,10 +96,6 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.kunserve_manager.runtime import (
-    build_kunserve_controller_from_env,
-    register_current_replica_from_env,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -354,8 +350,6 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    register_current_replica_from_env(host=server_args.host, port=server_args.port)
-
     # Execute the general warmup
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
@@ -363,43 +357,16 @@ async def lifespan(fast_api_app: FastAPI):
     )
     warmup_thread.start()
 
-    # KunServe control plane now lives inside sglang.  When enabled on one
-    # coordinator HTTP process, start it as a background task after the ASGI
-    # lifespan yields so all replica HTTP endpoints (including this one) can
-    # answer the controller's bootstrap/status RPCs.
-    kunserve_controller = None
-
-    async def _start_kunserve_manager_after_server_ready():
-        nonlocal kunserve_controller
-        startup_delay = float(os.getenv("SGLANG_KUNSERVE_MANAGER_STARTUP_DELAY", "5.0"))
-        if startup_delay > 0:
-            await asyncio.sleep(startup_delay)
-        controller = await asyncio.to_thread(
-            build_kunserve_controller_from_env, model_path=server_args.model_path
-        )
-        if controller is None:
-            return
-        await controller.start()
-        kunserve_controller = controller
-        logger.info("[KunServeManager] controller started inside sglang HTTP server")
-
-    kunserve_manager_task = asyncio.create_task(
-        _start_kunserve_manager_after_server_ready()
-    )
+    # The KunServe control plane is no longer started from inside the sglang
+    # HTTP server. It now lives in a separately-launched sidecar process
+    # (kunserve_manager package, top-level under sglang/). The deployer is
+    # responsible for running exactly one manager per replica group and
+    # pointing it at the replicas' HTTP endpoints.
 
     # Start the HTTP server
     try:
         yield
     finally:
-        if kunserve_manager_task is not None and not kunserve_manager_task.done():
-            kunserve_manager_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await kunserve_manager_task
-        elif kunserve_manager_task is not None:
-            with suppress(Exception):
-                kunserve_manager_task.result()
-        if kunserve_controller is not None:
-            await kunserve_controller.stop()
         warmup_thread.join()
 
 
