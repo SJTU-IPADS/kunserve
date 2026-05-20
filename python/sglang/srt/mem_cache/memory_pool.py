@@ -1476,6 +1476,63 @@ class HybridLinearKVPool(KVCache):
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
 
+    @property
+    def _kv_vmm_enabled(self) -> bool:
+        return bool(getattr(self.full_kv_pool, "_kv_vmm_enabled", False))
+
+    @property
+    def _kv_reserve_rows(self) -> int:
+        return int(
+            getattr(
+                self.full_kv_pool,
+                "_kv_reserve_rows",
+                int(self.full_kv_pool.size) + self.page_size,
+            )
+        )
+
+    @property
+    def _kv_active_rows(self) -> int:
+        return int(
+            getattr(
+                self.full_kv_pool,
+                "_kv_active_rows",
+                int(self.full_kv_pool.size) + self.page_size,
+            )
+        )
+
+    def bytes_per_slot(self) -> int:
+        return self.full_kv_pool.bytes_per_slot()
+
+    def quantize_slots_to_whole_donor_segments(
+        self, requested_slots: int, donor_segments: List[DonorSegment]
+    ) -> int:
+        return self.full_kv_pool.quantize_slots_to_whole_donor_segments(
+            requested_slots, donor_segments
+        )
+
+    def expand_by_slots(
+        self,
+        num_slots: int,
+        donor_segments: Optional[List[DonorSegment]] = None,
+    ) -> None:
+        self.full_kv_pool.expand_by_slots(num_slots, donor_segments=donor_segments)
+        self.size = self.full_kv_pool.size
+        if self.use_mla:
+            self.mem_usage = self.get_kv_size_bytes() / GB
+        else:
+            k_size, v_size = self.get_kv_size_bytes()
+            self.mem_usage = (k_size + v_size) / GB
+
+    def shrink_tail(self, num_slots: int) -> DonorLedger:
+        returned = self.full_kv_pool.shrink_tail(num_slots)
+        self.size = self.full_kv_pool.size
+        if self.use_mla:
+            self.mem_usage = self.get_kv_size_bytes() / GB
+        else:
+            k_size, v_size = self.get_kv_size_bytes()
+            self.mem_usage = (k_size + v_size) / GB
+        return returned
+
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:
             raise ValueError(

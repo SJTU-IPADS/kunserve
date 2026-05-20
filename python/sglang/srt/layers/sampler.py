@@ -53,25 +53,66 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        # Optional guard for experimental large-MoE rollout paths. When enabled,
+        # invalid logits/probabilities are sanitized before torch.multinomial so
+        # one bad batch does not kill the scheduler with a CUDA device-side assert.
+        self.sanitize_nonfinite_sampling = get_bool_env_var(
+            "SGLANG_SANITIZE_NONFINITE_SAMPLING"
+        )
+
+    def _sanitize_nonfinite_tensor(
+        self, tensor: torch.Tensor, tensor_name: str, fill_value: float = -1e5
+    ) -> torch.Tensor:
+        if not (self.use_nan_detection or self.sanitize_nonfinite_sampling):
+            return tensor
+
+        finite_mask = torch.isfinite(tensor)
+        if torch.all(finite_mask):
+            return tensor
+
+        logger.warning(
+            "Detected non-finite values during sampling in %s; sanitizing. shape=%s",
+            tensor_name,
+            tuple(tensor.shape),
+        )
+        if crash_on_warnings() and not self.sanitize_nonfinite_sampling:
+            raise ValueError(f"Detected non-finite values in {tensor_name}.")
+        return torch.where(finite_mask, tensor, torch.full_like(tensor, fill_value))
+
+    def _sanitize_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        if not (self.use_nan_detection or self.sanitize_nonfinite_sampling):
+            return probs
+
+        valid_mask = torch.isfinite(probs) & (probs >= 0)
+        if torch.all(valid_mask):
+            return probs
+
+        logger.warning(
+            "Detected invalid probabilities during sampling; sanitizing. shape=%s",
+            tuple(probs.shape),
+        )
+        if crash_on_warnings() and not self.sanitize_nonfinite_sampling:
+            raise ValueError("Detected invalid probabilities during sampling.")
+
+        probs = torch.where(valid_mask, probs, torch.zeros_like(probs))
+        row_sums = probs.sum(dim=-1, keepdim=True)
+        bad_rows = (~torch.isfinite(row_sums)) | (row_sums <= 0)
+        probs = torch.where(bad_rows, torch.ones_like(probs), probs)
+        row_sums = probs.sum(dim=-1, keepdim=True).clamp_min_(
+            torch.finfo(probs.dtype).tiny
+        )
+        probs.div_(row_sums)
+        return probs
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
-        """Apply custom logit processors and handle NaN detection."""
+        """Apply custom logit processors and handle non-finite logits."""
         # Apply the custom logit processors if registered in the sampling info
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
 
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
-
-        return logits
+        return self._sanitize_nonfinite_tensor(logits, "logits")
 
     def forward(
         self,
@@ -152,10 +193,13 @@ class Sampler(nn.Module):
             else:
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
+                logits = self._sanitize_nonfinite_tensor(
+                    logits, "temperature-scaled logits"
+                )
 
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                probs = self._sanitize_probs(logits)
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
@@ -164,7 +208,7 @@ class Sampler(nn.Module):
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
                         if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
+                        else torch.log(probs.clamp_min(torch.finfo(probs.dtype).tiny))
                     )
                 del probs
 
@@ -268,7 +312,8 @@ class Sampler(nn.Module):
         Used for the Ascend NPU backend which handles softmax internally.
         """
         if simple_sampling_case:
-            probs = torch.softmax(logits, dim=-1)
+            logits = self._sanitize_nonfinite_tensor(logits, "ascend logits")
+            probs = self._sanitize_probs(torch.softmax(logits, dim=-1))
             batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:

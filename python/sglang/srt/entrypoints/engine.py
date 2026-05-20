@@ -1030,6 +1030,30 @@ def _launch_subprocesses(
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
+    # Prewarm CUDA VMM inline extension in the parent process to avoid many
+    # scheduler subprocesses concurrently JIT-building the same extension. This
+    # matters for large MoE models where TP/EP launches many scheduler workers.
+    vmm_enabled = os.environ.get("SGLANG_EXPERIMENTAL_CUDA_VMM", "").lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+    vmm_consumer_enabled = os.environ.get(
+        "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS", ""
+    ).lower() in ("1", "true", "on", "yes") or os.environ.get(
+        "SGLANG_EXPERIMENTAL_VMM_KV_CACHE", ""
+    ).lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+    if vmm_enabled and vmm_consumer_enabled:
+        from sglang.srt.utils.cuda_vmm import cuda_vmm_available
+
+        cuda_vmm_available()
+
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
         server_args=server_args,
