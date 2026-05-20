@@ -3085,12 +3085,15 @@ class Scheduler(
     def prepare_balloon(self, recv_req: PrepareBalloonReqInput):
         logger.info(
             "[KunServeScheduler] prepare_balloon request: target=%s runtime_ep_size=%s "
-            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_graph=%s",
+            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s "
+            "comm_backend=%s capture_policy=%s capture_graph=%s",
             recv_req.target_variant,
             recv_req.runtime_ep_size,
             recv_req.runtime_rank_offset,
             recv_req.dispatch_rank_offset,
             recv_req.process_group_name,
+            recv_req.kunserve_comm_backend,
+            recv_req.capture_policy,
             recv_req.capture_cuda_graph,
         )
         try:
@@ -3119,12 +3122,15 @@ class Scheduler(
     def warmup_balloon(self, recv_req: WarmupBalloonReqInput):
         logger.info(
             "[KunServeScheduler] warmup_balloon request: target=%s runtime_ep_size=%s "
-            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_graph=%s",
+            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s "
+            "comm_backend=%s capture_policy=%s capture_graph=%s",
             recv_req.target_variant,
             recv_req.runtime_ep_size,
             recv_req.runtime_rank_offset,
             recv_req.dispatch_rank_offset,
             recv_req.process_group_name,
+            recv_req.kunserve_comm_backend,
+            recv_req.capture_policy,
             recv_req.capture_cuda_graph,
         )
         try:

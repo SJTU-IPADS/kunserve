@@ -94,6 +94,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="init_weights_update_group backend (default: nccl).",
     )
     p.add_argument(
+        "--comm-backend",
+        choices=("deepep", "sglang"),
+        default=_env_or("KUNSERVE_MANAGER_COMM_BACKEND", "deepep"),
+        help=(
+            "KunServe GLOBAL MoE communication backend. 'deepep' keeps the "
+            "existing DeepEP dispatcher path; 'sglang' uses the "
+            "correctness-first CrossReplicaStandardDispatcher (default: deepep)."
+        ),
+    )
+    p.add_argument(
+        "--capture-policy",
+        choices=("auto", "fixed_padded", "disabled"),
+        default=_env_or("KUNSERVE_MANAGER_CAPTURE_POLICY", "auto"),
+        help=(
+            "GLOBAL CUDA graph capture policy. For comm-backend=sglang this "
+            "currently resolves to disabled because the initial dispatcher uses "
+            "dynamic all-gather/all-reduce collectives."
+        ),
+    )
+    p.add_argument(
         "--enable-restore",
         action="store_true",
         default=_env_or("KUNSERVE_MANAGER_ENABLE_RESTORE", "0") in ("1", "true"),
@@ -201,6 +221,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         offload_local_experts=args.offload_local_experts,
         group_name=args.group_name,
         backend=args.backend,
+        comm_backend=args.comm_backend,
+        capture_policy=args.capture_policy,
         enable_restore=args.enable_restore,
         eager_warmup=args.eager_warmup,
         output_dir=args.output_dir,
@@ -209,12 +231,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info(
         "kunserve_manager starting: replicas=%s model_path=%s poll=%.2fs "
-        "group=%s backend=%s eager_warmup=%s enable_restore=%s output_dir=%s bw_log=%s",
+        "group=%s backend=%s comm_backend=%s capture_policy=%s eager_warmup=%s "
+        "enable_restore=%s output_dir=%s bw_log=%s",
         replicas,
         args.model_path,
         args.poll_interval,
         args.group_name,
         args.backend,
+        args.comm_backend,
+        args.capture_policy,
         args.eager_warmup,
         args.enable_restore,
         args.output_dir,

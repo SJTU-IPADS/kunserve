@@ -706,6 +706,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_offloaded_local_experts = 0
         self._balloon_last_error = None
         self._balloon_process_group_name = None
+        self._balloon_kunserve_comm_backend = "deepep"
+        self._balloon_capture_policy = "auto"
         self._balloon_fused_moe_layers: Optional[List[torch.nn.Module]] = None
 
         # KunServe LOCAL/GLOBAL split:
@@ -1092,10 +1094,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None,
         physical_to_logical_map=None,
         process_group_name: Optional[str] = None,
+        kunserve_comm_backend: str = "deepep",
+        capture_policy: str = "auto",
+        kunserve_pg_names: Optional[Dict[str, str]] = None,
+        kunserve_backend_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[int, torch.Tensor]:
         fused_layers = self._iter_fused_moe_layers()
         if not fused_layers:
             raise ValueError("Balloon runtime requires a model with FusedMoE layers.")
+
+        kunserve_comm_backend = str(kunserve_comm_backend or "deepep").lower()
+        capture_policy = str(capture_policy or "auto").lower()
+        kunserve_backend_config = dict(kunserve_backend_config or {})
+        if kunserve_comm_backend not in ("deepep", "sglang"):
+            raise ValueError(
+                "Unsupported KunServe GLOBAL communication backend "
+                f"{kunserve_comm_backend!r}; expected 'deepep' or 'sglang'."
+            )
 
         # KunServe BALLOON publishes a complementary physical_to_logical_map
         # across replicas (e.g. replica 0 retains [0..31, 64..95] while replica
@@ -1117,34 +1132,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"{getattr(self.server_args, 'ep_dispatch_algorithm', None)!r}."
             )
         moe_a2a_backend = get_moe_a2a_backend()
-        if moe_a2a_backend.is_none():
-            raise ValueError(
-                "Balloon GLOBAL bundle requires a cross-rank MoE A2A backend. "
-                "moe_a2a_backend='none' would make the GLOBAL bundle's "
-                "auto-registered dispatcher fall back to StandardDispatcher, "
-                "which only does rank-local expert compute + intra-TP "
-                "all-reduce; it cannot route tokens to experts retained by "
-                "the peer KunServe replica. Pass "
-                "engine_kwargs.sglang.moe_a2a_backend=deepep and "
-                "engine_kwargs.sglang.moe_runner_backend=deep_gemm. NOTE: the "
-                "LOCAL bundle is intentionally overridden back to Standard by "
-                "_force_local_bundle_to_standard_dispatcher (gated on "
-                "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), so this flag only "
-                "affects the GLOBAL bundle's default."
-            )
-        if (moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake()) and str(
-            getattr(self.server_args, "moe_runner_backend", None)
-        ) != "deep_gemm":
-            raise ValueError(
-                "Balloon GLOBAL bundle with moe_a2a_backend="
-                f"{moe_a2a_backend.value!r} requires "
-                "server_args.moe_runner_backend='deep_gemm'. This sglang build "
-                "only registers DeepEP/Mooncake MoE pre/post permutation paths "
-                "for the deep_gemm runner; leaving the runner as 'auto' or "
-                "'triton' can crash the scheduler during warmup/cuda-graph "
-                "capture. Pass engine_kwargs.sglang.moe_runner_backend=deep_gemm. "
-                f"Current value: {getattr(self.server_args, 'moe_runner_backend', None)!r}."
-            )
+        if kunserve_comm_backend == "deepep":
+            if moe_a2a_backend.is_none():
+                raise ValueError(
+                    "Balloon GLOBAL bundle with kunserve_comm_backend='deepep' "
+                    "requires a cross-rank MoE A2A backend. "
+                    "moe_a2a_backend='none' would make the GLOBAL bundle's "
+                    "auto-registered dispatcher fall back to StandardDispatcher, "
+                    "which only does rank-local expert compute + intra-TP "
+                    "all-reduce; it cannot route tokens to experts retained by "
+                    "the peer KunServe replica. Pass "
+                    "engine_kwargs.sglang.moe_a2a_backend=deepep and "
+                    "engine_kwargs.sglang.moe_runner_backend=deep_gemm, or set "
+                    "kunserve_comm_backend='sglang' to use the new "
+                    "CrossReplicaStandardDispatcher. NOTE: the LOCAL bundle is "
+                    "intentionally overridden back to Standard by "
+                    "_force_local_bundle_to_standard_dispatcher (gated on "
+                    "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), so this flag only "
+                    "affects the GLOBAL bundle's default."
+                )
+            if (
+                moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake()
+            ) and str(getattr(self.server_args, "moe_runner_backend", None)) != (
+                "deep_gemm"
+            ):
+                raise ValueError(
+                    "Balloon GLOBAL bundle with kunserve_comm_backend='deepep' and "
+                    "moe_a2a_backend="
+                    f"{moe_a2a_backend.value!r} requires "
+                    "server_args.moe_runner_backend='deep_gemm'. This sglang build "
+                    "only registers DeepEP/Mooncake MoE pre/post permutation paths "
+                    "for the deep_gemm runner; leaving the runner as 'auto' or "
+                    "'triton' can crash the scheduler during warmup/cuda-graph "
+                    "capture. Pass engine_kwargs.sglang.moe_runner_backend=deep_gemm. "
+                    f"Current value: {getattr(self.server_args, 'moe_runner_backend', None)!r}."
+                )
 
         active_mappings = self._normalize_balloon_active_mappings(
             retained_local_experts=retained_local_experts,
@@ -1162,6 +1184,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             except Exception:
                 runtime_group_size = "unknown"
+        if kunserve_comm_backend == "sglang" and runtime_group is None:
+            raise ValueError(
+                "KunServe comm backend 'sglang' requires process_group_name to "
+                "resolve to an initialized global process group."
+            )
         self._balloon_global_expert_location_metadata = (
             self._build_balloon_global_metadata(
                 physical_to_logical_map=physical_to_logical_map,
@@ -1201,7 +1228,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
                     "tp_rank=%s GLOBAL_dispatch_map shape=%s "
                     "layer0[(0,32,64,96)]=(%d,%d,%d,%d) "
-                    "p2l_layer0[:8]=%s a2a_backend=%s",
+                    "p2l_layer0[:8]=%s a2a_backend=%s kunserve_comm_backend=%s "
+                    "capture_policy=%s",
                     self.tp_rank,
                     tuple(gmap.shape),
                     int(gmap[0, 0].item()),
@@ -1214,11 +1242,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else "?"
                     ),
                     get_moe_a2a_backend().value,
+                    kunserve_comm_backend,
+                    capture_policy,
                 )
         self._balloon_prepared_active_mappings = {
             layer_id: mapping.clone() for layer_id, mapping in active_mappings.items()
         }
         self._balloon_process_group_name = process_group_name
+        self._balloon_kunserve_comm_backend = kunserve_comm_backend
+        self._balloon_capture_policy = capture_policy
 
         resolved_ep_size = (
             int(runtime_ep_size) if runtime_ep_size is not None else self.moe_ep_size
@@ -1278,6 +1310,70 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_local_experts=int(mapping.numel()),
             )
 
+            explicit_global_dispatcher = None
+            explicit_global_runner = None
+
+            if kunserve_comm_backend == "sglang":
+                from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+                from sglang.srt.layers.moe.token_dispatcher.kunserve_standard import (
+                    CrossReplicaStandardDispatcher,
+                )
+                from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+                local_ep_size = int(
+                    kunserve_backend_config.get("local_ep_size") or self.moe_ep_size
+                )
+                # Phase D: when capture_policy=fixed_padded, hand the
+                # dispatcher capture_max_m so it pre-allocates static
+                # buffers and takes the graph-safe path during capture.
+                # max_num_token = max(capture_bs) * num_tokens_per_bs covers
+                # every batch size we capture.  Leave as None for any other
+                # policy so the dispatcher stays purely eager.
+                resolved_capture_max_m: Optional[int] = None
+                if str(capture_policy or "auto").lower() == "fixed_padded":
+                    gr = getattr(self, "graph_runner", None)
+                    if gr is not None:
+                        resolved_capture_max_m = int(
+                            getattr(gr, "max_num_token", 0) or 0
+                        ) or None
+                    if resolved_capture_max_m is None:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] capture_policy=fixed_padded requested "
+                            "but graph_runner.max_num_token is unavailable; "
+                            "GLOBAL bundle will fall back to eager dispatch."
+                        )
+                explicit_global_dispatcher = CrossReplicaStandardDispatcher(
+                    group=runtime_group,
+                    moe_runner_config=global_runner_config,
+                    local_expert_mapping=dispatcher_local_expert_mapping,
+                    local_ep_size=local_ep_size,
+                    replica_rank=resolved_moe_ep_rank // local_ep_size,
+                    global_rank=resolved_moe_ep_rank,
+                    world_size=resolved_ep_size,
+                    capture_max_m=resolved_capture_max_m,
+                )
+                # Use the normal Standard/Triton MoE core for the correctness
+                # backend. This avoids DeepEP/NVSHMEM and DeepGEMM entirely;
+                # the dispatcher itself performs global all-gather + all-reduce.
+                explicit_global_runner = MoeRunner(
+                    MoeRunnerBackend.TRITON,
+                    global_runner_config,
+                )
+                if int(layer.layer_id) == 0:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] GLOBAL bundle uses CrossReplicaStandardDispatcher: "
+                        "tp_rank=%s global_rank=%s world=%s local_ep_size=%s "
+                        "replica_rank=%s capture_policy=%s capture_max_m=%s "
+                        "backend_config=%s",
+                        self.tp_rank,
+                        resolved_moe_ep_rank,
+                        resolved_ep_size,
+                        local_ep_size,
+                        resolved_moe_ep_rank // local_ep_size,
+                        capture_policy,
+                        resolved_capture_max_m,
+                        kunserve_backend_config,
+                    )
             # When SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL is on (default), build
             # the GLOBAL bundle's dispatcher in DeepEP NORMAL mode explicitly
             # (NOT LL). Reason: this host's container does not expose
@@ -1292,8 +1388,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # init entirely. Trade-off: dynamic-shape dispatch can't be cuda
             # graph captured, so GLOBAL forward runs eager. LOCAL forward
             # (StandardDispatcher) keeps its cuda graph.
-            explicit_global_dispatcher = None
-            if envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get():
+            elif envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get():
                 from sglang.srt.batch_overlap.two_batch_overlap import (
                     MaybeTboDeepEPDispatcher,
                 )
@@ -1315,6 +1410,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 variant="global",
                 moe_runner_config=global_runner_config,
                 dispatcher=explicit_global_dispatcher,  # None ⇒ default DeepEP via create_moe_dispatcher
+                runner=explicit_global_runner,
                 group=runtime_group,
                 moe_ep_size=resolved_ep_size,
                 moe_ep_rank=resolved_moe_ep_rank,
@@ -1323,14 +1419,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_local_experts=int(mapping.numel()),
                 active_local_expert_mapping=mapping,
                 dispatcher_local_expert_mapping=dispatcher_local_expert_mapping,
-                # GLOBAL bundle uses a DeepEP dispatcher whose combine step
-                # already aggregates each token's expert outputs across the
-                # whole cross-replica EP world. Adding the FusedMoE-level
-                # tp_group all-reduce on top would double-reduce within the
-                # local TP group. Companion: LOCAL bundle (StandardDispatcher)
-                # registered in _force_local_bundle_to_standard_dispatcher
-                # passes reduce_results=True because Standard's combine is a
-                # no-op and partial sums need a final tp_group all-reduce.
+                # GLOBAL bundle combine already aggregates each token's expert
+                # outputs across the whole cross-replica EP world:
+                #   - DeepEP does it inside DeepEP combine;
+                #   - CrossReplicaStandardDispatcher does it with a global
+                #     all-reduce then slices back to local tokens.
+                # Adding the FusedMoE-level tp_group all-reduce on top would
+                # double-reduce within the local TP group. Companion: LOCAL
+                # bundle (StandardDispatcher) registered in
+                # _force_local_bundle_to_standard_dispatcher passes
+                # reduce_results=True because Standard's combine is a no-op and
+                # partial sums need a final tp_group all-reduce.
                 reduce_results=False,
             )
         return active_mappings
@@ -1458,6 +1557,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         physical_to_logical_map,
         process_group_name: Optional[str],
         capture_cuda_graph: bool,
+        kunserve_comm_backend: str = "deepep",
+        capture_policy: str = "auto",
+        kunserve_pg_names: Optional[Dict[str, str]] = None,
+        kunserve_backend_config: Optional[Dict[str, Any]] = None,
     ) -> List[torch.nn.Module]:
         """Idempotent setup that prepares the global runtime bundle and CUDA graph.
 
@@ -1505,30 +1608,109 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 active_local_expert_mapping_by_layer=active_local_expert_mapping_by_layer,
                 physical_to_logical_map=physical_to_logical_map,
                 process_group_name=process_group_name,
+                kunserve_comm_backend=kunserve_comm_backend,
+                capture_policy=capture_policy,
+                kunserve_pg_names=kunserve_pg_names,
+                kunserve_backend_config=kunserve_backend_config,
             )
 
         # ensure_cuda_graph_variant_captured short-circuits when the graph for
         # this variant is already in `self.graphs`.
         if capture_cuda_graph:
-            # When the GLOBAL bundle is forced into DeepEP NORMAL mode
-            # (SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=True, the default), its
-            # dispatch_a/dispatch_b output has dynamic shape — the cuda graph
-            # capture path would either error out on shape mismatch or bake
-            # in stale shapes. We skip GLOBAL capture in that case and let
-            # BALLOON forward run eager. LOCAL graph (StandardDispatcher,
-            # fixed-shape) is unaffected because it was captured at server
-            # startup before this code path runs.
-            skip_capture = (
-                target_variant == "global"
-                and envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
-            )
+            # Skip GLOBAL capture for known dynamic-shape data paths:
+            #   - deepep + DEEPEP_NORMAL=True  → DeepEP NORMAL dispatch_a/b
+            #     has dynamic shape (no NVSHMEM so we can't go to LL).
+            #   - sglang + capture_policy != fixed_padded → the dispatcher
+            #     stays in dynamic eager mode (no static buffers, host syncs
+            #     present).
+            # The sglang+fixed_padded path uses pre-allocated static buffers
+            # in CrossReplicaStandardDispatcher and IS graph-safe.
+            backend_lower = str(kunserve_comm_backend or "deepep").lower()
+            policy_lower = str(capture_policy or "auto").lower()
+            if backend_lower == "sglang":
+                skip_capture = (
+                    target_variant == "global"
+                    and policy_lower != "fixed_padded"
+                )
+            else:
+                skip_capture = (
+                    target_variant == "global"
+                    and envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
+                )
             if not skip_capture:
+                # NCCL communicator preheat for the sglang fixed_padded
+                # path.  The static CrossReplicaStandardDispatcher uses
+                # `all_gather_into_tensor` (dispatch) and `all_reduce`
+                # (combine) on `runtime_group`.  The very first time NCCL
+                # touches a process group it does communicator
+                # bootstrap; if that bootstrap happens *inside* the cuda
+                # graph capture context, NCCL either refuses
+                # ("init not allowed in graph mode") or bakes
+                # per-launch metadata into the graph that goes stale
+                # on replay.  Issue one dummy of each collective on the
+                # group while we are outside the capture context so the
+                # communicator is fully built before capture begins.
+                # The deepep path does its own NCCL/NVSHMEM warmup
+                # through the DeepEP buffer setup, so we only do this
+                # for the sglang backend.
+                if (
+                    backend_lower == "sglang"
+                    and policy_lower == "fixed_padded"
+                ):
+                    preheat_group = self._resolve_balloon_process_group(
+                        process_group_name
+                    )
+                    if preheat_group is not None:
+                        try:
+                            preheat_device = torch.device(
+                                "cuda", torch.cuda.current_device()
+                            )
+                            preheat_world = int(
+                                dist.get_world_size(group=preheat_group)
+                            )
+                            ag_in = torch.zeros(1, device=preheat_device)
+                            ag_out = torch.zeros(
+                                preheat_world, device=preheat_device
+                            )
+                            dist.all_gather_into_tensor(
+                                ag_out, ag_in, group=preheat_group
+                            )
+                            ar_buf = torch.zeros(1, device=preheat_device)
+                            dist.all_reduce(
+                                ar_buf,
+                                op=dist.ReduceOp.SUM,
+                                group=preheat_group,
+                            )
+                            torch.cuda.synchronize()
+                            _kunserve_ms(
+                                "[KUNSERVE-MS] NCCL communicator preheat done "
+                                "for runtime_group: world=%d "
+                                "(all_gather_into_tensor + all_reduce)",
+                                preheat_world,
+                            )
+                        except Exception as exc:
+                            # Preheat failure is suspicious but not
+                            # necessarily fatal — the actual capture may
+                            # still succeed if NCCL already initialized
+                            # the communicator through some other path
+                            # (e.g. the warmup forward).  Log and
+                            # continue; if capture later fails on init
+                            # this milestone will pinpoint why.
+                            _kunserve_ms(
+                                "[KUNSERVE-MS] NCCL communicator preheat "
+                                "FAILED on runtime_group: %r — proceeding "
+                                "into capture anyway",
+                                exc,
+                            )
                 self.ensure_cuda_graph_variant_captured(target_variant)
             else:
                 _kunserve_ms(
                     "[KUNSERVE-MS] skip GLOBAL cuda graph capture: "
-                    "GLOBAL bundle is in DeepEP NORMAL mode (dynamic shape, "
-                    "non-capturable). BALLOON forward will run eager.",
+                    "GLOBAL bundle uses a dynamic eager communication path "
+                    "(comm_backend=%s, capture_policy=%s). BALLOON forward "
+                    "will run eager.",
+                    kunserve_comm_backend,
+                    capture_policy,
                 )
 
         return fused_layers
@@ -1548,20 +1730,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         physical_to_logical_map=None,
         process_group_name: Optional[str] = None,
         capture_cuda_graph: bool = True,
+        kunserve_comm_backend: str = "deepep",
+        capture_policy: str = "auto",
+        kunserve_pg_names: Optional[Dict[str, str]] = None,
+        kunserve_backend_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         target_variant = self._normalize_balloon_variant(target_variant)
         _kunserve_ms(
-            "[KUNSERVE-MS] prepare start: target_variant=%s pg=%s capture_cuda_graph=%s "
+            "[KUNSERVE-MS] prepare start: target_variant=%s pg=%s "
+            "comm_backend=%s capture_policy=%s capture_cuda_graph=%s "
             "runtime_ep_size=%s rank_offset=%s",
             target_variant,
             process_group_name,
+            kunserve_comm_backend,
+            capture_policy,
             capture_cuda_graph,
             runtime_ep_size,
             runtime_rank_offset,
         )
         logger.info(
             "Prepare balloon: target_variant=%s runtime_ep_size=%s moe_ep_rank=%s dispatch_ep_rank=%s "
-            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s capture_cuda_graph=%s",
+            "runtime_rank_offset=%s dispatch_rank_offset=%s process_group=%s "
+            "comm_backend=%s capture_policy=%s capture_cuda_graph=%s",
             target_variant,
             runtime_ep_size,
             moe_ep_rank,
@@ -1569,6 +1759,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             runtime_rank_offset,
             dispatch_rank_offset,
             process_group_name,
+            kunserve_comm_backend,
+            capture_policy,
             capture_cuda_graph,
         )
 
@@ -1585,6 +1777,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             physical_to_logical_map=physical_to_logical_map,
             process_group_name=process_group_name,
             capture_cuda_graph=capture_cuda_graph,
+            kunserve_comm_backend=kunserve_comm_backend,
+            capture_policy=capture_policy,
+            kunserve_pg_names=kunserve_pg_names,
+            kunserve_backend_config=kunserve_backend_config,
         )
 
         self._balloon_prepared_variant = target_variant
@@ -1613,6 +1809,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         physical_to_logical_map=None,
         process_group_name: Optional[str] = None,
         capture_cuda_graph: bool = True,
+        kunserve_comm_backend: str = "deepep",
+        capture_policy: str = "auto",
+        kunserve_pg_names: Optional[Dict[str, str]] = None,
+        kunserve_backend_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Pre-build the GLOBAL runtime bundle and capture its CUDA graph
         without changing balloon state.
@@ -1637,22 +1837,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return self.get_balloon_status()
 
         _kunserve_ms(
-            "[KUNSERVE-MS] warmup start: target_variant=%s pg=%s capture_cuda_graph=%s "
+            "[KUNSERVE-MS] warmup start: target_variant=%s pg=%s "
+            "comm_backend=%s capture_policy=%s capture_cuda_graph=%s "
             "runtime_ep_size=%s rank_offset=%s",
             target_variant,
             process_group_name,
+            kunserve_comm_backend,
+            capture_policy,
             capture_cuda_graph,
             runtime_ep_size,
             runtime_rank_offset,
         )
         logger.info(
             "Warmup balloon: target_variant=%s runtime_ep_size=%s moe_ep_rank=%s "
-            "runtime_rank_offset=%s process_group=%s capture_cuda_graph=%s",
+            "runtime_rank_offset=%s process_group=%s comm_backend=%s "
+            "capture_policy=%s capture_cuda_graph=%s",
             target_variant,
             runtime_ep_size,
             moe_ep_rank,
             runtime_rank_offset,
             process_group_name,
+            kunserve_comm_backend,
+            capture_policy,
             capture_cuda_graph,
         )
 
@@ -1670,6 +1876,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 physical_to_logical_map=physical_to_logical_map,
                 process_group_name=process_group_name,
                 capture_cuda_graph=capture_cuda_graph,
+                kunserve_comm_backend=kunserve_comm_backend,
+                capture_policy=capture_policy,
+                kunserve_pg_names=kunserve_pg_names,
+                kunserve_backend_config=kunserve_backend_config,
             )
         except Exception as exc:
             self._balloon_last_error = str(exc)
@@ -2109,6 +2319,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "tp_size": int(self.tp_size),
             "local_ep_size": int(self.moe_ep_size),
             "balloon_process_group_name": self._balloon_process_group_name,
+            "kunserve_comm_backend": self._balloon_kunserve_comm_backend,
+            "kunserve_capture_policy": self._balloon_capture_policy,
             "local_num_experts_per_layer": {
                 int(layer.layer_id): int(layer.local_bundle.num_local_experts)
                 for layer in fused_layers

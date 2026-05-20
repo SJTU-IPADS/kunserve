@@ -1535,6 +1535,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
+        get_runtime_tensor = getattr(layer, "get_runtime_tensor", None)
+        if get_runtime_tensor is None:
+
+            def get_runtime_tensor(name):
+                return getattr(layer, name)
+
         if self.runner.runner_backend.is_deep_gemm():
 
             get_runtime_tensor = getattr(layer, "get_runtime_tensor", None)
@@ -1628,23 +1634,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
+                w13_weight=get_runtime_tensor("w13_weight"),
+                w2_weight=get_runtime_tensor("w2_weight"),
+                b13=(
+                    layer.get_runtime_bias("w13_weight_bias")
+                    if hasattr(layer, "get_runtime_bias")
+                    else getattr(layer, "w13_weight_bias", None)
+                ),
+                b2=(
+                    layer.get_runtime_bias("w2_weight_bias")
+                    if hasattr(layer, "get_runtime_bias")
+                    else getattr(layer, "w2_weight_bias", None)
+                ),
                 use_fp8_w8a8=True,
                 w13_scale=(
-                    layer.w13_weight_scale_inv
+                    get_runtime_tensor("w13_weight_scale_inv")
                     if self.block_quant
-                    else layer.w13_weight_scale
+                    else get_runtime_tensor("w13_weight_scale")
                 ),
                 w2_scale=(
-                    layer.w2_weight_scale_inv
+                    get_runtime_tensor("w2_weight_scale_inv")
                     if self.block_quant
-                    else layer.w2_weight_scale
+                    else get_runtime_tensor("w2_weight_scale")
                 ),
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
+                a13_scale=get_runtime_tensor("w13_input_scale"),
+                a2_scale=get_runtime_tensor("w2_input_scale"),
                 block_shape=self.quant_config.weight_block_size,
             )
         else:

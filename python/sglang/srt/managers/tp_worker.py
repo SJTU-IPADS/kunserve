@@ -197,6 +197,10 @@ class BaseTpWorker(ABC):
             physical_to_logical_map=recv_req.physical_to_logical_map,
             process_group_name=recv_req.process_group_name,
             capture_cuda_graph=recv_req.capture_cuda_graph,
+            kunserve_comm_backend=recv_req.kunserve_comm_backend,
+            capture_policy=recv_req.capture_policy,
+            kunserve_pg_names=recv_req.kunserve_pg_names,
+            kunserve_backend_config=recv_req.kunserve_backend_config,
         )
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         return status
@@ -215,6 +219,10 @@ class BaseTpWorker(ABC):
             physical_to_logical_map=recv_req.physical_to_logical_map,
             process_group_name=recv_req.process_group_name,
             capture_cuda_graph=recv_req.capture_cuda_graph,
+            kunserve_comm_backend=recv_req.kunserve_comm_backend,
+            capture_policy=recv_req.capture_policy,
+            kunserve_pg_names=recv_req.kunserve_pg_names,
+            kunserve_backend_config=recv_req.kunserve_backend_config,
         )
         # Warmup does not change max_total_num_tokens, but mirror the pattern
         # used by other balloon entry points so any future internal cache stays

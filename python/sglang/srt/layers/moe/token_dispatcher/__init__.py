@@ -20,6 +20,9 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     FlashinferDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.kunserve_standard import (
+    CrossReplicaStandardDispatcher,
+)
 from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
@@ -48,6 +51,7 @@ __all__ = [
     "DispatchOutputChecker",
     "FlashinferDispatchOutput",
     "FlashinferDispatcher",
+    "CrossReplicaStandardDispatcher",
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",

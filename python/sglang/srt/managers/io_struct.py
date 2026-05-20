@@ -1586,6 +1586,10 @@ class PrepareBalloonReqInput(BaseReq):
     physical_to_logical_map: Optional[List[List[int]]] = None
     process_group_name: Optional[str] = None
     capture_cuda_graph: bool = True
+    kunserve_comm_backend: str = "deepep"
+    capture_policy: str = "auto"
+    kunserve_pg_names: Optional[Dict[str, str]] = None
+    kunserve_backend_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1610,6 +1614,10 @@ class WarmupBalloonReqInput(BaseReq):
     physical_to_logical_map: Optional[List[List[int]]] = None
     process_group_name: Optional[str] = None
     capture_cuda_graph: bool = True
+    kunserve_comm_backend: str = "deepep"
+    capture_policy: str = "auto"
+    kunserve_pg_names: Optional[Dict[str, str]] = None
+    kunserve_backend_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
