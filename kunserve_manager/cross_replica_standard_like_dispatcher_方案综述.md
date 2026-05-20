@@ -1079,6 +1079,11 @@ model_runner.py:forward_idle()
 
 ## 9. pre-capture 用这个例子怎么理解？
 
+> **状态更新（Phase D 已实现）**：sglang backend 的 fixed_padded GLOBAL graph capture 路径已经落地。
+> 触发：`KUNSERVE_CAPTURE_POLICY=fixed_padded`（默认仍 `disabled` 不破坏旧 smoke）。
+> 实现细节见 §9.4 和 [`kunserve_implementation_detail.md`](kunserve_implementation_detail.md) 的 Phase D 章节。
+> 本节保留原始动机描述以便后续接手的人理解为什么需要 pre-capture，再继续读 §9.4 的当前实现。
+
 ### 9.1 没有 pre-capture 会怎样？
 
 如果等到请求已经因为 KV 不够触发 BALLOON 时才做 GLOBAL graph capture：
@@ -1144,6 +1149,84 @@ B token 数 = 45, 41, 50, ...
 ```text
 kunserve_capture_policy=fixed_padded
 ```
+
+### 9.4 当前实现（Phase D, 已落地）
+
+CrossReplicaStandardDispatcher 被改成**双路径**：
+
+```text
+dynamic 路径：
+  - 保留原 correctness-first 实现
+  - 每步 dist.all_gather(list) + torch.full/empty_like + .item() host sync
+  - 不能 capture，但 BALLOON 期间任何 shape 都能跑（prefill、不匹配 batch）
+
+static 路径（capture-only）：
+  - 构造时按 capture_max_m = graph_runner.max_num_token 预分配持久 buffer
+  - dispatch 用 dist.all_gather_into_tensor（不是 list 形式）
+  - 用静态 slice copy 做 lane select
+  - remap topk_ids 走 torch.clamp + torch.where 无 Python 分支
+  - combine 用 dist.all_reduce 直接在静态 buffer 上 in-place
+  - 无 .item() / .cpu() / bool() 等 host sync
+```
+
+路径选择：进入 `dispatch()` / `combine()` 时通过 `torch.cuda.is_current_stream_capturing()` 判断。capture stream 上必走 static；eager 必走 dynamic；replay 时 Python 不执行，graph 直接重放，问题不存在。
+
+预分配的 buffer（每个 FusedMoE 层一套）：
+
+```text
+_buf_padded_hidden[M, H]              # 本 rank all-gather 源
+_buf_padded_topk_ids[M, K]            #  ↑
+_buf_padded_topk_weights[M, K]        #  ↑
+_buf_gathered_hidden[W·M, H]          # all-gather 目标
+_buf_gathered_topk_ids[W·M, K]        #  ↑
+_buf_gathered_topk_weights[W·M, K]    #  ↑
+_buf_union_hidden[NR·M, H]            # lane select 输出 / runner 输入
+_buf_union_topk_ids[NR·M, K]          #  ↑
+_buf_union_topk_weights[NR·M, K]      #  ↑
+_buf_union_topk_ids_remapped[NR·M, K] # remap 后的 topk_ids（独立 buffer）
+_neg_one_int32                        # 常量标量，给 torch.where 用
+```
+
+其中 `M = capture_max_m`、`W = world_size`（=4，单节点 2 replica × TP2）、`NR = num_replicas`（=2）。
+
+**关键设计决定**：
+
+1. 用单独的 `_buf_union_topk_ids_remapped` 作为 remap 输出，**绝对不能** `self._buf_union_topk_ids = torch.where(...)` 这样重新绑定属性——会把后续 capture 的 buffer 指针污染掉（指向上一次 capture 的 graph 私有 pool）。
+2. `_allocate_static_buffers()` 在构造时立即调用 `_mapping_on(device)` 把 `local_expert_mapping` move 到 cuda，避免 capture 内 `.to(device)` 重新分配。
+3. 所有 buffer 在 default cuda pool 分配，**不在** graph capture context 里——这样每个 `(variant, batch_size)` 的 graph 共享同一组静态地址。
+
+### 9.5 NCCL communicator 预热（避开 capture 内 init）
+
+NCCL communicator 是 per-group 的，第一次任何 collective 在 `runtime_group` 上跑都会触发 bootstrap。如果这个 bootstrap 发生在 `with torch.cuda.graph(...)` capture context **里**，NCCL 会报"init not allowed in graph mode"或者把 per-launch 元数据烤进 graph 导致 replay 出错。
+
+`model_runner._warmup_balloon_global_runtime` 在进 capture 之前做一次 dummy collective：
+
+```python
+# 仅 sglang + fixed_padded 路径触发；deepep 路径自己的 DeepEP buffer setup 已处理
+if backend_lower == "sglang" and policy_lower == "fixed_padded":
+    preheat_group = self._resolve_balloon_process_group(process_group_name)
+    if preheat_group is not None:
+        ag_in  = torch.zeros(1, device=cuda)
+        ag_out = torch.zeros(world, device=cuda)
+        dist.all_gather_into_tensor(ag_out, ag_in, group=preheat_group)
+        ar_buf = torch.zeros(1, device=cuda)
+        dist.all_reduce(ar_buf, op=SUM, group=preheat_group)
+        torch.cuda.synchronize()
+        _kunserve_ms("[KUNSERVE-MS] NCCL communicator preheat done ...")
+```
+
+两个 op（`all_gather_into_tensor` + `all_reduce`）就够 —— communicator init 是 per-group 不是 per-shape，一旦建好后续任何 shape 都直接复用。`torch.cuda.synchronize()` 确保 bootstrap 完成再进 capture。
+
+失败被 wrap 在 try/except 里：如果 communicator 已经从别的路径（manager 的 `init_weights_update_group`、之前的 warmup forward）建好了，preheat 会成功；如果真没建好且 preheat 也失败，capture 会自己报错，那时这条 milestone 是定位首要线索。
+
+### 9.6 形状不变量与 idle keepalive 的耦合
+
+static 路径有一条**硬约束**：capture 和 replay 时所有 global rank 必须看到同一个 `local_m`。
+
+- capture 阶段：`CudaGraphRunner` 按 `capture_bs` 同步遍历，两个 replica 在同一时刻执行 warmup_balloon RPC，都进 `_capture_one_stream("global")`，每个 bs 同时 capture。manager 已经用 `asyncio.gather` 并行调用两边的 `warmup_balloon`，这一步天然 lockstep。
+- replay 阶段：BALLOON forward 时如果两个 replica `forward_batch.batch_size` 不一致（例如 replicaA decode 64 个请求，replicaB 已经 drain 完），`all_gather_into_tensor` 会因为 input shape 不匹配 hang/报错。
+
+**Phase D 没有解决 replay-time 的 lockstep 问题**——这是 §8 idle keepalive 的范围。Phase D 跑通后，必须配套实现 Phase E（idle keepalive 正式化），否则长尾不均衡场景会 NCCL hang。短期 smoke 测试两 replica 工作量大致相同时不触发。
 
 ---
 
@@ -1393,7 +1476,7 @@ kunserve_capture_policy=disabled
 输出 stop reason 大多正常
 ```
 
-### Phase D：实现 fixed padded pre-capture
+### Phase D：实现 fixed padded pre-capture【已完成】
 
 参数：
 
@@ -1403,12 +1486,30 @@ kunserve_pre_capture=True
 kunserve_capture_policy=fixed_padded
 ```
 
-验收：
+**实现状态**：
+- ✅ `kunserve_standard.py` 增加 static 路径 + 静态 buffer 预分配 + `all_gather_into_tensor` + 无 host sync
+- ✅ `runtime_config.py` 的 `should_capture_global_graph()` 允许 sglang+fixed_padded
+- ✅ `model_runner.register_balloon_global_runtime_bundle` 传 `capture_max_m=graph_runner.max_num_token`
+- ✅ `_warmup_balloon_global_runtime` 的 `skip_capture` 按 backend 分支
+- ✅ NCCL communicator 预热（dummy all_gather_into_tensor + all_reduce）
 
-```text
-warmup 阶段看到 Capturing batches variant='global'
-/kunserve/status 里 captured_graph_variants 包含 global
-BALLOON 后 step latency 明显低于 eager
+**剩余风险**：replay 时两 replica `local_m` 必须一致，依赖 Phase E。
+
+验收命令：
+
+```bash
+RUN=/workspace/verl/outputs/<ts>/kunserve
+grep -aE "CrossReplicaStandardDispatcher static buffers ready" \
+     "${RUN}"/kunserve_*.log "${RUN}"/verl_training.log
+grep -aE "NCCL communicator preheat done" \
+     "${RUN}"/kunserve_*.log
+grep -aE "Capturing batches \(variant='?global'?" \
+     "${RUN}"/verl_training.log
+grep -aE "\[KUNSERVE-MS\] skip GLOBAL cuda graph capture" \
+     "${RUN}"/kunserve_*.log   # 必须为空
+jq '.internal_states[] | .balloon_status.captured_graph_variants' \
+     "${RUN}"/sglang_snapshot/server_info_*.json
+# 期望进 BALLOON 后包含 ["local","global"]
 ```
 
 ### Phase E：正式化 idle keepalive
@@ -1439,6 +1540,26 @@ lane1_pg = [rank1, rank3]
 
 dispatcher 从 `global_dense_v0` 切到 `lane_exchange_v1`。
 
+**这个 phase 同时解锁 dispatch 和 combine 两侧的通信优化**：
+
+- **dispatch 侧**：消除 `[A,A,B,B]` 网络冗余。当前 P0 global all-gather 把 A 在 rank0/rank1 都发了一份、B 在 rank2/rank3 都发了一份。lane subgroup `[rank0, rank2]` / `[rank1, rank3]` 内的 all-gather 只产生 `[A, B]`，无冗余。
+- **combine 侧**：当前 `dist.all_reduce` 等价于 `reduce_scatter + all_gather`。reduce 部分（每个 rank 把 partial expert 输出加起来）是 MoE partition 决定的数学必要；但 all_gather 部分把完整 `[2*M, H]` union 发到每个 rank 是浪费——replica0 的两个 rank 只用 `[0:M]`、replica1 的两个 rank 只用 `[M:2*M]`。两阶段拆分：
+  ```
+  Stage 1: lane subgroup [rank0,rank2] / [rank1,rank3] 内 reduce_scatter
+           输入 [2*M, H]，输出 [M, H]：lane 内的 partial 已经按 replica 切好
+  Stage 2: local TP group [rank0,rank1] / [rank2,rank3] 内 all_reduce
+           合并两条 lane 的贡献 → 每个 rank 得到自己 replica 完整 [M, H]
+  ```
+  combine 阶段网络字节数 ≈ 砍一半。
+
+两个优化共享同一组 lane subgroup PG，单独做 combine 优化不划算，必须和 lane subgroup 一起上线。
+
+### Phase G（可选）：token-level all-to-all（DeepEP 思路，不依赖 DeepEP 实现）
+
+进一步用 "token 只发到拥有它 top_k expert 的 rank、算完结果送回 origin replica" 的精确路由替代 dense all-gather + all-reduce。通信量 O(M·top_k·H) 而不是 O(M·world_size·H)。
+
+这一阶段在数学上和 DeepEP 等价，但用 `torch.distributed` 原语而不是 DeepEP/NVSHMEM 实现。优势是可移植性（不依赖 IB、NVSHMEM、IBGDA）；劣势是工程复杂度高，需要 token 分桶 + 静态 padding + 反向路由表。**只有 Phase F 的 reduce_scatter 优化收益榨干之后才考虑做**。
+
 ---
 
 ## 14. 最终推荐参数
@@ -1449,7 +1570,14 @@ dispatcher 从 `global_dense_v0` 切到 `lane_exchange_v1`。
 actor_rollout_ref.rollout.kunserve_enable=True
 actor_rollout_ref.rollout.kunserve_comm_backend=sglang
 actor_rollout_ref.rollout.kunserve_pre_capture=True
-actor_rollout_ref.rollout.kunserve_capture_policy=fixed_padded
+actor_rollout_ref.rollout.kunserve_capture_policy=fixed_padded   # Phase D 已支持
+```
+
+或者通过 smoke 脚本环境变量：
+
+```bash
+export KUNSERVE_COMM_BACKEND=sglang
+export KUNSERVE_CAPTURE_POLICY=fixed_padded   # 默认 disabled
 ```
 
 ### manager CLI
@@ -1498,6 +1626,8 @@ python -m kunserve_manager \
 3. **P0 先只建一个 global PG。** 这样可以复用当前 `/init_weights_update_group`，先把 correctness 跑通。
 4. **P1 再做 lane subgroup。** lane subgroup 是性能优化，不是第一版 correctness 必需项。
 5. **GLOBAL all-reduce 必须用 KunServe global group。** 不能误用 local `get_tp_group()`。
-6. **pre-capture 必须 fixed padded。** dynamic all-gather 可以 eager 跑，但不能承诺 CUDA graph。
-7. **idle keepalive 是跨 replica collective 的生存条件。** 只要一个 replica 还在 BALLOON decode，其他 replica 即使没真实请求也必须继续参与 GLOBAL collectives。
-8. **初版不要做 persistent union hidden。** MoE 内部可以临时 union，但离开 `FusedMoE.forward_impl()` 时必须 slice 回 local batch；否则会牵连 attention/KV/ForwardBatch/scheduler，变成“合并实例”级别改造。
+6. **pre-capture 必须 fixed padded。** dynamic all-gather 可以 eager 跑，但不能承诺 CUDA graph。**Phase D 已实现这条**。
+7. **idle keepalive 是跨 replica collective 的生存条件。** 只要一个 replica 还在 BALLOON decode，其他 replica 即使没真实请求也必须继续参与 GLOBAL collectives。**Phase D 的 graph replay 同样依赖这条**——两 replica 的 `local_m` 必须 lockstep，否则 `all_gather_into_tensor` 会 hang。
+8. **初版不要做 persistent union hidden。** MoE 内部可以临时 union，但离开 `FusedMoE.forward_impl()` 时必须 slice 回 local batch；否则会牵连 attention/KV/ForwardBatch/scheduler，变成”合并实例”级别改造。
+9. **静态 buffer 的属性指针不能在 dispatch 内部被重新绑定。** capture 之间共享同一组持久 buffer 地址；`self._buf_X = torch.where(...)` 这样的写法会把后续 capture 的 record 钉死到上一次 capture 的 graph 私有 pool。所有 in-place 修改必须走 `copy_` / `.zero_()` / `.fill_()` / `dist.*_into_tensor`。
+10. **NCCL communicator 必须在 capture 之外完成 bootstrap。** 进入 `with torch.cuda.graph(...)` 之前对目标 PG 跑一次 dummy `all_gather_into_tensor + all_reduce`；否则 NCCL 在 capture 里 init 会失败或把 per-launch 元数据烤进 graph。

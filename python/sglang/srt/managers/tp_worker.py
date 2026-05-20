@@ -112,6 +112,8 @@ class BaseTpWorker(ABC):
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+            lane_only_tp_rank=recv_req.lane_only_tp_rank,
+            explicit_group_rank=recv_req.explicit_group_rank,
         )
         return success, message
 

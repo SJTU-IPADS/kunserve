@@ -8,6 +8,8 @@
 4. 当前脚本如何选择 bf16/no-quant 或 FP8/DeepEP 路径。
 
 > 当前推荐的 correctness-first 初版：`KUNSERVE_COMM_BACKEND=sglang`，`KUNSERVE_CAPTURE_POLICY=disabled`，`moe_a2a_backend=none`，`moe_runner_backend=triton`，rollout 不传 `quantization`，因此 SGLang 按 rollout 默认 `dtype=bfloat16` 做 bf16/no-quant 推理。
+>
+> **Phase D 状态（已实现）**：sglang backend 的 GLOBAL CUDA graph capture 已可用。开关 `KUNSERVE_CAPTURE_POLICY=fixed_padded`。dispatcher 是**双路径**：eager 时跑动态 all-gather/all-reduce（原 P0 行为），capture 时切到静态 buffer + `all_gather_into_tensor`，无 host sync。详见 §6.6。剩余依赖 Phase E（idle keepalive 正式化）才能在长尾不均衡场景下安全 replay。
 
 ---
 
@@ -431,11 +433,140 @@ layer.get_runtime_tensor("w2_weight")
 
 ### 6.5 当前限制
 
-- correctness-first eager 实现；
+- correctness-first eager 实现仍然保留为默认路径（`capture_policy=disabled`/`auto`）；
 - 每层都做 all-gather + all-reduce，性能不是最终目标；
-- 不 capture GLOBAL CUDA graph；
+- **Phase D 已支持 GLOBAL CUDA graph capture**（`capture_policy=fixed_padded`，详见 §6.6）；
 - 当前只支持 `StandardTopKOutput`；
-- 依赖同一 replica 内 EP ranks token count 一致，否则会显式报错。
+- 依赖同一 replica 内 EP ranks token count 一致，否则会显式报错；
+- Phase D graph replay 要求两个 replica `local_m` 一致（lockstep），idle keepalive 尚未正式化。
+
+### 6.6 Phase D：fixed_padded GLOBAL graph capture（新增）
+
+触发：`KUNSERVE_CAPTURE_POLICY=fixed_padded`（默认仍 `disabled` 不破坏旧 smoke）。
+
+dispatcher 改成**双路径**：
+
+| 路径 | 何时走 | 关键特性 |
+|---|---|---|
+| dynamic eager | `is_current_stream_capturing() == False` | 保留 §6.2/§6.4 原实现，host sync + 动态 tensor alloc + list-form all_gather |
+| static fixed_padded | `is_current_stream_capturing() == True` | 全部走预分配静态 buffer + `dist.all_gather_into_tensor` + `dist.all_reduce`，无任何 host sync |
+
+#### 6.6.1 静态 buffer 预分配
+
+`CrossReplicaStandardDispatcher.__init__` 在传入 `capture_max_m = graph_runner.max_num_token` 时立即在 default cuda pool 分配：
+
+```text
+_buf_padded_hidden       [M, H]
+_buf_padded_topk_ids     [M, K]
+_buf_padded_topk_weights [M, K]
+_buf_gathered_hidden     [W·M, H]
+_buf_gathered_topk_ids   [W·M, K]
+_buf_gathered_topk_weights [W·M, K]
+_buf_union_hidden        [NR·M, H]
+_buf_union_topk_ids      [NR·M, K]
+_buf_union_topk_weights  [NR·M, K]
+_buf_union_topk_ids_remapped [NR·M, K]    # 关键：独立 buffer 避免重新绑定
+_neg_one_int32           标量              # torch.where 的 other 常量
+```
+
+其中 `M = capture_max_m`、`W = world_size = 4`、`K = top_k`、`NR = num_replicas = 2`。同时构造时立即 `local_expert_mapping.to(cuda)`。
+
+#### 6.6.2 dispatch / combine 静态路径
+
+dispatch 关键步骤：
+
+```python
+# 1) 源 buffer pad: zero/fill 全部，前缀 copy 真数据
+self._buf_padded_hidden.zero_()
+self._buf_padded_hidden[:local_m].copy_(hidden_states)
+self._buf_padded_topk_ids.fill_(-1)
+self._buf_padded_topk_ids[:local_m].copy_(topk_ids.to(int32))
+self._buf_padded_topk_weights.zero_()
+self._buf_padded_topk_weights[:local_m].copy_(topk_weights)
+
+# 2) all_gather_into_tensor —— 不是 list 形式，buffer 静态地址
+dist.all_gather_into_tensor(self._buf_gathered_hidden, self._buf_padded_hidden, ...)
+# (topk_ids / topk_weights 同样)
+
+# 3) Lane select 静态 slice copy
+for r in range(self.num_replicas):
+    src = (r * self.local_ep_size + self.lane_rank) * M
+    dst = r * M
+    self._buf_union_hidden[dst:dst+M].copy_(self._buf_gathered_hidden[src:src+M])
+    # (topk_ids / topk_weights 同样)
+
+# 4) Branch-free remap → 写入独立 buffer
+valid = (union_ids >= 0) & (union_ids < self.num_experts)
+safe_ids = torch.clamp(union_ids, min=0).to(long)
+looked = mapping[safe_ids].to(union_ids.dtype)
+self._buf_union_topk_ids_remapped.copy_(
+    torch.where(valid, looked, self._neg_one_int32)
+)
+```
+
+**关键陷阱**：第 4 步**绝对不能** `self._buf_union_topk_ids = torch.where(...)`。属性重新绑定会让后续 `(variant, bs)` capture 录到上一次 capture 的 graph 私有 pool 指针，replay 会出 NaN/越界。所以引入独立 `_buf_union_topk_ids_remapped`。
+
+combine 关键步骤：
+
+```python
+hidden_states = hidden_states.contiguous()
+dist.all_reduce(hidden_states, op=SUM, group=self.group)
+start = self.replica_rank * self._capture_max_m
+end   = start + self._last_local_m
+return hidden_states[start:end].contiguous()
+```
+
+每个 `(variant, bs)` 的 graph 让 runner 在该 graph 的 private pool 分配 partial output；`all_reduce` 直接 in-place。
+
+#### 6.6.3 NCCL communicator 预热
+
+`model_runner._warmup_balloon_global_runtime` 在进 capture 之前对 `runtime_group` 跑：
+
+```python
+dist.all_gather_into_tensor(ag_out, ag_in, group=runtime_group)
+dist.all_reduce(ar_buf, op=SUM, group=runtime_group)
+torch.cuda.synchronize()
+```
+
+仅在 `backend=sglang + capture_policy=fixed_padded + not skip_capture` 时执行。failure 被 try/except wrap，仅打 milestone。日志关键字 `[KUNSERVE-MS] NCCL communicator preheat done` / `... FAILED`。
+
+NCCL communicator init 是 per-group 的，两个 op 就足够覆盖 dispatcher 用到的所有 collective（`all_gather_into_tensor` + `all_reduce`），不需要每种 shape 都预热一次。
+
+#### 6.6.4 三处代码改动汇总
+
+| 文件 | 改动 |
+|---|---|
+| `python/sglang/srt/layers/moe/token_dispatcher/kunserve_standard.py` | 加 `capture_max_m` 参数；构造预分配 11 个静态 buffer；`dispatch`/`combine` 用 `is_current_stream_capturing()` 路由；新增 `_dispatch_static` / `_combine_static`；dynamic 路径完整保留。 |
+| `kunserve_manager/runtime_config.py` | `should_capture_global_graph()` 在 sglang backend 下从一律 `False` 改成只在 `capture_policy=fixed_padded` 时返回 `True`。deepep 行为不变。 |
+| `python/sglang/srt/model_executor/model_runner.py` | `register_balloon_global_runtime_bundle` 的 sglang 分支按 `capture_policy` 决定是否取 `graph_runner.max_num_token` 传给 dispatcher；`_warmup_balloon_global_runtime` 的 `skip_capture` 改成按 backend 分支（sglang 看 `capture_policy`，deepep 看 `DEEPEP_NORMAL`）；加 NCCL communicator 预热。 |
+
+#### 6.6.5 验证 grep 闸门
+
+```bash
+RUN=/workspace/verl/outputs/<ts>/kunserve
+
+# 闸门 1：静态 buffer 真分配了
+grep -aE "CrossReplicaStandardDispatcher static buffers ready" "${RUN}"/*.log
+
+# 闸门 2：NCCL 预热成功
+grep -aE "NCCL communicator preheat done" "${RUN}"/*.log
+grep -aE "NCCL communicator preheat FAILED" "${RUN}"/*.log   # 必须为空
+
+# 闸门 3：GLOBAL graph 真 capture 了
+grep -aE "Capturing batches \(variant='?global'?" "${RUN}/verl_training.log"
+grep -aE "skip GLOBAL cuda graph capture" "${RUN}"/*.log   # 必须为空
+
+# 闸门 4：BALLOON 状态包含 global
+jq '.internal_states[] | .balloon_status |
+    {state, runtime_variant, captured_graph_variants}' \
+   "${RUN}"/sglang_snapshot/server_info_*.json
+```
+
+#### 6.6.6 Phase D 未解决的事
+
+- **Replay lockstep**：两 replica `local_m` 必须一致；不一致时 `all_gather_into_tensor` 会 hang。需要 Phase E（idle keepalive 正式化）。
+- **lane subgroup 优化**：dispatch 的 `[A,A,B,B]` 网络冗余 + combine 的 `all_reduce ≡ reduce_scatter + all_gather` 浪费，需要 Phase F。两个优化共享同一组 lane subgroup PG，单独做 combine 不划算。
+- **router_logits**：static 路径下不做 router_logits union；当前 Triton MoE runner 不依赖它做 compute，OK。需要 union router_logits 的下游 layer 需要补。
 
 ---
 
@@ -504,6 +635,8 @@ GPU_MEMORY_UTILIZATION=0.65
 KUNSERVE_MOE_A2A_BACKEND=none
 KUNSERVE_MOE_RUNNER_BACKEND=triton
 KUNSERVE_ROLLOUT_QUANTIZATION=none
+KUNSERVE_CAPTURE_POLICY=disabled         # 默认仍 disabled
+                                          # 想开 Phase D 设 =fixed_padded
 
 # deepep backend 默认
 KUNSERVE_MOE_A2A_BACKEND=deepep
@@ -511,7 +644,14 @@ KUNSERVE_MOE_RUNNER_BACKEND=deep_gemm
 KUNSERVE_ROLLOUT_QUANTIZATION=fp8
 ```
 
-`none|null|bf16|bfloat16|false|0` 都表示“不传 rollout.quantization”。
+`none|null|bf16|bfloat16|false|0` 都表示”不传 rollout.quantization”。
+
+打开 Phase D：
+
+```bash
+ONLY_RUN=kunserve KUNSERVE_CAPTURE_POLICY=fixed_padded \
+    bash /workspace/verl/data/compare_kunserve_vs_baseline.sh
+```
 
 ### 8.3 TP=2 vs TP=4 compare
 
@@ -558,10 +698,20 @@ grep -a "rollout.quantization" /workspace/verl/outputs/<RUN>/kunserve/verl_train
 
 ## 10. 后续优化方向
 
-1. **sglang backend 性能优化**：当前每层 dense all-gather + all-reduce 是 correctness-first，后续可做 fixed padded graph、lane subgroup、reduce-scatter 等优化。
-2. **idle keepalive**：BALLOON 后所有 ranks 必须共同进入 collective；长尾时如果一个 replica 完全 idle，仍需 dummy participation。
-3. **DeepEP LL 路径**：若 nvidia-peermem/IBGDA/NVSHMEM 环境稳定，可继续作为高性能路径。
-4. **更多 replica/general split**：当前 layout planner 写死 two-replica symmetric half split，可在 `layout.py` 扩展。
+1. **Phase D — fixed padded GLOBAL graph capture**：**已实现**（见 §6.6）。开关 `KUNSERVE_CAPTURE_POLICY=fixed_padded`。
+2. **Phase E — idle keepalive 正式化**：Phase D 的 graph replay 依赖两 replica `local_m` 一致，长尾不均衡时必须发 dummy batch 同步 collective，否则 `all_gather_into_tensor` 会 hang。当前 `scheduler.py:_maybe_get_balloon_keepalive_batch()` 有雏形，需要扩成"对端 replica idle 时也要发同 shape 的 dummy forward"。
+3. **Phase F — lane subgroup 优化（dispatch + combine 共享）**：
+   - **dispatch 侧**：当前 P0 global all-gather 产生 `[A,A,B,B]` 网络冗余。lane subgroup `[rank0, rank2]` / `[rank1, rank3]` 内做 all-gather 可以直接得到 `[A, B]`。
+   - **combine 侧**：当前 `dist.all_reduce` 等价于 `reduce_scatter + all_gather`。reduce 部分（partial expert sum）是 MoE partition 的数学必要；但 all_gather 部分把完整 `[2*M, H]` 广播到每个 rank 是浪费。两阶段拆分：
+     ```
+     Stage 1: lane subgroup reduce_scatter，按 replica 维度切，每个 rank 拿到本 lane 对本 replica 的贡献
+     Stage 2: local TP group all_reduce，合并两条 lane 的贡献
+     ```
+     combine 阶段网络字节数 ≈ 砍一半。
+   - 两个优化共享 lane subgroup PG 基础设施，要做必须一起做。
+4. **Phase G（可选）— token-level all-to-all**：用 DeepEP 思路（token 只发到拥有它 top_k expert 的 rank，结果送回 origin）替代 dense all-gather + all-reduce，但用 `torch.distributed` 实现，不依赖 NVSHMEM/IBGDA。通信量从 O(M·world_size·H) 降到 O(M·top_k·H)。只有 Phase F 收益榨干之后才考虑。
+5. **DeepEP LL 路径**：若 nvidia-peermem/IBGDA/NVSHMEM 环境稳定，仍是 deepep backend 下的高性能路径。
+6. **更多 replica / general split**：当前 layout planner 写死 two-replica symmetric half split，可在 `layout.py` 扩展。
 
 ---
 
@@ -604,12 +754,12 @@ class KunServeRuntimeBackendConfig:                # manager 内部统一保存�
     def should_capture_global_graph(self) -> bool:  # manager 构造 payload 时调用
         if self.capture_policy == "disabled":      # 显式禁用时直接 False
             return False
-        if self.comm_backend == "sglang":           # sglang 初版是 dynamic all-gather/all-reduce
-            # P0 sglang backend uses dynamic padded all-gather/all-reduce.
-            # Capture support needs a later fixed-padded graph implementation;
-            # until that lands, even capture_policy=fixed_padded is treated as
-            # disabled rather than attempting an unsafe graph capture.
-            return False                            # 因此不尝试 GLOBAL graph capture
+        if self.comm_backend == "sglang":
+            # Phase D（已实现）：dispatcher 的 static 路径用预分配 buffer +
+            # all_gather_into_tensor，是 graph-safe 的。只有 capture_policy=
+            # fixed_padded 明确请求才走 capture；其他 sglang 情况（auto/未设置）
+            # 仍走 eager，保持 P0 correctness-first 行为。
+            return self.capture_policy == "fixed_padded"
         return True                                 # DeepEP 路径仍允许按旧逻辑 capture
 ```
 
@@ -923,6 +1073,18 @@ if kunserve_comm_backend == "sglang":
     local_ep_size = int(                                # manager payload 显式传 local_ep_size
         kunserve_backend_config.get("local_ep_size") or self.moe_ep_size
     )
+
+    # Phase D：fixed_padded 时从 graph_runner 拿 max_num_token 给 dispatcher。
+    # 其他 capture_policy 仍传 None，dispatcher 走纯 eager 路径。
+    resolved_capture_max_m: Optional[int] = None
+    if str(capture_policy or "auto").lower() == "fixed_padded":
+        gr = getattr(self, "graph_runner", None)
+        if gr is not None:
+            resolved_capture_max_m = int(getattr(gr, "max_num_token", 0) or 0) or None
+        if resolved_capture_max_m is None:
+            _kunserve_ms("[KUNSERVE-MS] capture_policy=fixed_padded requested but "
+                         "graph_runner.max_num_token unavailable; falling back to eager.")
+
     explicit_global_dispatcher = CrossReplicaStandardDispatcher(
         group=runtime_group,                            # 跨 replica GLOBAL process group
         moe_runner_config=global_runner_config,          # num_local_experts 已改成 retained 数
@@ -931,6 +1093,7 @@ if kunserve_comm_backend == "sglang":
         replica_rank=resolved_moe_ep_rank // local_ep_size,
         global_rank=resolved_moe_ep_rank,
         world_size=resolved_ep_size,
+        capture_max_m=resolved_capture_max_m,            # ← Phase D 新增
     )
     explicit_global_runner = MoeRunner(                  # 不用 DeepGEMM，显式使用 Triton core
         MoeRunnerBackend.TRITON,
@@ -941,13 +1104,36 @@ if kunserve_comm_backend == "sglang":
 GLOBAL graph skip：
 
 ```python
-skip_capture = (
-    target_variant == "global"
-    and (
-        envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get() # DeepEP NORMAL dynamic shape 不 capture
-        or str(kunserve_comm_backend or "deepep").lower() == "sglang" # sglang 初版也不 capture
+backend_lower = str(kunserve_comm_backend or "deepep").lower()
+policy_lower = str(capture_policy or "auto").lower()
+if backend_lower == "sglang":
+    skip_capture = (
+        target_variant == "global" and policy_lower != "fixed_padded"
     )
-)
+else:  # deepep
+    skip_capture = (
+        target_variant == "global" and envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
+    )
+```
+
+进 capture 之前的 NCCL communicator 预热（仅 sglang + fixed_padded + not skip_capture）：
+
+```python
+if backend_lower == "sglang" and policy_lower == "fixed_padded":
+    preheat_group = self._resolve_balloon_process_group(process_group_name)
+    if preheat_group is not None:
+        try:
+            preheat_world = int(dist.get_world_size(group=preheat_group))
+            ag_in  = torch.zeros(1, device=cuda)
+            ag_out = torch.zeros(preheat_world, device=cuda)
+            dist.all_gather_into_tensor(ag_out, ag_in, group=preheat_group)
+            ar_buf = torch.zeros(1, device=cuda)
+            dist.all_reduce(ar_buf, op=dist.ReduceOp.SUM, group=preheat_group)
+            torch.cuda.synchronize()
+            _kunserve_ms("[KUNSERVE-MS] NCCL communicator preheat done ...")
+        except Exception as exc:
+            _kunserve_ms("[KUNSERVE-MS] NCCL communicator preheat FAILED: %r", exc)
+self.ensure_cuda_graph_variant_captured(target_variant)
 ```
 
 status 新增：
@@ -960,6 +1146,8 @@ status 新增：
 ### 11.8 `CrossReplicaStandardDispatcher`：完整核心逻辑逐行注释
 
 文件：`python/sglang/srt/layers/moe/token_dispatcher/kunserve_standard.py`
+
+> **更新（Phase D）**：dispatcher 现在是**双路径**结构。下面 11.8.x 注释的是 dynamic eager 路径（原 P0 行为，`capture_policy=disabled`/`auto` 时走）。Phase D 新增的 static fixed_padded 路径见 §6.6 和文件内 `_dispatch_static` / `_combine_static` 方法。构造函数也新增 `capture_max_m: Optional[int] = None` 参数：传入时立即调 `_allocate_static_buffers()` 预分配 11 个持久 buffer 并把 `local_expert_mapping` move 到 cuda。
 
 构造函数：
 

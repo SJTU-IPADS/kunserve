@@ -64,6 +64,13 @@ class KunServeController:
         # successful PG bring-up so downstream RPCs reference the live group.
         self._base_group_name = group_name
         self.group_name = group_name
+        # Phase F lane subgroup names, populated by _ensure_lane_subgroups
+        # after the global group succeeds.  Format:
+        #   {0: "kunserve_lane0_v...", 1: "kunserve_lane1_v..."}
+        # Empty until lane init runs successfully.  Used when building the
+        # warmup_balloon payload so each replica can resolve its lane
+        # process group by name.
+        self.lane_group_names: dict[int, str] = {}
         self.backend = backend
         self.runtime_backend = KunServeRuntimeBackendConfig(
             comm_backend=comm_backend,
@@ -458,7 +465,13 @@ class KunServeController:
             "num_replicas": len(self._replicas),
             "global_world_size": plan.global_world_size,
         }
-        pg_names = {"global": self.group_name}
+        pg_names: dict[str, str] = {"global": self.group_name}
+        # Phase F: when lane subgroups are initialized, surface their
+        # names so the model_runner can pass the right per-lane handle
+        # to CrossReplicaStandardDispatcher.  Empty dict means the
+        # dispatcher falls back to the global group for everything.
+        for lane_idx, lane_name in self.lane_group_names.items():
+            pg_names[f"lane_{int(lane_idx)}"] = lane_name
         payloads: list[dict[str, Any]] = []
         for replica_idx in range(len(self._replicas)):
             payloads.append(
@@ -834,6 +847,28 @@ class KunServeController:
                     self.backend,
                     attempt + 1,
                 )
+                # Phase F: also build lane subgroups for the sglang
+                # backend.  These are NCCL groups of size num_replicas
+                # whose members are [replica0_tp_rank=L, replica1_tp_rank=L]
+                # for each L in 0..local_ep_size-1.  Failure is a warning
+                # (not fatal) because the dispatcher falls back to the
+                # existing global-group path when lane groups are
+                # missing.  Only meaningful for the sglang comm backend;
+                # the DeepEP path does its own dispatch coordination.
+                if self.runtime_backend.comm_backend == "sglang":
+                    try:
+                        await self._ensure_lane_subgroups(
+                            plan=plan,
+                            master_address=master_address,
+                            base_suffix=attempt_group_name,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[KUNSERVE-MS] Phase F lane subgroup init failed: "
+                            "%r -- falling back to global-group dispatch/combine",
+                            exc,
+                        )
+                        self.lane_group_names = {}
                 return
 
             last_errors = attempt_errors
@@ -864,6 +899,121 @@ class KunServeController:
             "init_weights_update_group failed after "
             f"{attempts} attempts: {'; '.join(last_errors)}"
         )
+
+    async def _ensure_lane_subgroups(
+        self,
+        *,
+        plan: KunServeLayoutPlan,
+        master_address: str,
+        base_suffix: str,
+    ) -> None:
+        """Phase F: initialize lane subgroups on top of the global group.
+
+        Each lane L is a 2-replica NCCL group of size ``num_replicas``
+        whose members are the tp_rank=L workers from every replica:
+
+            lane 0 = [replica0.tp_rank=0, replica1.tp_rank=0] = [rank0, rank2]
+            lane 1 = [replica0.tp_rank=1, replica1.tp_rank=1] = [rank1, rank3]
+
+        The HTTP RPC is sent to every TP worker on every replica, but
+        the ``lane_only_tp_rank=L`` argument makes only the matching
+        workers actually rendezvous.  Non-participating workers record a
+        ``None`` sentinel so the dispatcher can detect them.
+
+        On success self.lane_group_names is populated and downstream
+        warmup_balloon payloads carry the names so the model_runner
+        resolves them and passes the right lane handle to the
+        CrossReplicaStandardDispatcher.
+        """
+        local_ep_size = int(plan.local_ep_size)
+        num_replicas = len(self._replicas)
+        if num_replicas != plan.global_world_size // local_ep_size:
+            raise RuntimeError(
+                f"Phase F lane init: world_size mismatch "
+                f"global={plan.global_world_size} local_ep={local_ep_size} "
+                f"num_replicas={num_replicas}"
+            )
+        new_lane_names: dict[int, str] = {}
+        for lane_idx in range(local_ep_size):
+            # Allocate a fresh port per lane.  Pattern mirrors the global
+            # group init: get_free_port may TOCTOU steal the port but
+            # rendezvous on the worker side surfaces the error and we
+            # surface as a non-fatal warning above.
+            try:
+                lane_port, _ = get_free_port(master_address)
+            except OSError:
+                lane_port = random.randint(40000, 60000)
+            lane_group_name = f"kunserve_lane{lane_idx}_{base_suffix}"
+            logger.info(
+                "[KunServeController] init lane subgroup lane=%d: "
+                "master=%s:%d world=%d group=%s backend=%s",
+                lane_idx,
+                master_address,
+                lane_port,
+                num_replicas,
+                lane_group_name,
+                self.backend,
+            )
+            init_results = await asyncio.gather(
+                *[
+                    replica.init_weights_update_group(
+                        {
+                            "master_address": master_address,
+                            "master_port": lane_port,
+                            # rank_offset is unused for lane init because
+                            # explicit_group_rank is set; left as 0 for
+                            # clarity.
+                            "rank_offset": 0,
+                            "world_size": num_replicas,
+                            "group_name": lane_group_name,
+                            "backend": self.backend,
+                            # Only the matching tp_rank actually
+                            # rendezvouses on this lane.
+                            "lane_only_tp_rank": int(lane_idx),
+                            # The participating worker's rank inside the
+                            # 2-rank lane subgroup equals its replica
+                            # index (0 for replica0, 1 for replica1).
+                            "explicit_group_rank": int(replica_idx),
+                        }
+                    )
+                    for replica_idx, replica in enumerate(self._replicas)
+                ],
+                return_exceptions=True,
+            )
+            failures: list[str] = []
+            for idx, result in enumerate(init_results):
+                if isinstance(result, Exception):
+                    failures.append(f"{self._replicas[idx].name}: {result!r}")
+                    continue
+                if not bool(result.get("success")):
+                    failures.append(
+                        f"{self._replicas[idx].name}: "
+                        f"{result.get('message', 'unknown error')}"
+                    )
+            if failures:
+                # Best-effort destroy then bubble up.
+                await asyncio.gather(
+                    *[
+                        replica.destroy_weights_update_group(lane_group_name)
+                        for replica in self._replicas
+                    ],
+                    return_exceptions=True,
+                )
+                raise RuntimeError(
+                    f"lane {lane_idx} subgroup init failed: "
+                    f"{'; '.join(failures)}"
+                )
+            new_lane_names[lane_idx] = lane_group_name
+            logger.warning(
+                "[KUNSERVE-MS] Phase F lane subgroup ready lane=%d group=%s "
+                "world=%d master=%s:%d",
+                lane_idx,
+                lane_group_name,
+                num_replicas,
+                master_address,
+                lane_port,
+            )
+        self.lane_group_names = new_lane_names
 
     async def _destroy_process_group(self, *, force: bool = False) -> None:
         if not self._process_group_initialized and not force:

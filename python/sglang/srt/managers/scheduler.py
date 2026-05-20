@@ -1180,19 +1180,64 @@ class Scheduler(
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
-            if batch is None:
+
+            # Phase E (sglang backend only): negotiate the per-step bs
+            # across the cross-replica runtime_group so all 4 ranks enter
+            # forward with the same ``local_m``.  Without this, the peer
+            # replica's captured GLOBAL graph would replay with a fixed
+            # bs while the idle local rank tries to all_gather an empty
+            # tensor -> NCCL shape mismatch / silent hang.
+            phase_e_force_eager_set = False
+            if self._kunserve_phase_e_active():
+                local_status = self._local_balloon_status_or_stop()
+                if local_status is not None:
+                    local_bs = batch.batch_size if batch is not None else 0
+                    # Negotiate using the *padded* bs the local graph
+                    # would actually replay with, so the agreed value
+                    # matches what each rank's can_run() resolves to.
+                    local_padded = self._padded_capture_bs(local_bs)
+                    negotiated_max_bs, negotiated_min_bs = (
+                        self.negotiate_balloon_step_bs(local_padded)
+                    )
+                    if batch is None and negotiated_max_bs > 0:
+                        # Peer has real work; build a matching keepalive batch.
+                        batch = self._build_balloon_keepalive_batch(
+                            negotiated_max_bs, local_status
+                        )
+                    elif batch is None and negotiated_max_bs == 0:
+                        # All replicas idle -> stop keepalive, skip this step.
+                        self._stop_balloon_keepalive("all replicas idle")
+                    # Symmetric force-eager decision: every rank
+                    # observed the same (max, min) so we all agree.
+                    self._phase_e_apply_step_decision(
+                        negotiated_max_bs=negotiated_max_bs,
+                        negotiated_min_bs=negotiated_min_bs,
+                    )
+                    phase_e_force_eager_set = True
+            elif batch is None:
+                # Non-sglang backends (DeepEP NORMAL): keep the legacy
+                # local-only keepalive behavior.
                 batch = self._maybe_get_balloon_keepalive_batch()
             else:
                 self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
 
-            # Launch the current batch
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-            else:
-                # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+            # Launch the current batch.  The Phase E per-step
+            # force-eager flag is set above; it must be cleared even
+            # if run_batch raises so the next iteration starts from a
+            # known state.
+            try:
+                if batch:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+                else:
+                    # When the server is idle, do self-check and re-init some states
+                    self.self_check_during_idle()
+            finally:
+                if phase_e_force_eager_set:
+                    mr = getattr(self.tp_worker, "model_runner", None)
+                    if mr is not None:
+                        mr.set_balloon_step_force_eager(False)
 
             # Update last_batch
             self.last_batch = batch
@@ -1220,34 +1265,107 @@ class Scheduler(
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
+
+            # Phase E (sglang backend only): negotiate per-step bs with
+            # peer replicas BEFORE deciding overlap & launching.  See the
+            # non-overlap loop above for the rationale.  We do the sync
+            # here even when ``batch is not None`` so the active replica
+            # advertises its bs to peers, which lets an idle peer build a
+            # matching keepalive on the same step.
+            phase_e_negotiated_max: Optional[int] = None
+            phase_e_negotiated_min: Optional[int] = None
+            phase_e_status: Optional[Dict[str, Any]] = None
+            if self._kunserve_phase_e_active():
+                phase_e_status = self._local_balloon_status_or_stop()
+                if phase_e_status is not None:
+                    local_bs = batch.batch_size if batch is not None else 0
+                    local_padded = self._padded_capture_bs(local_bs)
+                    phase_e_negotiated_max, phase_e_negotiated_min = (
+                        self.negotiate_balloon_step_bs(local_padded)
+                    )
+
             if batch is not None:
                 self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            # Phase E force-eager decision for the current batch (if any).
+            # Done after we know the launched bs; will be applied before
+            # run_batch and cleared right after.  The (max, min) pair is
+            # symmetric across ranks so every rank reaches the same
+            # decision.
+            phase_e_force_eager_set = False
+            if (
+                phase_e_negotiated_max is not None
+                and phase_e_negotiated_min is not None
+                and batch is not None
+            ):
+                self._phase_e_apply_step_decision(
+                    negotiated_max_bs=int(phase_e_negotiated_max),
+                    negotiated_min_bs=int(phase_e_negotiated_min),
+                )
+                phase_e_force_eager_set = True
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
 
-            # Launch the current batch
-            if batch:
-                batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
+            # Launch the current batch (try/finally so the per-step
+            # force-eager flag is always cleared even on exception).
+            try:
+                if batch:
+                    batch_result = self.run_batch(batch)
+                    self.result_queue.append((batch.copy(), batch_result))
+                else:
+                    batch_result = None
+            finally:
+                if phase_e_force_eager_set:
+                    mr = getattr(self.tp_worker, "model_runner", None)
+                    if mr is not None:
+                        mr.set_balloon_step_force_eager(False)
+                    phase_e_force_eager_set = False
 
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
-                keepalive_batch = self._maybe_get_balloon_keepalive_batch()
+                if phase_e_negotiated_max is not None:
+                    # Phase E branch: only enter keepalive if peer is busy.
+                    if phase_e_negotiated_max > 0 and phase_e_status is not None:
+                        keepalive_batch = self._build_balloon_keepalive_batch(
+                            int(phase_e_negotiated_max), phase_e_status
+                        )
+                    else:
+                        self._stop_balloon_keepalive("all replicas idle")
+                        keepalive_batch = None
+                else:
+                    keepalive_batch = self._maybe_get_balloon_keepalive_batch()
+
                 if keepalive_batch is not None:
                     batch = keepalive_batch
                     self.cur_batch = batch
-                    batch_result = self.run_batch(batch)
-                    self.result_queue.append((batch.copy(), batch_result))
+                    # Phase E force-eager decision for the keepalive
+                    # case (now that batch has its final bs).  Then
+                    # run_batch with try/finally cleanup.
+                    if (
+                        phase_e_negotiated_max is not None
+                        and phase_e_negotiated_min is not None
+                    ):
+                        self._phase_e_apply_step_decision(
+                            negotiated_max_bs=int(phase_e_negotiated_max),
+                            negotiated_min_bs=int(phase_e_negotiated_min),
+                        )
+                        phase_e_force_eager_set = True
+                    try:
+                        batch_result = self.run_batch(batch)
+                        self.result_queue.append((batch.copy(), batch_result))
+                    finally:
+                        if phase_e_force_eager_set:
+                            mr2 = getattr(self.tp_worker, "model_runner", None)
+                            if mr2 is not None:
+                                mr2.set_balloon_step_force_eager(False)
                 else:
                     # When the server is idle, do self-check and re-init some states
                     self.self_check_during_idle()
@@ -2949,7 +3067,88 @@ class Scheduler(
             )
             self._balloon_keepalive_active = False
 
-    def _maybe_get_balloon_keepalive_batch(self) -> Optional[ScheduleBatch]:
+    def _kunserve_phase_e_active(self) -> bool:
+        """Whether Phase E cross-replica bs sync should run this step.
+
+        Only the sglang backend's static-buffer dispatcher requires per
+        step lockstep with the peer replica (because its captured graph
+        embeds a specific bs into all_gather_into_tensor / all_reduce).
+        DeepEP backends manage their own per-step coordination via
+        DeepEPMode.NORMAL's buffer setup and do not need this sync.
+        """
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return False
+        if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
+            return False
+        backend = str(
+            getattr(model_runner, "_balloon_kunserve_comm_backend", "deepep") or ""
+        ).lower()
+        if backend != "sglang":
+            return False
+        # Skip the sync until a runtime_group has actually been resolved.
+        return getattr(model_runner, "_balloon_process_group_name", None) is not None
+
+    def _padded_capture_bs(self, local_bs: int) -> int:
+        """Mirror cuda_graph_runner.can_run's bisect-up rule.
+
+        Returns the bs that the captured graph would actually replay
+        with, or ``local_bs`` if no graph would be selected.  Phase E
+        feeds this into the cross-replica negotiation so the agreed
+        value matches the real per-rank graph that would fire.
+        """
+        if local_bs <= 0:
+            return 0
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        graph_runner = getattr(model_runner, "graph_runner", None) if model_runner else None
+        if graph_runner is None:
+            return int(local_bs)
+        capture_bs = getattr(graph_runner, "capture_bs", None) or []
+        if not capture_bs:
+            return int(local_bs)
+        import bisect
+
+        idx = bisect.bisect_left(capture_bs, int(local_bs))
+        if idx >= len(capture_bs):
+            # Too large for any captured graph -> would go eager anyway.
+            return int(local_bs)
+        return int(capture_bs[idx])
+
+    def _phase_e_apply_step_decision(
+        self,
+        *,
+        negotiated_max_bs: int,
+        negotiated_min_bs: int,
+    ) -> None:
+        """Set ``_balloon_step_force_eager`` based on the negotiation.
+
+        Symmetric rule (every rank sees the same ``(max, min)`` and
+        reaches the same decision):
+
+        * ``min_bs == 0 and max_bs > 0`` -- idle/busy split.  Idle
+          replicas have already been told to build a keepalive batch
+          of size ``max_bs``, so post-build every rank's effective bs
+          equals ``max_bs``.  No force_eager needed.
+        * ``min_bs > 0 and min_bs != max_bs`` -- busy/busy with
+          mismatched padded bs.  Each rank's captured graph would
+          carry a different NCCL shape; we MUST force eager.
+        * ``min_bs == max_bs`` -- uniform, graph replay safe.
+
+        Compactly: ``force_eager = (0 < min_bs < max_bs)``.
+        """
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return
+        force_eager = (
+            int(negotiated_min_bs) > 0
+            and int(negotiated_min_bs) != int(negotiated_max_bs)
+        )
+        try:
+            model_runner.set_balloon_step_force_eager(force_eager)
+        except Exception:
+            pass
+
+    def _local_balloon_status_or_stop(self) -> Optional[Dict[str, Any]]:
         try:
             local_status = self.tp_worker.get_balloon_status(GetBalloonStatusReqInput())
         except Exception:
@@ -2958,53 +3157,115 @@ class Scheduler(
                 "[KunServeScheduler] failed to query balloon status before keepalive"
             )
             return None
-
         if str(local_status.get("state")) != "balloon":
             self._stop_balloon_keepalive("runtime is not balloon")
             return None
+        return local_status
 
+    def negotiate_balloon_step_bs(self, local_bs: int) -> Tuple[int, int]:
+        """Phase E entry point in the scheduler.
+
+        Returns ``(max_bs, min_bs)`` across the cross-replica runtime
+        group.  Callers use:
+
+        * ``max_bs`` as the negotiated batch size (idle replicas pad
+          their keepalive batch to this size).
+        * ``min_bs`` (with ``max_bs``) to derive the symmetric
+          force-eager decision: every rank that observes
+          ``0 < min_bs < max_bs`` must skip graph replay this step,
+          because the captured (variant, bs) graphs across ranks would
+          carry mismatched NCCL collective shapes otherwise.
+        """
+        max_bs, min_bs = self.tp_worker.model_runner.negotiate_balloon_step_bs(
+            int(local_bs)
+        )
+        return int(max_bs), int(min_bs)
+
+    def _build_balloon_keepalive_batch(
+        self, target_bs: int, local_status: Dict[str, Any]
+    ) -> ScheduleBatch:
+        """Phase E: build an IDLE batch shaped to a peer-negotiated bs.
+
+        ``target_bs == 0`` is the historical empty-batch behavior (used by
+        DeepEP backend and by transient DeepEP path-corruption mitigation
+        before Phase D).  ``target_bs > 0`` is the Phase E flow: the
+        keepalive batch carries that many dummy decode tokens so the
+        cross-replica all_gather_into_tensor / all_reduce inside the
+        captured GLOBAL graph see the matching ``local_m`` on every rank.
+
+        The dummy tokens' ``out_cache_loc`` is redirected to the
+        keepalive KV scratch slot reserved by
+        ``ModelRunner.commit_balloon`` so the captured graph's KV
+        write cannot collide with real-request slot 0.  See Phase E
+        BUG #2 in the kunserve docs.
+        """
         self.balloon_keepalive_step_ct += 1
         if not self._balloon_keepalive_active:
             logger.warning(
-                "[KunServeScheduler] start balloon keepalive: variant=%s offloaded=%s added_slots=%s",
+                "[KunServeScheduler] start balloon keepalive: variant=%s "
+                "offloaded=%s added_slots=%s target_bs=%d",
                 local_status.get("runtime_variant"),
                 local_status.get("offloaded_local_experts"),
                 local_status.get("added_kv_slots"),
+                int(target_bs),
             )
             self._balloon_keepalive_active = True
         elif self.balloon_keepalive_step_ct % 128 == 0:
             logger.info(
-                "[KunServeScheduler] balloon keepalive progress: steps=%d variant=%s",
+                "[KunServeScheduler] balloon keepalive progress: steps=%d "
+                "variant=%s target_bs=%d",
                 self.balloon_keepalive_step_ct,
                 local_status.get("runtime_variant"),
+                int(target_bs),
             )
 
-        keepalive_batch = self.get_idle_batch()
-        # Force attn_tp_size dummy tokens so model_runner.forward calls
-        # prepare_mlp_sync_batch and pads input_ids to attn_tp_size
-        # (tensor_split then yields [1, 1] on TP=2 instead of [1, 0]).
-        # Without this the keepalive idle batch ships input_ids=empty(0)
-        # while the peer replica's GLOBAL EP dispatch routes 1 real token
-        # into our experts; DeepEP combine returns rank0=[1] rank1=[0]
-        # but residual stays at [0] (prepare_attn line 426 sets
-        # residual=hidden_states when shape[0]==0). The next layer's
-        # _scatter_hidden_states_and_residual then crashes:
-        #   CHECK_EQ(input.size(0), residual.size(0)) failed. 1 vs 0.
-        # We bypass maybe_prepare_mlp_sync_batch's all_gather here because
-        # both TP ranks of this replica enter this branch in lockstep and
-        # set the same constants (their num_tokens already match without
-        # extra sync), and the all_gather path would overwrite our
-        # global_num_tokens with [0] for IDLE batches (scheduler_dp_attn_
-        # mixin.py:148 falls into extend_num_tokens=0 for IDLE).
-        # Repro: ab_20260507_113241 R1 crash at 12:47:16.
+        # Pull the keepalive KV scratch slot from model_runner.  None
+        # means commit_balloon didn't reserve one (legacy DeepEP path,
+        # or alloc failed); prepare_for_idle will then fall back to
+        # slot 0 with a warning printed earlier.
+        dummy_kv_slot: Optional[int] = None
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is not None and int(target_bs) > 0:
+            dummy_kv_slot = getattr(
+                model_runner, "_kunserve_keepalive_dummy_kv_slot", None
+            )
+
+        keepalive_batch = self.get_idle_batch(
+            target_bs=int(max(target_bs, 0)),
+            dummy_kv_slot=dummy_kv_slot,
+        )
+        # Same shape-fixup as before: force attn_tp_size dummy tokens for
+        # mlp_sync paths so the DP-attention scatter doesn't see [0,0]
+        # for an IDLE batch.  When target_bs > 0 the batch already has
+        # the right shape from prepare_for_idle(), but the DP-sync count
+        # fields still need to reflect that.  See the original repro
+        # ab_20260507_113241 R1 crash for details.
         if self.require_mlp_sync:
             attn_tp_size = max(self.attn_tp_size, 1)
-            keepalive_batch.global_num_tokens = [attn_tp_size]
-            keepalive_batch.global_num_tokens_for_logprob = [attn_tp_size]
+            effective = (
+                int(target_bs) if target_bs > 0 else attn_tp_size
+            )
+            keepalive_batch.global_num_tokens = [effective]
+            keepalive_batch.global_num_tokens_for_logprob = [effective]
             keepalive_batch.is_extend_in_batch = False
             keepalive_batch.global_forward_mode = ForwardMode.IDLE
             keepalive_batch.can_run_dp_cuda_graph = False
         return keepalive_batch
+
+    def _maybe_get_balloon_keepalive_batch(
+        self, *, target_bs: int = 0
+    ) -> Optional[ScheduleBatch]:
+        """Legacy entry point preserved for DeepEP backend.
+
+        For the sglang Phase D + Phase E flow callers should use
+        ``negotiate_balloon_step_bs`` + ``_build_balloon_keepalive_batch``
+        explicitly so the cross-replica sync happens once per step rather
+        than only on the idle branch.
+        """
+        local_status = self._local_balloon_status_or_stop()
+        if local_status is None:
+            return None
+        return self._build_balloon_keepalive_batch(int(target_bs), local_status)
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
@@ -3078,6 +3339,19 @@ class Scheduler(
                 "scheduler_max_total_num_tokens": int(self.max_total_num_tokens),
                 "balloon_keepalive_steps": int(self.balloon_keepalive_step_ct),
                 "balloon_keepalive_active": bool(self._balloon_keepalive_active),
+                # Phase E telemetry.  Useful for verifying lockstep
+                # behavior in failure investigations: if
+                # ``phase_e_force_eager_step`` flips True frequently the
+                # workload is busy/busy with mismatched padded bs and
+                # graph replay is not paying off.
+                "phase_e_active": bool(self._kunserve_phase_e_active()),
+                "phase_e_force_eager_step": bool(
+                    getattr(
+                        getattr(self.tp_worker, "model_runner", None),
+                        "_balloon_step_force_eager",
+                        False,
+                    )
+                ),
             }
         )
         return GetBalloonStatusReqOutput(status=status)

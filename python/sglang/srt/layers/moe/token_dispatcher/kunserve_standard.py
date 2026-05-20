@@ -65,6 +65,8 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         global_rank: Optional[int] = None,
         world_size: Optional[int] = None,
         capture_max_m: Optional[int] = None,
+        lane_group: Optional[dist.ProcessGroup] = None,
+        local_tp_group: Optional[dist.ProcessGroup] = None,
     ) -> None:
         super().__init__()
         if group is None:
@@ -98,6 +100,22 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             else self.global_rank // self.local_ep_size
         )
         self.lane_rank = self.global_rank % self.local_ep_size
+
+        # Phase F: optional lane subgroup (cross-replica 2-rank group
+        # containing only the workers in this lane) and the local TP
+        # group (intra-replica 2-rank group).  When both are available
+        # dispatch uses lane_group.all_gather_into_tensor to avoid the
+        # ``[A, A, B, B]`` redundancy of the global group, and combine
+        # uses lane_group.reduce_scatter_tensor + local_tp_group.all_reduce
+        # instead of a global all_reduce so each rank only receives the
+        # union slice it actually needs.  When either is None the
+        # dispatcher transparently falls back to the Phase D path on
+        # the global runtime_group.
+        self.lane_group = lane_group
+        self.local_tp_group = local_tp_group
+        self.phase_f_enabled = (
+            lane_group is not None and local_tp_group is not None
+        )
 
         self.num_experts = int(moe_runner_config.num_experts)
         self.top_k = int(moe_runner_config.top_k)
@@ -178,6 +196,11 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         default caching allocator pool, not inside any cuda graph private
         pool.  Reused across every (variant, batch_size) capture and across
         replays.
+
+        Phase F shrinks the all-gather receive buffer from ``world * M``
+        rows to ``num_replicas * M`` rows because the lane subgroup is
+        used instead of the global group.  In that case the lane-select
+        step becomes a no-op and union buffers alias the gather buffers.
         """
         if self._static_buffers_ready:
             return
@@ -199,6 +222,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         weight_dtype = torch.float32
         id_dtype = torch.int32
 
+        # Per-rank source buffers (input to all_gather_into_tensor).
         self._buf_padded_hidden = torch.zeros(
             (M, H), dtype=hidden_dtype, device=device
         )
@@ -209,27 +233,42 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             (M, K), dtype=weight_dtype, device=device
         )
 
+        # Gather destination shape depends on which group we all_gather on.
+        gather_world = NR if self.phase_f_enabled else W
         self._buf_gathered_hidden = torch.zeros(
-            (W * M, H), dtype=hidden_dtype, device=device
+            (gather_world * M, H), dtype=hidden_dtype, device=device
         )
         self._buf_gathered_topk_ids = torch.full(
-            (W * M, K), -1, dtype=id_dtype, device=device
+            (gather_world * M, K), -1, dtype=id_dtype, device=device
         )
         self._buf_gathered_topk_weights = torch.zeros(
-            (W * M, K), dtype=weight_dtype, device=device
+            (gather_world * M, K), dtype=weight_dtype, device=device
         )
 
-        self._buf_union_hidden = torch.zeros(
-            (NR * M, H), dtype=hidden_dtype, device=device
-        )
-        self._buf_union_topk_ids = torch.full(
-            (NR * M, K), -1, dtype=id_dtype, device=device
-        )
-        self._buf_union_topk_weights = torch.zeros(
-            (NR * M, K), dtype=weight_dtype, device=device
-        )
+        if self.phase_f_enabled:
+            # gather output IS already the union; alias the union buffers
+            # to the gather buffers so the lane-select copies become
+            # no-ops and the graph records fewer ops.
+            self._buf_union_hidden = self._buf_gathered_hidden
+            self._buf_union_topk_ids = self._buf_gathered_topk_ids
+            self._buf_union_topk_weights = self._buf_gathered_topk_weights
+        else:
+            self._buf_union_hidden = torch.zeros(
+                (NR * M, H), dtype=hidden_dtype, device=device
+            )
+            self._buf_union_topk_ids = torch.full(
+                (NR * M, K), -1, dtype=id_dtype, device=device
+            )
+            self._buf_union_topk_weights = torch.zeros(
+                (NR * M, K), dtype=weight_dtype, device=device
+            )
         self._buf_union_topk_ids_remapped = torch.full(
             (NR * M, K), -1, dtype=id_dtype, device=device
+        )
+        # Phase F combine scratch: receives the per-replica slice after
+        # lane reduce_scatter.  Sized [M, H], one slice.
+        self._buf_combine_local_slice = torch.zeros(
+            (M, H), dtype=hidden_dtype, device=device
         )
 
         self._neg_one_int32 = torch.full((), -1, dtype=id_dtype, device=device)
@@ -242,7 +281,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         logger.info(
             "[KUNSERVE-MS] CrossReplicaStandardDispatcher static buffers ready: "
             "capture_max_m=%d hidden=%d top_k=%d world=%d num_replicas=%d "
-            "rank=%d lane=%d replica=%d hidden_dtype=%s",
+            "rank=%d lane=%d replica=%d hidden_dtype=%s phase_f=%s",
             M,
             H,
             K,
@@ -252,6 +291,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             self.lane_rank,
             self.replica_rank,
             hidden_dtype,
+            self.phase_f_enabled,
         )
 
     # ------------------------------------------------------------------
@@ -277,25 +317,44 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
     # ------------------------------------------------------------------
 
     def _all_gather_sizes(self, local_m: int, device: torch.device) -> torch.Tensor:
+        """All-gather sizes across the appropriate group for the eager path.
+
+        Phase F uses the lane subgroup (size num_replicas) since the
+        eager dispatch's all-gather also runs on the lane.  Phase D
+        fallback uses the full global group and validates the TP
+        within-replica invariant.
+        """
         local_size = torch.tensor([int(local_m)], dtype=torch.int64, device=device)
-        gathered = [torch.empty_like(local_size) for _ in range(self.world_size)]
-        dist.all_gather(gathered, local_size, group=self.group)
+        if self.phase_f_enabled:
+            ws = int(self.num_replicas)
+            gather_group = self.lane_group
+        else:
+            ws = int(self.world_size)
+            gather_group = self.group
+        gathered = [torch.empty_like(local_size) for _ in range(ws)]
+        dist.all_gather(gathered, local_size, group=gather_group)
         sizes = torch.cat(gathered, dim=0)
 
-        # In SGLang's TP/EP=local_ep_size baseline, ranks in the same replica
-        # carry the same token batch.  The cross-replica Standard-like
-        # algorithm relies on that invariant because lane 0 and lane 1 produce
-        # partial sums for the same union-token order before all-reduce.
-        sizes_cpu = sizes.detach().cpu().tolist()
-        for replica_idx in range(self.num_replicas):
-            base = replica_idx * self.local_ep_size
-            replica_sizes = sizes_cpu[base : base + self.local_ep_size]
-            if len(set(replica_sizes)) != 1:
-                raise RuntimeError(
-                    "CrossReplicaStandardDispatcher requires all local EP ranks "
-                    "inside a replica to see the same token count. "
-                    f"replica={replica_idx} sizes={replica_sizes} all_sizes={sizes_cpu}"
-                )
+        if not self.phase_f_enabled:
+            # In SGLang's TP/EP=local_ep_size baseline, ranks in the same
+            # replica carry the same token batch.  The cross-replica
+            # Standard-like algorithm relies on that invariant because
+            # lane 0 and lane 1 produce partial sums for the same union-
+            # token order before all-reduce.  In Phase F mode we don't
+            # see the within-replica peer in this group, so the
+            # invariant is checked implicitly by the lane subgroup itself
+            # plus the Phase E scheduler-level bs negotiation.
+            sizes_cpu = sizes.detach().cpu().tolist()
+            for replica_idx in range(self.num_replicas):
+                base = replica_idx * self.local_ep_size
+                replica_sizes = sizes_cpu[base : base + self.local_ep_size]
+                if len(set(replica_sizes)) != 1:
+                    raise RuntimeError(
+                        "CrossReplicaStandardDispatcher requires all local EP "
+                        "ranks inside a replica to see the same token count. "
+                        f"replica={replica_idx} sizes={replica_sizes} "
+                        f"all_sizes={sizes_cpu}"
+                    )
         return sizes
 
     def _pad_dim0(
@@ -319,11 +378,22 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         return out
 
     def _all_gather_padded(self, tensor: torch.Tensor) -> list[torch.Tensor]:
-        gathered = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered, tensor.contiguous(), group=self.group)
+        if self.phase_f_enabled:
+            ws = int(self.num_replicas)
+            gather_group = self.lane_group
+        else:
+            ws = int(self.world_size)
+            gather_group = self.group
+        gathered = [torch.empty_like(tensor) for _ in range(ws)]
+        dist.all_gather(gathered, tensor.contiguous(), group=gather_group)
         return gathered
 
     def _select_lane_segments(self, gathered: list[torch.Tensor]) -> torch.Tensor:
+        if self.phase_f_enabled:
+            # Phase F: the lane subgroup already returned only the
+            # ``num_replicas`` segments we need, in replica-index order.
+            # Just concat.
+            return torch.cat(list(gathered), dim=0).contiguous()
         segments = [
             gathered[replica_idx * self.local_ep_size + self.lane_rank]
             for replica_idx in range(self.num_replicas)
@@ -381,7 +451,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             logger.warning(
                 "[KUNSERVE-MS] CrossReplicaStandardDispatcher active (dynamic): "
                 "rank=%d world=%d local_ep=%d replica=%d lane=%d "
-                "local_m=%d max_m=%d union_m=%d capture_max_m=%s",
+                "local_m=%d max_m=%d union_m=%d capture_max_m=%s phase_f=%s",
                 self.global_rank,
                 self.world_size,
                 self.local_ep_size,
@@ -391,6 +461,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 max_m,
                 int(union_hidden.shape[0]),
                 self._capture_max_m,
+                self.phase_f_enabled,
             )
             self._logged_shape = True
 
@@ -407,8 +478,36 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
     def _combine_dynamic(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         hidden_states = hidden_states.contiguous()
-        dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=self.group)
 
+        if self.phase_f_enabled:
+            # Phase F: lane reduce_scatter + intra-TP all_reduce.
+            # Input ``[NR*max_m, H]`` is reduced over the lane subgroup
+            # and scattered by replica chunk so each lane member only
+            # keeps its replica's [max_m, H] slice; then the local TP
+            # group combines lane0/lane1's slices to produce the final
+            # [max_m, H] result on every rank in this replica.
+            max_m = int(self._last_max_m)
+            H = hidden_states.shape[1]
+            local_slice = torch.empty(
+                (max_m, H),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            dist.reduce_scatter_tensor(
+                local_slice,
+                hidden_states,
+                op=dist.ReduceOp.SUM,
+                group=self.lane_group,
+            )
+            dist.all_reduce(
+                local_slice,
+                op=dist.ReduceOp.SUM,
+                group=self.local_tp_group,
+            )
+            return local_slice[: int(self._last_local_m)].contiguous()
+
+        # Phase D fallback: global all_reduce on the union, then slice.
+        dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=self.group)
         start = int(self._last_slice_start)
         end = start + int(self._last_local_m)
         return hidden_states[start:end].contiguous()
@@ -445,38 +544,53 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             topk_weights.to(self._buf_padded_topk_weights.dtype)
         )
 
-        # 2) Cross-replica all-gather into pre-allocated contiguous buffers.
+        # 2) Cross-replica all-gather.
+        #
+        # Phase F: gather across the LANE subgroup (size num_replicas).
+        #          The receive buffer ends up as ``[A_pad, B_pad]`` --
+        #          already the union; no lane select needed.
+        #
+        # Phase D fallback: gather across the global group (size world).
+        #          The receive buffer is ``[A,A,B,B]`` and we copy out
+        #          the lane segments below.
+        if self.phase_f_enabled:
+            gather_group = self.lane_group
+        else:
+            gather_group = self.group
         dist.all_gather_into_tensor(
             self._buf_gathered_hidden,
             self._buf_padded_hidden,
-            group=self.group,
+            group=gather_group,
         )
         dist.all_gather_into_tensor(
             self._buf_gathered_topk_ids,
             self._buf_padded_topk_ids,
-            group=self.group,
+            group=gather_group,
         )
         dist.all_gather_into_tensor(
             self._buf_gathered_topk_weights,
             self._buf_padded_topk_weights,
-            group=self.group,
+            group=gather_group,
         )
 
-        # 3) Lane select with static slice copies.  num_replicas is a
-        #    Python int known at capture time, so this loop unrolls cleanly
-        #    into a small number of recorded copies.
-        for replica_idx in range(self.num_replicas):
-            src_base = (replica_idx * self.local_ep_size + self.lane_rank) * M
-            dst_base = replica_idx * M
-            self._buf_union_hidden[dst_base : dst_base + M].copy_(
-                self._buf_gathered_hidden[src_base : src_base + M]
-            )
-            self._buf_union_topk_ids[dst_base : dst_base + M].copy_(
-                self._buf_gathered_topk_ids[src_base : src_base + M]
-            )
-            self._buf_union_topk_weights[dst_base : dst_base + M].copy_(
-                self._buf_gathered_topk_weights[src_base : src_base + M]
-            )
+        # 3) Lane select.  Skipped in Phase F because the lane-subgroup
+        #    gather already produced the union directly into
+        #    _buf_union_* (aliased to _buf_gathered_*).
+        if not self.phase_f_enabled:
+            for replica_idx in range(self.num_replicas):
+                src_base = (
+                    replica_idx * self.local_ep_size + self.lane_rank
+                ) * M
+                dst_base = replica_idx * M
+                self._buf_union_hidden[dst_base : dst_base + M].copy_(
+                    self._buf_gathered_hidden[src_base : src_base + M]
+                )
+                self._buf_union_topk_ids[dst_base : dst_base + M].copy_(
+                    self._buf_gathered_topk_ids[src_base : src_base + M]
+                )
+                self._buf_union_topk_weights[dst_base : dst_base + M].copy_(
+                    self._buf_gathered_topk_weights[src_base : src_base + M]
+                )
 
         # 4) Branch-free expert id remap.  Out-of-range or negative ids
         #    become -1; valid ids index into the local expert mapping.
@@ -515,10 +629,46 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
 
     def _combine_static(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
-        # Each (variant, bs) graph allocates its own partial-output tensor
-        # in the graph private pool, so all_reduce-in-place targets a
-        # stable address per graph.
         hidden_states = hidden_states.contiguous()
+
+        if self.phase_f_enabled:
+            # Phase F combine: two-stage reduction.
+            #
+            # Input shape: [NR*M, H] -- partial expert sum from this rank's
+            # local_experts over the whole union batch.
+            #
+            # Stage 1: reduce_scatter on the lane subgroup.  Splits the
+            # [NR*M, H] partial by replica chunk, sums lane-internal
+            # contributions, and lands each lane member with its own
+            # replica's slice [M, H] (lane0's contribution to A on
+            # this lane's rank for replica0, etc).
+            #
+            # Stage 2: all_reduce on the local TP group, which contains
+            # both lanes within this replica.  Combines lane0's slice
+            # with lane1's slice to produce the full MoE output [M, H]
+            # for this replica's tokens, on every rank in this replica.
+            #
+            # Total combine traffic ~ M*H (stage 1) + 1.5*M*H (stage 2)
+            # = 2.5*M*H per rank vs 3*M*H for the Phase D global
+            # all_reduce on [NR*M, H].  About 17% combine saving in
+            # the 2-replica case; bigger gains at larger world size.
+            M = int(self._capture_max_m)
+            local_slice = self._buf_combine_local_slice  # [M, H]
+            dist.reduce_scatter_tensor(
+                local_slice,
+                hidden_states,
+                op=dist.ReduceOp.SUM,
+                group=self.lane_group,
+            )
+            dist.all_reduce(
+                local_slice, op=dist.ReduceOp.SUM, group=self.local_tp_group
+            )
+            return local_slice[: int(self._last_local_m)].contiguous()
+
+        # Phase D fallback: global all_reduce + slice.  Each (variant,
+        # bs) graph allocates its own partial-output tensor in the
+        # graph private pool, so all_reduce-in-place targets a stable
+        # address per graph.
         dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=self.group)
 
         start = self.replica_rank * self._capture_max_m

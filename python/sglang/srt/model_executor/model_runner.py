@@ -698,6 +698,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_runtime_variant = "local"
         self._balloon_prepared_variant = None
         self._balloon_graph_replay_enabled = True
+        # Phase E per-step override: scheduler flips this on when the
+        # cross-replica bs negotiation detects an asymmetric busy/busy
+        # step that would otherwise replay graphs with mismatched NCCL
+        # collective shapes.  Read by is_cuda_graph_replay_enabled().
+        self._balloon_step_force_eager: bool = False
+        # Phase E keepalive KV scratch slot.  Allocated once at
+        # commit_balloon time so the keepalive batch's out_cache_loc
+        # points at a dedicated dummy slot instead of slot 0.  Without
+        # this, captured DECODE graph replay (forward_mode=IDLE still
+        # matches is_cuda_graph() and triggers graph replay) would
+        # call set_kv_buffer at out_cache_loc=0 and clobber whichever
+        # real request currently owns slot 0.  Storing the alloc
+        # tensor (not just the int) lets us free it cleanly on a
+        # future restore.
+        self._kunserve_keepalive_dummy_kv_slot_tensor: Optional[torch.Tensor] = None
+        self._kunserve_keepalive_dummy_kv_slot: Optional[int] = None
         self._balloon_local_expert_location_metadata = local_metadata
         self._balloon_global_expert_location_metadata = None
         self._balloon_prepared_active_mappings: Dict[int, torch.Tensor] = {}
@@ -838,6 +854,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return variant_value
 
     def _resolve_balloon_process_group(self, process_group_name: Optional[str]):
+        """Look up an initialized PG by name.
+
+        Returns ``None`` for both the "not set" case and the Phase F
+        "this TP rank did not participate" case (the latter stores
+        ``None`` under the name as a sentinel — see
+        ``init_weights_update_group`` with ``lane_only_tp_rank``).
+        """
         if process_group_name is None:
             return None
         if process_group_name in self._model_update_group:
@@ -847,6 +870,72 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         raise ValueError(
             f"Process group '{process_group_name}' is not initialized on this rank."
         )
+
+    def negotiate_balloon_step_bs(self, local_bs: int) -> Tuple[int, int]:
+        """Phase E: cross-replica per-step batch-size negotiation.
+
+        Every rank in the cross-replica runtime_group must call this in
+        lockstep at the same scheduler step.  Returns
+        ``(max_bs, min_bs)`` of the gathered ``local_bs`` values --
+        callers use the pair to derive:
+
+        * ``negotiated_bs = max_bs`` -- the size every idle replica
+          should pad its keepalive batch to so the captured GLOBAL
+          graph can replay in lockstep on all 4 ranks.
+        * ``lockstep_safe = (min_bs == 0) or (min_bs == max_bs)`` -- if
+          False the world is split into busy-but-different-bs and graph
+          replay would mismatch across ranks; the scheduler must force
+          eager forward on this step.  Returning a pair (instead of
+          just ``max``) is what makes the decision symmetric: every
+          rank sees the same ``(max, min)`` tuple and reaches the same
+          force-eager conclusion.
+
+        Idle replicas pass ``local_bs=0``; if ``max_bs > 0`` they must
+        build a keepalive batch of that size.
+
+        Returns ``(local_bs, local_bs)`` (i.e. skips the collective)
+        when:
+
+        - balloon state is not ``balloon`` (LOCAL forward needs no sync),
+        - the runtime_group has not been resolved on this rank yet,
+        - or the kunserve backend is something that does its own per-step
+          sync (DeepEP path - keepalive there is handled by the existing
+          DeepEP normal mode buffer setup).
+        """
+        if str(self._balloon_state) != "balloon":
+            return int(local_bs), int(local_bs)
+        if str(self._balloon_kunserve_comm_backend or "").lower() != "sglang":
+            return int(local_bs), int(local_bs)
+        try:
+            runtime_group = self._resolve_balloon_process_group(
+                self._balloon_process_group_name
+            )
+        except Exception:
+            return int(local_bs), int(local_bs)
+        if runtime_group is None:
+            return int(local_bs), int(local_bs)
+        try:
+            device = torch.device("cuda", torch.cuda.current_device())
+            local_t = torch.tensor(
+                [int(local_bs)], dtype=torch.int32, device=device
+            )
+            world = int(dist.get_world_size(group=runtime_group))
+            all_t = torch.empty(world, dtype=torch.int32, device=device)
+            dist.all_gather_into_tensor(all_t, local_t, group=runtime_group)
+            # Pull both max and min in one device->host sync so every
+            # rank reaches the same force-eager decision below.
+            return int(all_t.max().item()), int(all_t.min().item())
+        except Exception as exc:
+            # If the collective fails (e.g. group destroyed mid-shutdown),
+            # fall back to the local bs.  The dispatcher's dynamic eager
+            # path can still handle whatever shape arrives.
+            _kunserve_ms(
+                "[KUNSERVE-MS] negotiate_balloon_step_bs failed: %r (local_bs=%d) "
+                "-- falling back to local-only sizing",
+                exc,
+                int(local_bs),
+            )
+            return int(local_bs), int(local_bs)
 
     def _default_balloon_physical_to_logical_map(self):
         metadata = (
@@ -961,7 +1050,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return self._normalize_balloon_variant(self._balloon_runtime_variant)
 
     def is_cuda_graph_replay_enabled(self) -> bool:
+        if getattr(self, "_balloon_step_force_eager", False):
+            return False
         return bool(self._balloon_graph_replay_enabled)
+
+    def set_balloon_step_force_eager(self, force: bool) -> None:
+        """Phase E hook: when the cross-replica bs negotiation detects an
+        asymmetric busy/busy step (e.g. replica A's batch padded to bs=64
+        but replica B's padded to bs=128), both replicas must skip graph
+        replay for this single step.  Otherwise each rank would replay
+        its own (variant, bs) graph whose captured NCCL collectives have
+        different shapes -> NCCL all_gather_into_tensor size mismatch ->
+        silent hang.  The scheduler flips this on before run_batch and
+        back off after the forward returns.
+        """
+        self._balloon_step_force_eager = bool(force)
 
     def _update_live_expert_location_metadata(self, metadata) -> None:
         if self.is_draft_worker or metadata is None:
@@ -1342,6 +1445,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             "but graph_runner.max_num_token is unavailable; "
                             "GLOBAL bundle will fall back to eager dispatch."
                         )
+                # Phase F: resolve the lane subgroup (cross-replica
+                # 2-rank group) and the local TP group.  When both are
+                # available the dispatcher will use:
+                #   dispatch -> all_gather_into_tensor on lane_group
+                #               (no [A,A,B,B] redundancy)
+                #   combine  -> reduce_scatter on lane_group +
+                #               all_reduce on local_tp_group
+                #               (no wasted all_gather half)
+                # When unavailable it transparently falls back to the
+                # Phase D path on the global runtime_group.
+                lane_group = None
+                pg_names_lower = {
+                    str(k).lower(): v for k, v in (kunserve_pg_names or {}).items()
+                }
+                lane_key = f"lane_{resolved_moe_ep_rank % local_ep_size}"
+                lane_group_name = pg_names_lower.get(lane_key)
+                if lane_group_name:
+                    try:
+                        lane_group = self._resolve_balloon_process_group(
+                            lane_group_name
+                        )
+                    except Exception as exc:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] Phase F lane group %r unresolved "
+                            "on tp_rank=%s: %r -- falling back to global "
+                            "group for dispatch/combine.",
+                            lane_group_name,
+                            self.tp_rank,
+                            exc,
+                        )
+                        lane_group = None
+                local_tp_group = None
+                try:
+                    from sglang.srt.distributed.parallel_state import get_tp_group
+
+                    tp_coord = get_tp_group()
+                    local_tp_group = getattr(tp_coord, "device_group", None)
+                except Exception as exc:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] Phase F local TP group unavailable: "
+                        "%r -- combine optimization disabled.",
+                        exc,
+                    )
+                    local_tp_group = None
+
                 explicit_global_dispatcher = CrossReplicaStandardDispatcher(
                     group=runtime_group,
                     moe_runner_config=global_runner_config,
@@ -1351,6 +1499,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     global_rank=resolved_moe_ep_rank,
                     world_size=resolved_ep_size,
                     capture_max_m=resolved_capture_max_m,
+                    lane_group=lane_group,
+                    local_tp_group=local_tp_group,
                 )
                 # Use the normal Standard/Triton MoE core for the correctness
                 # backend. This avoids DeepEP/NVSHMEM and DeepGEMM entirely;
@@ -1364,7 +1514,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "[KUNSERVE-MS] GLOBAL bundle uses CrossReplicaStandardDispatcher: "
                         "tp_rank=%s global_rank=%s world=%s local_ep_size=%s "
                         "replica_rank=%s capture_policy=%s capture_max_m=%s "
-                        "backend_config=%s",
+                        "phase_f_lane=%s phase_f_tp=%s backend_config=%s",
                         self.tp_rank,
                         resolved_moe_ep_rank,
                         resolved_ep_size,
@@ -1372,6 +1522,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         resolved_moe_ep_rank // local_ep_size,
                         capture_policy,
                         resolved_capture_max_m,
+                        (lane_group_name if lane_group is not None else None),
+                        ("ready" if local_tp_group is not None else "unavailable"),
                         kunserve_backend_config,
                     )
             # When SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL is on (default), build
@@ -1657,49 +1809,123 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     backend_lower == "sglang"
                     and policy_lower == "fixed_padded"
                 ):
-                    preheat_group = self._resolve_balloon_process_group(
-                        process_group_name
-                    )
-                    if preheat_group is not None:
+                    # Collect every NCCL group the static dispatcher
+                    # may touch during capture.  Each group's
+                    # communicator init must complete OUTSIDE the
+                    # graph_capture context.  Order doesn't matter; we
+                    # just hit every (group, op) pair the dispatcher
+                    # uses.
+                    preheat_groups: List[
+                        Tuple[str, Optional["dist.ProcessGroup"]]
+                    ] = []
+                    try:
+                        preheat_groups.append(
+                            (
+                                "runtime",
+                                self._resolve_balloon_process_group(
+                                    process_group_name
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] preheat: failed to resolve "
+                            "runtime group %r: %r",
+                            process_group_name,
+                            exc,
+                        )
+                    # Phase F: also preheat the lane group + local TP
+                    # group when present so static dispatch/combine
+                    # collectives in the captured graph never trigger
+                    # in-graph communicator init.
+                    pg_names_map = {
+                        str(k).lower(): v
+                        for k, v in (kunserve_pg_names or {}).items()
+                    }
+                    for lane_idx in range(int(self.moe_ep_size)):
+                        lane_name = pg_names_map.get(f"lane_{lane_idx}")
+                        if lane_name is None:
+                            continue
+                        if int(lane_idx) != int(self.tp_rank):
+                            # Not our lane; skip silently.
+                            continue
                         try:
-                            preheat_device = torch.device(
-                                "cuda", torch.cuda.current_device()
+                            preheat_groups.append(
+                                (
+                                    f"lane_{lane_idx}",
+                                    self._resolve_balloon_process_group(
+                                        lane_name
+                                    ),
+                                )
                             )
-                            preheat_world = int(
-                                dist.get_world_size(group=preheat_group)
+                        except Exception as exc:
+                            _kunserve_ms(
+                                "[KUNSERVE-MS] preheat: failed to resolve "
+                                "lane group %r: %r",
+                                lane_name,
+                                exc,
                             )
+                    try:
+                        from sglang.srt.distributed.parallel_state import (
+                            get_tp_group,
+                        )
+
+                        preheat_groups.append(
+                            ("local_tp", get_tp_group().device_group)
+                        )
+                    except Exception as exc:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] preheat: failed to resolve "
+                            "local TP group: %r",
+                            exc,
+                        )
+
+                    preheat_device = torch.device(
+                        "cuda", torch.cuda.current_device()
+                    )
+                    for label, group in preheat_groups:
+                        if group is None:
+                            continue
+                        try:
+                            world = int(dist.get_world_size(group=group))
                             ag_in = torch.zeros(1, device=preheat_device)
-                            ag_out = torch.zeros(
-                                preheat_world, device=preheat_device
-                            )
+                            ag_out = torch.zeros(world, device=preheat_device)
                             dist.all_gather_into_tensor(
-                                ag_out, ag_in, group=preheat_group
+                                ag_out, ag_in, group=group
                             )
+                            rs_in = torch.zeros(world, device=preheat_device)
+                            rs_out = torch.zeros(1, device=preheat_device)
+                            try:
+                                dist.reduce_scatter_tensor(
+                                    rs_out, rs_in, group=group
+                                )
+                            except Exception:
+                                # Some NCCL builds expose
+                                # _reduce_scatter_base; ignore failure
+                                # for groups that don't support
+                                # reduce_scatter (the dispatcher only
+                                # uses it on lane group anyway).
+                                pass
                             ar_buf = torch.zeros(1, device=preheat_device)
                             dist.all_reduce(
                                 ar_buf,
                                 op=dist.ReduceOp.SUM,
-                                group=preheat_group,
+                                group=group,
                             )
                             torch.cuda.synchronize()
                             _kunserve_ms(
                                 "[KUNSERVE-MS] NCCL communicator preheat done "
-                                "for runtime_group: world=%d "
-                                "(all_gather_into_tensor + all_reduce)",
-                                preheat_world,
+                                "for %s: world=%d (all_gather_into_tensor + "
+                                "reduce_scatter_tensor + all_reduce)",
+                                label,
+                                world,
                             )
                         except Exception as exc:
-                            # Preheat failure is suspicious but not
-                            # necessarily fatal — the actual capture may
-                            # still succeed if NCCL already initialized
-                            # the communicator through some other path
-                            # (e.g. the warmup forward).  Log and
-                            # continue; if capture later fails on init
-                            # this milestone will pinpoint why.
                             _kunserve_ms(
                                 "[KUNSERVE-MS] NCCL communicator preheat "
-                                "FAILED on runtime_group: %r — proceeding "
-                                "into capture anyway",
+                                "FAILED on %s: %r — proceeding into capture "
+                                "anyway",
+                                label,
                                 exc,
                             )
                 self.ensure_cuda_graph_variant_captured(target_variant)
@@ -2147,6 +2373,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._balloon_added_slots = int(added_slots)
             self._balloon_last_error = None
             self._balloon_graph_replay_enabled = True
+
+            # Phase E: reserve a dummy KV slot for keepalive batches.
+            # Done after the KV pool has been expanded (so we draw from
+            # the new headroom, not from real-request capacity).  Only
+            # for the sglang backend's keepalive path; DeepEP uses a
+            # different keepalive mechanism.
+            if (
+                str(self._balloon_kunserve_comm_backend or "").lower()
+                == "sglang"
+                and self._kunserve_keepalive_dummy_kv_slot is None
+            ):
+                try:
+                    dummy_alloc = self.token_to_kv_pool_allocator.alloc(1)
+                    if (
+                        dummy_alloc is not None
+                        and getattr(dummy_alloc, "numel", lambda: 0)() >= 1
+                    ):
+                        self._kunserve_keepalive_dummy_kv_slot_tensor = dummy_alloc
+                        self._kunserve_keepalive_dummy_kv_slot = int(
+                            dummy_alloc[0].item()
+                        )
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] keepalive dummy KV slot reserved: "
+                            "slot=%d (allocator size=%d after balloon expand)",
+                            self._kunserve_keepalive_dummy_kv_slot,
+                            int(self.token_to_kv_pool_allocator.size),
+                        )
+                    else:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] keepalive dummy KV slot alloc returned "
+                            "empty -- keepalive will fall back to slot 0 (UNSAFE: "
+                            "may corrupt slot 0's KV during graph replay)"
+                        )
+                except Exception as exc:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] keepalive dummy KV slot alloc raised: %r "
+                        "-- keepalive will fall back to slot 0 (UNSAFE: may "
+                        "corrupt slot 0's KV during graph replay)",
+                        exc,
+                    )
+
             _kunserve_ms(
                 "[KUNSERVE-MS] commit done: state=balloon variant=%s offloaded=%d added_kv_slots=%d max_total_num_tokens=%d (graph replay RESUMED)",
                 self.get_cuda_graph_runtime_variant(),
@@ -2221,6 +2488,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._balloon_offloaded_local_experts,
         )
         self._balloon_graph_replay_enabled = False
+        # Phase E: free the keepalive dummy KV slot before shrinking
+        # the pool tail; if the slot index is in the tail we're about
+        # to remove, freeing it after shrink would be invalid.
+        if self._kunserve_keepalive_dummy_kv_slot_tensor is not None:
+            try:
+                self.token_to_kv_pool_allocator.free(
+                    self._kunserve_keepalive_dummy_kv_slot_tensor
+                )
+            except Exception as exc:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] keepalive dummy KV slot free failed: %r "
+                    "(leaking 1 slot; restore continues)",
+                    exc,
+                )
+            self._kunserve_keepalive_dummy_kv_slot_tensor = None
+            self._kunserve_keepalive_dummy_kv_slot = None
         if self._balloon_added_slots > 0:
             self.token_to_kv_pool_allocator.shrink_tail(self._balloon_added_slots)
             returned = self._get_balloon_kv_cache().shrink_tail(
@@ -2985,6 +3268,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         world_size,
         group_name,
         backend="nccl",
+        *,
+        lane_only_tp_rank: Optional[int] = None,
+        explicit_group_rank: Optional[int] = None,
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -2995,18 +3281,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         In the RLHF workflow, the training engine updates the model
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
+
+        KunServe Phase F adds the ability to build cross-replica lane
+        subgroups (``[rank0, rank2]`` / ``[rank1, rank3]``) which only
+        include ONE TP worker per replica.  When ``lane_only_tp_rank``
+        is set, every TP worker still receives the RPC but only the one
+        with matching ``tp_rank`` actually participates in the NCCL
+        rendezvous; the others record a sentinel so they don't try to
+        look up a non-existent local handle.  ``explicit_group_rank``
+        overrides the ``rank_offset + tp_rank`` formula for the
+        participating worker (used because lane subgroup ranks are
+        ``replica_idx``, not ``rank_offset + tp_rank``).
         """
         assert (
             torch.distributed.is_initialized()
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        rank = rank_offset + self.tp_rank
+        # Phase F: lane-filtered init.  Non-participating TP workers
+        # record None so _resolve_balloon_process_group can detect them
+        # and the dispatcher can fall back gracefully.
+        if (
+            lane_only_tp_rank is not None
+            and int(lane_only_tp_rank) != int(self.tp_rank)
+        ):
+            self._model_update_group[group_name] = None
+            return True, (
+                f"Skipped non-participating tp_rank={self.tp_rank} for "
+                f"lane group {group_name!r} (lane_only_tp_rank="
+                f"{lane_only_tp_rank})."
+            )
+
+        if explicit_group_rank is not None:
+            rank = int(explicit_group_rank)
+        else:
+            rank = rank_offset + self.tp_rank
 
         # Idempotent: if a group with the same name is already initialized,
         # return success. Callers (e.g. KunServeController) may retry the same
         # request and we must not double-init or fail the second call.
-        if group_name in self._model_update_group:
+        if (
+            group_name in self._model_update_group
+            and self._model_update_group[group_name] is not None
+        ):
             logger.info(
                 f"init custom process group: group_name={group_name} already initialized, returning success."
             )
@@ -3054,6 +3371,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         try:
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
+                if pg is None:
+                    # Phase F sentinel for a non-participating tp_rank.
+                    # Nothing to tear down on this side.
+                    return True, "Succeeded to destroy custom process group."
                 torch.distributed.destroy_process_group(pg)
                 return True, "Succeeded to destroy custom process group."
             else:

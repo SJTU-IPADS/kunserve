@@ -255,7 +255,11 @@ class SchedulerDPAttnMixin:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
-    def get_idle_batch(self: Scheduler) -> ScheduleBatch:
+    def get_idle_batch(
+        self: Scheduler,
+        target_bs: int = 0,
+        dummy_kv_slot: Optional[int] = None,
+    ) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
             self.req_to_token_pool,
@@ -265,5 +269,7 @@ class SchedulerDPAttnMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
-        idle_batch.prepare_for_idle()
+        idle_batch.prepare_for_idle(
+            target_bs=int(target_bs), dummy_kv_slot=dummy_kv_slot
+        )
         return idle_batch

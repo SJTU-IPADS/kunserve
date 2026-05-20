@@ -1928,15 +1928,64 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Reset the encoder cached status
         self.encoder_cached = [True] * len(self.reqs)
 
-    def prepare_for_idle(self):
+    def prepare_for_idle(
+        self, target_bs: int = 0, dummy_kv_slot: Optional[int] = None
+    ):
+        """Build an IDLE batch.
+
+        ``target_bs == 0`` keeps the historical "empty batch" behavior
+        used by the DP-attention idle path.
+
+        ``target_bs > 0`` (KunServe Phase E) builds a dummy DECODE-shaped
+        batch with ``target_bs`` rows of placeholder tokens.  This is
+        required when the peer KunServe replica is running real work at
+        ``batch_size=target_bs`` and the GLOBAL CUDA graph capture only
+        has ops for that specific shape - the idle replica must enter the
+        cross-replica collective with the same ``local_m`` so all 4 ranks
+        replay the same graph in lockstep.
+
+        Safety: the captured graph carries ForwardMode.DECODE attention
+        ops including ``set_kv_buffer(layer, out_cache_loc, k, v)`` --
+        which still runs under graph replay even though the live
+        ``forward_mode`` is IDLE.  Pointing ``out_cache_loc`` at slot 0
+        would clobber whichever real request currently owns slot 0.
+        ``dummy_kv_slot`` is a dedicated slot reserved by
+        ``ModelRunner.commit_balloon`` for this purpose; passing it
+        here redirects the KV write to a slot no real request can ever
+        be assigned.  ``dummy_kv_slot=None`` falls back to slot 0 with
+        a comment for callers that haven't reserved one (unsafe).
+
+        ``req_pool_indices``, ``seq_lens`` and ``positions`` stay at 0
+        / 1 -- attention only READS the historical KV they point at;
+        the read is wasted compute but cannot corrupt state.
+        """
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.seq_lens_sum = 0
+        if target_bs <= 0:
+            self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.seq_lens_sum = 0
+        else:
+            # Per-token state placeholders.  Values are dummy because the
+            # tokens will be processed by the cross-replica collectives
+            # only - the attention reads back at out_cache_loc=0 are
+            # discarded.  seq_lens=1 keeps attention metadata valid; using
+            # a real seq_len value lets the attention backend's CUDA
+            # graph capture run without nan-from-zero-length workarounds.
+            n = int(target_bs)
+            self.input_ids = torch.zeros(n, dtype=torch.int64, device=self.device)
+            self.seq_lens = torch.ones(n, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.ones(n, dtype=torch.int64)
+            self.orig_seq_lens = torch.ones(n, dtype=torch.int32, device=self.device)
+            kv_loc_value = int(dummy_kv_slot) if dummy_kv_slot is not None else 0
+            self.out_cache_loc = torch.full(
+                (n,), kv_loc_value, dtype=torch.int64, device=self.device
+            )
+            self.req_pool_indices = torch.zeros(n, dtype=torch.int32, device=self.device)
+            self.seq_lens_sum = int(n)
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,

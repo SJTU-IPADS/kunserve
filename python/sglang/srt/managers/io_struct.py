@@ -1439,6 +1439,20 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # KunServe Phase F: when set, only the TP worker whose tp_rank
+    # matches this value participates in the rendezvous; other TP
+    # workers return success without touching torch.distributed.  Used
+    # for cross-replica lane subgroups [rank0, rank2] and [rank1, rank3]
+    # which need to be initialized but only include one TP worker per
+    # replica.  ``None`` (default) preserves the original behavior where
+    # every TP worker participates.
+    lane_only_tp_rank: Optional[int] = None
+    # Phase F: rank of this participating worker inside the lane
+    # subgroup (typically the replica index when ``lane_only_tp_rank``
+    # is set).  Ignored unless ``lane_only_tp_rank`` matches the
+    # worker's local tp_rank; otherwise the existing
+    # ``rank_offset + tp_rank`` formula is used.
+    explicit_group_rank: Optional[int] = None
 
 
 @dataclass
