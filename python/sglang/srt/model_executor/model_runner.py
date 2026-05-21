@@ -1989,10 +1989,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if (
                     backend_lower == "sglang"
                     and policy_lower == "fixed_padded"
-                    and runtime_group is not None
                 ):
                     try:
-                        dist.barrier(group=runtime_group)
+                        _grp = self._resolve_balloon_process_group(
+                            process_group_name
+                        )
+                        if _grp is not None:
+                            dist.barrier(group=_grp)
                     except Exception:
                         pass
                     torch.cuda.synchronize()
