@@ -1558,6 +1558,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     return_recv_hook=True,
                 )
 
+            # CrossReplicaStandardDispatcher (sglang backend) uses each
+            # rank's OWN local weight tensor rows (0..num_local_experts-1)
+            # via the dispatcher's all_gather+reduce pattern — no VMM weight
+            # expansion.  Passing mapping=[32..63] here would cause
+            # build_dense_expert_runtime_tensors to call
+            # tensor.narrow(0, 32, 32) on a 32-row weight tensor, which is
+            # an out-of-bounds access → cudaErrorIllegalAddress at warmup.
+            # For the sglang path: leave active_local_expert_mapping=None
+            # so _active_runtime_tensors stays empty and get_runtime_tensor
+            # falls back to the full local weight tensor.
+            # The DeepEP/Mooncake paths retain the original mapping because
+            # they DO expand the weight tensor via VMM.
+            sglang_path = (
+                kunserve_comm_backend == "sglang"
+                and explicit_global_dispatcher is not None
+            )
             layer.register_runtime_bundle(
                 variant="global",
                 moe_runner_config=global_runner_config,
@@ -1569,7 +1585,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 num_local_experts=int(mapping.numel()),
-                active_local_expert_mapping=mapping,
+                active_local_expert_mapping=(None if sglang_path else mapping),
                 dispatcher_local_expert_mapping=dispatcher_local_expert_mapping,
                 # GLOBAL bundle combine already aggregates each token's expert
                 # outputs across the whole cross-replica EP world:

@@ -480,12 +480,16 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         hidden_states = hidden_states.contiguous()
 
         if self.phase_f_enabled:
-            # Phase F: lane reduce_scatter + intra-TP all_reduce.
+            # Phase F: lane reduce_scatter only.
             # Input ``[NR*max_m, H]`` is reduced over the lane subgroup
-            # and scattered by replica chunk so each lane member only
-            # keeps its replica's [max_m, H] slice; then the local TP
-            # group combines lane0/lane1's slices to produce the final
-            # [max_m, H] result on every rank in this replica.
+            # and scattered by replica chunk so each lane member keeps
+            # its replica's [max_m, H] slice covering half the expert
+            # logical space (lane0: experts 0..63, lane1: experts 64..127
+            # in the 2-replica case).  The TP all_reduce that combines
+            # lane0's partial with lane1's partial is NOT done here —
+            # forward_normal in the model layer already calls
+            # tensor_model_parallel_all_reduce after experts().  Doing it
+            # here too would double-reduce and overflow after many layers.
             max_m = int(self._last_max_m)
             H = hidden_states.shape[1]
             local_slice = torch.empty(
@@ -499,14 +503,17 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 op=dist.ReduceOp.SUM,
                 group=self.lane_group,
             )
-            dist.all_reduce(
-                local_slice,
-                op=dist.ReduceOp.SUM,
-                group=self.local_tp_group,
-            )
             return local_slice[: int(self._last_local_m)].contiguous()
 
         # Phase D fallback: global all_reduce on the union, then slice.
+        # WARNING: this path has the same double-TP-all_reduce hazard as
+        # Phase F had before the fix above.  forward_normal will do a
+        # tensor_model_parallel_all_reduce after experts(), which doubles
+        # the already-complete sum returned here.  Phase D is not currently
+        # triggered when Phase F lane subgroups initialise successfully.
+        # If Phase D needs to be re-enabled, fix by either (a) migrating
+        # to lane groups, or (b) suppressing forward_normal's all_reduce
+        # when GLOBAL bundle is active.
         dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=self.group)
         start = int(self._last_slice_start)
         end = start + int(self._last_local_m)
@@ -632,26 +639,22 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         hidden_states = hidden_states.contiguous()
 
         if self.phase_f_enabled:
-            # Phase F combine: two-stage reduction.
+            # Phase F combine: lane reduce_scatter only.
             #
             # Input shape: [NR*M, H] -- partial expert sum from this rank's
             # local_experts over the whole union batch.
             #
-            # Stage 1: reduce_scatter on the lane subgroup.  Splits the
-            # [NR*M, H] partial by replica chunk, sums lane-internal
-            # contributions, and lands each lane member with its own
-            # replica's slice [M, H] (lane0's contribution to A on
-            # this lane's rank for replica0, etc).
+            # reduce_scatter on the lane subgroup splits the [NR*M, H]
+            # partial by replica chunk, sums lane-internal contributions,
+            # and lands each lane member with its replica's slice [M, H]:
+            #   lane0 rank → experts 0..63 partial for its replica's tokens
+            #   lane1 rank → experts 64..127 partial for its replica's tokens
             #
-            # Stage 2: all_reduce on the local TP group, which contains
-            # both lanes within this replica.  Combines lane0's slice
-            # with lane1's slice to produce the full MoE output [M, H]
-            # for this replica's tokens, on every rank in this replica.
-            #
-            # Total combine traffic ~ M*H (stage 1) + 1.5*M*H (stage 2)
-            # = 2.5*M*H per rank vs 3*M*H for the Phase D global
-            # all_reduce on [NR*M, H].  About 17% combine saving in
-            # the 2-replica case; bigger gains at larger world size.
+            # The TP all_reduce that combines lane0's partial with lane1's
+            # is NOT done here.  forward_normal in the model layer already
+            # calls tensor_model_parallel_all_reduce after experts().
+            # Doing it here too would double-reduce every layer and overflow
+            # after many MoE layers.
             M = int(self._capture_max_m)
             local_slice = self._buf_combine_local_slice  # [M, H]
             dist.reduce_scatter_tensor(
@@ -660,15 +663,14 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 op=dist.ReduceOp.SUM,
                 group=self.lane_group,
             )
-            dist.all_reduce(
-                local_slice, op=dist.ReduceOp.SUM, group=self.local_tp_group
-            )
             return local_slice[: int(self._last_local_m)].contiguous()
 
         # Phase D fallback: global all_reduce + slice.  Each (variant,
         # bs) graph allocates its own partial-output tensor in the
         # graph private pool, so all_reduce-in-place targets a stable
         # address per graph.
+        # WARNING: same double-TP-all_reduce hazard as _combine_dynamic
+        # Phase D; see note there.  Not triggered when Phase F is active.
         dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=self.group)
 
         start = self.replica_rank * self._capture_max_m

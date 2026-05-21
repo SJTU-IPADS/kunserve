@@ -1087,7 +1087,25 @@ class Qwen3MoeForCausalLM(nn.Module):
                     continue
 
                 param = params_dict[name]
-                weight_loader = param.weight_loader
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is None:
+                    # Some locally patched/quantized Qwen3-MoE paths expose split
+                    # attention/MLP Parameters without SGLang's stacked-shard
+                    # weight_loader metadata. Fall back to default loading when
+                    # shapes match, otherwise skip instead of crashing the
+                    # scheduler during async weight sync.
+                    if tuple(param.shape) == tuple(loaded_weight.shape):
+                        default_weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(
+                            "Skip loading %s into %s because weight_loader is missing "
+                            "and shapes differ: param=%s loaded=%s",
+                            weight_name,
+                            name,
+                            tuple(param.shape),
+                            tuple(loaded_weight.shape),
+                        )
+                    break
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1108,7 +1126,21 @@ class Qwen3MoeForCausalLM(nn.Module):
                         continue
 
                     param = params_dict[name]
-                    weight_loader = param.weight_loader
+                    weight_loader = getattr(param, "weight_loader", None)
+                    if weight_loader is None:
+                        if tuple(param.shape) == tuple(loaded_weight.shape):
+                            default_weight_loader(param, loaded_weight)
+                        else:
+                            logger.warning(
+                                "Skip loading expert weight %s into %s because "
+                                "weight_loader is missing and shapes differ: "
+                                "param=%s loaded=%s",
+                                weight_name,
+                                name,
+                                tuple(param.shape),
+                                tuple(loaded_weight.shape),
+                            )
+                        break
                     weight_loader(
                         param,
                         loaded_weight,
@@ -1130,10 +1162,23 @@ class Qwen3MoeForCausalLM(nn.Module):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
+                        weight_loader = getattr(param, "weight_loader", None)
+                        if weight_loader is None:
+                            # Guard against shape mismatches (e.g. when
+                            # process_weights_after_loading replaces a Parameter
+                            # object and loses the weight_loader attribute).
+                            if tuple(param.shape) == tuple(loaded_weight.shape):
+                                default_weight_loader(param, loaded_weight)
+                            else:
+                                logger.warning(
+                                    "Skip loading %s because weight_loader is "
+                                    "missing and shapes differ: param=%s loaded=%s",
+                                    name,
+                                    tuple(param.shape),
+                                    tuple(loaded_weight.shape),
+                                )
+                        else:
+                            weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 

@@ -1191,7 +1191,7 @@ class Scheduler(
             if self._kunserve_phase_e_active():
                 local_status = self._local_balloon_status_or_stop()
                 if local_status is not None:
-                    local_bs = batch.batch_size if batch is not None else 0
+                    local_bs = batch.batch_size() if batch is not None else 0
                     # Negotiate using the *padded* bs the local graph
                     # would actually replay with, so the agreed value
                     # matches what each rank's can_run() resolves to.
@@ -1278,7 +1278,7 @@ class Scheduler(
             if self._kunserve_phase_e_active():
                 phase_e_status = self._local_balloon_status_or_stop()
                 if phase_e_status is not None:
-                    local_bs = batch.batch_size if batch is not None else 0
+                    local_bs = batch.batch_size() if batch is not None else 0
                     local_padded = self._padded_capture_bs(local_bs)
                     phase_e_negotiated_max, phase_e_negotiated_min = (
                         self.negotiate_balloon_step_bs(local_padded)
