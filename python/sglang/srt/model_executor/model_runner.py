@@ -1979,6 +1979,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 label,
                                 exc,
                             )
+                # After NCCL preheat on the default stream, synchronize
+                # every rank and the GPU so the graph-capture stream (which
+                # will be a *different* stream) sees fully-initialised
+                # communicators.  Without this barrier the very first
+                # lane-group all_gather inside the warmup runs can race
+                # with residual NCCL bootstrap work and produce
+                # cudaErrorIllegalAddress.
+                if (
+                    backend_lower == "sglang"
+                    and policy_lower == "fixed_padded"
+                    and runtime_group is not None
+                ):
+                    try:
+                        dist.barrier(group=runtime_group)
+                    except Exception:
+                        pass
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
                 self.ensure_cuda_graph_variant_captured(target_variant)
             else:
                 _kunserve_ms(
