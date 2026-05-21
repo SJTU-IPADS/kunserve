@@ -1560,20 +1560,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # CrossReplicaStandardDispatcher (sglang backend) uses each
             # rank's OWN local weight tensor rows (0..num_local_experts-1)
-            # via the dispatcher's all_gather+reduce pattern — no VMM weight
-            # expansion.  Passing mapping=[32..63] here would cause
-            # build_dense_expert_runtime_tensors to call
-            # tensor.narrow(0, 32, 32) on a 32-row weight tensor, which is
-            # an out-of-bounds access → cudaErrorIllegalAddress at warmup.
-            # For the sglang path: leave active_local_expert_mapping=None
-            # so _active_runtime_tensors stays empty and get_runtime_tensor
-            # falls back to the full local weight tensor.
-            # The DeepEP/Mooncake paths retain the original mapping because
-            # they DO expand the weight tensor via VMM.
+            # via the all_gather+reduce pattern — no VMM weight expansion.
+            #
+            # The VMM tensor has 64 rows for a 32-expert partition:
+            #   rows 0..31  — physical backing, always accessible
+            #   rows 32..63 — virtual-only, inaccessible until prepare_balloon
+            #
+            # For replica 0, the controller sends mapping=[0..31] → correct.
+            # For replica 1, the controller sends mapping=[32..63] — this is
+            # the DeepEP layout where rows 32..63 hold borrowed donor experts.
+            # But for the sglang path replica 1 also computes its OWN local
+            # experts (rows 0..31 of its own weight tensor); the dispatcher
+            # handles cross-replica token routing, not weight re-indexing.
+            #
+            # Passing mapping=[32..63] to build_dense_expert_runtime_tensors
+            # calls w13_weight.narrow(0, 32, 32) → a view into VMM rows 32..63
+            # → cudaErrorIllegalAddress during warmup capture.
+            # Passing mapping=None returns the full 64-row VMM tensor; the
+            # Triton runner reads E = w13.shape[0] = 64 and still tries to
+            # access rows 32..63 → same crash.
+            #
+            # Fix: always use the identity mapping [0..num_local_experts-1] for
+            # the sglang path.  build_dense_expert_runtime_tensors narrows to
+            # rows 0..31 (always accessible), and the Triton kernel sees E=32.
+            # The DeepEP/Mooncake paths keep the original mapping because they
+            # DO expand the weight tensor via VMM (rows 32..63 become accessible
+            # after prepare_balloon/commit_balloon).
             sglang_path = (
                 kunserve_comm_backend == "sglang"
                 and explicit_global_dispatcher is not None
             )
+            if sglang_path:
+                num_local = int(mapping.numel())
+                active_mapping = torch.arange(num_local, dtype=torch.int32)
+                if int(layer.layer_id) == 0:
+                    _kunserve_ms(
+                        "[KUNSERVE-DBG] sglang GLOBAL bundle: overriding active_mapping "
+                        "from [%d..%d] → [0..%d] so Triton kernel sees E=%d rows "
+                        "(rows 0..%d are VMM-accessible before prepare_balloon); "
+                        "tp_rank=%s global_rank=%s",
+                        int(mapping[0].item()),
+                        int(mapping[-1].item()),
+                        num_local - 1,
+                        num_local,
+                        num_local - 1,
+                        self.tp_rank,
+                        resolved_moe_ep_rank,
+                    )
+            else:
+                active_mapping = mapping
             layer.register_runtime_bundle(
                 variant="global",
                 moe_runner_config=global_runner_config,
@@ -1585,7 +1620,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 num_local_experts=int(mapping.numel()),
-                active_local_expert_mapping=(None if sglang_path else mapping),
+                active_local_expert_mapping=active_mapping,
                 dispatcher_local_expert_mapping=dispatcher_local_expert_mapping,
                 # GLOBAL bundle combine already aggregates each token's expert
                 # outputs across the whole cross-replica EP world:
