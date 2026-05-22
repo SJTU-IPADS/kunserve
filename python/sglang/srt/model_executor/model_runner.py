@@ -1934,30 +1934,73 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     preheat_device = torch.device(
                         "cuda", torch.cuda.current_device()
                     )
+                    # Per-group ops: only call the collectives each group
+                    # actually uses in the captured graph.
+                    #
+                    # Phase F (lane_group + local_tp_group):
+                    #   dispatch  → lane_group.all_gather_into_tensor
+                    #   combine   → lane_group.reduce_scatter_tensor
+                    #               + local_tp_group.all_reduce
+                    # Phase D fallback (runtime_group only):
+                    #   dispatch  → runtime_group.all_gather_into_tensor
+                    #   combine   → runtime_group.all_reduce
+                    #
+                    # IMPORTANT: do NOT call reduce_scatter_tensor on
+                    # groups that don't use it (runtime, local_tp).
+                    # Calling an unsupported collective silently on ONE
+                    # rank but not another creates a NCCL collective
+                    # mismatch that corrupts the communicator state even
+                    # when the per-group try/except says "done".
+                    _rs_groups: set = {
+                        lbl
+                        for lbl, _grp in preheat_groups
+                        if lbl.startswith("lane_")
+                    }
                     for label, group in preheat_groups:
                         if group is None:
                             continue
                         try:
                             world = int(dist.get_world_size(group=group))
-                            ag_in = torch.zeros(1, device=preheat_device)
-                            ag_out = torch.zeros(world, device=preheat_device)
+                            ag_in = torch.zeros(
+                                1, device=preheat_device
+                            )
+                            ag_out = torch.zeros(
+                                world, device=preheat_device
+                            )
                             dist.all_gather_into_tensor(
                                 ag_out, ag_in, group=group
                             )
-                            rs_in = torch.zeros(world, device=preheat_device)
-                            rs_out = torch.zeros(1, device=preheat_device)
-                            try:
+                            torch.cuda.synchronize()
+                            _kunserve_ms(
+                                "[KUNSERVE-MS] preheat %s: "
+                                "all_gather_into_tensor OK",
+                                label,
+                            )
+
+                            # reduce_scatter_tensor: only for lane
+                            # groups (Phase F combine).  All other
+                            # groups skip this to avoid collective
+                            # mismatch across ranks.
+                            if label in _rs_groups:
+                                rs_in = torch.zeros(
+                                    world, device=preheat_device
+                                )
+                                rs_out = torch.zeros(
+                                    1, device=preheat_device
+                                )
                                 dist.reduce_scatter_tensor(
                                     rs_out, rs_in, group=group
                                 )
-                            except Exception:
-                                # Some NCCL builds expose
-                                # _reduce_scatter_base; ignore failure
-                                # for groups that don't support
-                                # reduce_scatter (the dispatcher only
-                                # uses it on lane group anyway).
-                                pass
-                            ar_buf = torch.zeros(1, device=preheat_device)
+                                torch.cuda.synchronize()
+                                _kunserve_ms(
+                                    "[KUNSERVE-MS] preheat %s: "
+                                    "reduce_scatter_tensor OK",
+                                    label,
+                                )
+
+                            ar_buf = torch.zeros(
+                                1, device=preheat_device
+                            )
                             dist.all_reduce(
                                 ar_buf,
                                 op=dist.ReduceOp.SUM,
@@ -1965,17 +2008,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             )
                             torch.cuda.synchronize()
                             _kunserve_ms(
-                                "[KUNSERVE-MS] NCCL communicator preheat done "
-                                "for %s: world=%d (all_gather_into_tensor + "
-                                "reduce_scatter_tensor + all_reduce)",
+                                "[KUNSERVE-MS] NCCL communicator preheat "
+                                "done for %s: world=%d",
                                 label,
                                 world,
                             )
                         except Exception as exc:
                             _kunserve_ms(
                                 "[KUNSERVE-MS] NCCL communicator preheat "
-                                "FAILED on %s: %r — proceeding into capture "
-                                "anyway",
+                                "FAILED on %s: %r — proceeding into "
+                                "capture anyway",
                                 label,
                                 exc,
                             )
@@ -2007,11 +2049,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             _emb_weight = getattr(_mod, "weight", None)
                             break
                     if _emb_weight is not None:
+                        # Phase 1: explicit device sync to flush any
+                        # deferred GPU errors from background NCCL ops.
+                        # If THIS raises, the error is from a background
+                        # GPU operation (NCCL side-effect), NOT from the
+                        # embedding weight pointer.
+                        # If this passes but Phase 2 raises, the weight
+                        # data pointer itself is invalid (memory mapping
+                        # issue).
+                        try:
+                            torch.cuda.synchronize()
+                            _kunserve_ms(
+                                "[KUNSERVE-DBG] pre-capture "
+                                "explicit sync OK (no deferred GPU "
+                                "errors at this point)"
+                            )
+                        except Exception as _sync_exc:
+                            _kunserve_ms(
+                                "[KUNSERVE-DBG] pre-capture "
+                                "explicit sync FAILED: %r -- "
+                                "a BACKGROUND GPU operation (NCCL or "
+                                "other) caused cudaErrorIllegalAddress; "
+                                "the embedding weight pointer itself "
+                                "may be intact.",
+                                _sync_exc,
+                            )
+                            raise
+                        # Phase 2: probe the embedding weight pointer.
                         try:
                             _probe_val = float(
                                 _emb_weight.detach().sum().item()
                             )
-                            torch.cuda.synchronize()
                             _kunserve_ms(
                                 "[KUNSERVE-DBG] pre-capture "
                                 "embed_tokens.weight probe OK: shape=%s "
@@ -2024,15 +2092,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         except Exception as exc:
                             _kunserve_ms(
                                 "[KUNSERVE-DBG] pre-capture "
-                                "embed_tokens.weight probe FAILED: %r -- "
-                                "embedding weight is ALREADY corrupt "
-                                "before GLOBAL cuda-graph capture; root "
-                                "cause is in GLOBAL bundle registration / "
-                                "NCCL preheat, NOT the capture itself.",
+                                "embed_tokens.weight probe FAILED "
+                                "AFTER clean sync: %r -- "
+                                "the embedding weight DATA POINTER "
+                                "is invalid (GPU virtual address not "
+                                "backed / freed under us).",
                                 exc,
                             )
                             raise
+                _kunserve_ms(
+                    "[KUNSERVE-MS] GLOBAL cuda graph capture BEGIN "
+                    "(variant=%s pid=%d) — this blocks the GPU for "
+                    "~9 min; FSDP training NCCL collectives on TP-rank-1 "
+                    "workers will be delayed until capture completes.",
+                    target_variant,
+                    os.getpid(),
+                )
                 self.ensure_cuda_graph_variant_captured(target_variant)
+                _kunserve_ms(
+                    "[KUNSERVE-MS] GLOBAL cuda graph capture COMPLETE "
+                    "(variant=%s pid=%d) — GPU is now free; FSDP NCCL "
+                    "collectives can resume.",
+                    target_variant,
+                    os.getpid(),
+                )
             else:
                 _kunserve_ms(
                     "[KUNSERVE-MS] skip GLOBAL cuda graph capture: "
