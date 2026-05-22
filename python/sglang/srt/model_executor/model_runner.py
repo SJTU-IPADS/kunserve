@@ -2539,7 +2539,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     getattr(self.server_args, "ep_dispatch_algorithm", None),
                     self._balloon_global_expert_location_metadata is not None,
                 )
-                if self._balloon_global_expert_location_metadata is not None:
+                # For the sglang backend, CrossReplicaStandardDispatcher uses
+                # all_gather + reduce_scatter, so per-expert dispatch routing
+                # is not used. The BALLOON metadata maps some logical experts
+                # to GLOBAL physical positions that correspond to donated rows
+                # (rows 32..63 on both EP ranks) or out-of-bounds rows (>=64),
+                # which would cause cudaErrorIllegalAddress when
+                # ep_dispatch_algorithm=static remaps topk_ids at CUDA graph
+                # replay time.  Skip the update for the sglang path.
+                if (
+                    self._balloon_global_expert_location_metadata is not None
+                    and str(self._balloon_kunserve_comm_backend or "").lower()
+                    != "sglang"
+                ):
                     self._update_live_expert_location_metadata(
                         self._balloon_global_expert_location_metadata
                     )

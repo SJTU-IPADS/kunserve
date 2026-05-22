@@ -855,7 +855,10 @@ class KunServeController:
                 # existing global-group path when lane groups are
                 # missing.  Only meaningful for the sglang comm backend;
                 # the DeepEP path does its own dispatch coordination.
-                if self.runtime_backend.comm_backend == "sglang":
+                if self.runtime_backend.comm_backend == "sglang" and not (
+                    os.environ.get("KUNSERVE_DISABLE_LANE_SUBGROUPS", "")
+                    in ("1", "true", "True", "yes")
+                ):
                     try:
                         await self._ensure_lane_subgroups(
                             plan=plan,

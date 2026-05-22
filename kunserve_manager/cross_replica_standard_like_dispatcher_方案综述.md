@@ -1079,10 +1079,11 @@ model_runner.py:forward_idle()
 
 ## 9. pre-capture 用这个例子怎么理解？
 
-> **状态更新（Phase D 已实现）**：sglang backend 的 fixed_padded GLOBAL graph capture 路径已经落地。
-> 触发：`KUNSERVE_CAPTURE_POLICY=fixed_padded`（默认仍 `disabled` 不破坏旧 smoke）。
-> 实现细节见 §9.4 和 [`kunserve_implementation_detail.md`](kunserve_implementation_detail.md) 的 Phase D 章节。
-> 本节保留原始动机描述以便后续接手的人理解为什么需要 pre-capture，再继续读 §9.4 的当前实现。
+> **状态更新（Phase D + Phase F 已实现）**：
+> - **Phase D（fixed_padded GLOBAL graph capture）** 已落地。触发：`KUNSERVE_CAPTURE_POLICY=fixed_padded`。dispatcher 双路径：capture 流走静态 buffer + `all_gather_into_tensor`。
+> - **Phase F（lane subgroup 优化）** 已落地。dispatcher 构造函数接受 `lane_group` + `local_tp_group`，dispatch 用 lane all_gather 消除 `[A,A,B,B]` 冗余，combine 用 `lane.reduce_scatter_tensor + local_tp.all_reduce` 替代 global all_reduce。PG 通过 manager 的 `kunserve_pg_names` 传入。
+> - 默认仍 `disabled` 不破坏旧 smoke。实现细节见 [kunserve_implementation_detail.md §6.6](kunserve_implementation_detail.md)。
+> 本节保留原始动机描述以便后续接手理解为什么需要 pre-capture。
 
 ### 9.1 没有 pre-capture 会怎样？
 
@@ -1529,30 +1530,15 @@ replica1 不 hang
 最后请求能正常结束
 ```
 
-### Phase F：实现 lane subgroup 优化
+### Phase F：实现 lane subgroup 优化【已完成】
 
-新增更通用的 `/kunserve/init_process_group`，支持：
+**实现状态**：✅ 已落地。dispatcher 构造函数接受 `lane_group` + `local_tp_group`。dispatch 用 `lane_group.all_gather_into_tensor` 直接得到 `[A, B]`，无 `[A,A,B,B]` 冗余。combine 用 `lane_group.reduce_scatter_tensor + local_tp_group.all_reduce` 替代 global all_reduce，每个 rank 只收 replica 维度的切片。lane group PG 通过 manager 的 `kunserve_pg_names`（`lane_0`/`lane_1`）传入，由 `init_weights_update_group` 的 `lane_only_tp_rank` 模式创建。
 
-```text
-lane0_pg = [rank0, rank2]
-lane1_pg = [rank1, rank3]
-```
+Phase F 同时优化 dispatch 和 combine 两侧：
+- **dispatch 侧**：消除 `[A,A,B,B]` 网络冗余。compared to global all-gather，dispatch 阶段字节数从 `world * M * H` 降到 `num_replicas * M * H`
+- **combine 侧**：`reduce_scatter_tensor`（lane subgroup 内 reduce + 按 replica 切分）+ `local_tp_group.all_reduce`（合并两条 lane 贡献）。等价于 all_reduce 但网络字节数 ≈ 减半
 
-dispatcher 从 `global_dense_v0` 切到 `lane_exchange_v1`。
-
-**这个 phase 同时解锁 dispatch 和 combine 两侧的通信优化**：
-
-- **dispatch 侧**：消除 `[A,A,B,B]` 网络冗余。当前 P0 global all-gather 把 A 在 rank0/rank1 都发了一份、B 在 rank2/rank3 都发了一份。lane subgroup `[rank0, rank2]` / `[rank1, rank3]` 内的 all-gather 只产生 `[A, B]`，无冗余。
-- **combine 侧**：当前 `dist.all_reduce` 等价于 `reduce_scatter + all_gather`。reduce 部分（每个 rank 把 partial expert 输出加起来）是 MoE partition 决定的数学必要；但 all_gather 部分把完整 `[2*M, H]` union 发到每个 rank 是浪费——replica0 的两个 rank 只用 `[0:M]`、replica1 的两个 rank 只用 `[M:2*M]`。两阶段拆分：
-  ```
-  Stage 1: lane subgroup [rank0,rank2] / [rank1,rank3] 内 reduce_scatter
-           输入 [2*M, H]，输出 [M, H]：lane 内的 partial 已经按 replica 切好
-  Stage 2: local TP group [rank0,rank1] / [rank2,rank3] 内 all_reduce
-           合并两条 lane 的贡献 → 每个 rank 得到自己 replica 完整 [M, H]
-  ```
-  combine 阶段网络字节数 ≈ 砍一半。
-
-两个优化共享同一组 lane subgroup PG，单独做 combine 优化不划算，必须和 lane subgroup 一起上线。
+回退策略：当 `lane_group` 或 `local_tp_group` 为 None，dispatcher 透明回退到 Phase D global group 路径。
 
 ### Phase G（可选）：token-level all-to-all（DeepEP 思路，不依赖 DeepEP 实现）
 
