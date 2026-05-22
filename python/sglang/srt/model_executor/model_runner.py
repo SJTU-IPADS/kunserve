@@ -1979,27 +1979,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 label,
                                 exc,
                             )
-                # After NCCL preheat on the default stream, synchronize
-                # every rank and the GPU so the graph-capture stream (which
-                # will be a *different* stream) sees fully-initialised
-                # communicators.  Without this barrier the very first
-                # lane-group all_gather inside the warmup runs can race
-                # with residual NCCL bootstrap work and produce
-                # cudaErrorIllegalAddress.
+                # KUNSERVE-DBG: GLOBAL cuda-graph capture's first warmup
+                # run faults inside torch.embedding() with
+                # cudaErrorIllegalAddress (confirmed via
+                # CUDA_LAUNCH_BLOCKING=1).  Probe the input-embedding
+                # weight — a plain, non-VMM tensor — here, on the default
+                # stream, *before* entering the graph-capture context.
+                # This bisects the failure:
+                #   probe raises  -> device memory was already corrupt
+                #                    after GLOBAL bundle registration /
+                #                    NCCL preheat above;
+                #   probe passes  -> the weight is intact entering
+                #                    capture, so the corruption is
+                #                    introduced by the capture machinery
+                #                    (graph memory pool / variant switch /
+                #                    capture stream), not anything before.
+                # NOTE: do NOT probe self.model.parameters() broadly — the
+                # VMM MoE weight tensors have virtual-only rows 32..63 that
+                # fault on access by design; only the embedding is safe.
                 if (
                     backend_lower == "sglang"
                     and policy_lower == "fixed_padded"
                 ):
-                    try:
-                        _grp = self._resolve_balloon_process_group(
-                            process_group_name
-                        )
-                        if _grp is not None:
-                            dist.barrier(group=_grp)
-                    except Exception:
-                        pass
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                    _emb_weight = None
+                    for _mod_name, _mod in self.model.named_modules():
+                        if _mod_name.endswith("embed_tokens"):
+                            _emb_weight = getattr(_mod, "weight", None)
+                            break
+                    if _emb_weight is not None:
+                        try:
+                            _probe_val = float(
+                                _emb_weight.detach().sum().item()
+                            )
+                            torch.cuda.synchronize()
+                            _kunserve_ms(
+                                "[KUNSERVE-DBG] pre-capture "
+                                "embed_tokens.weight probe OK: shape=%s "
+                                "dtype=%s device=%s sum=%.4f",
+                                tuple(_emb_weight.shape),
+                                _emb_weight.dtype,
+                                _emb_weight.device,
+                                _probe_val,
+                            )
+                        except Exception as exc:
+                            _kunserve_ms(
+                                "[KUNSERVE-DBG] pre-capture "
+                                "embed_tokens.weight probe FAILED: %r -- "
+                                "embedding weight is ALREADY corrupt "
+                                "before GLOBAL cuda-graph capture; root "
+                                "cause is in GLOBAL bundle registration / "
+                                "NCCL preheat, NOT the capture itself.",
+                                exc,
+                            )
+                            raise
                 self.ensure_cuda_graph_variant_captured(target_variant)
             else:
                 _kunserve_ms(
