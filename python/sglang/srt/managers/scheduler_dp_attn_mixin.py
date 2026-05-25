@@ -259,6 +259,7 @@ class SchedulerDPAttnMixin:
         self: Scheduler,
         target_bs: int = 0,
         dummy_kv_slot: Optional[int] = None,
+        phantom_req_idx: Optional[int] = None,
     ) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
@@ -270,6 +271,8 @@ class SchedulerDPAttnMixin:
             self.spec_algorithm,
         )
         idle_batch.prepare_for_idle(
-            target_bs=int(target_bs), dummy_kv_slot=dummy_kv_slot
+            target_bs=int(target_bs),
+            dummy_kv_slot=dummy_kv_slot,
+            phantom_req_idx=phantom_req_idx,
         )
         return idle_batch

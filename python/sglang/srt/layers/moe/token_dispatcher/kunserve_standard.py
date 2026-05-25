@@ -138,6 +138,41 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._last_max_m: Optional[int] = None
         self._last_slice_start: Optional[int] = None
         self._logged_shape: bool = False
+        # KUNSERVE-DBG probe: per-dispatcher call counter so we can sample
+        # numerical stats at logarithmic intervals (call 1, 5, 20, ...)
+        # without spamming the log.  Enabled by env var KUNSERVE_DISPATCH_PROBE=1.
+        # IMPORTANT: scheduler subprocess's logger.warning is invisible from
+        # the Ray driver capture; we must append to KUNSERVE_DETAIL_LOG file
+        # directly (same trick as _kunserve_ms in model_runner.py).
+        import os as _os
+        self._probe_enabled: bool = _os.environ.get(
+            "KUNSERVE_DISPATCH_PROBE", ""
+        ) in ("1", "true", "True", "yes")
+        self._probe_detail_log_path: Optional[str] = _os.environ.get(
+            "KUNSERVE_DETAIL_LOG"
+        )
+        self._dispatch_call_count: int = 0
+        self._combine_call_count: int = 0
+        self._probe_milestones = {1, 5, 20, 100, 500, 2000}
+        # G0 (option B): upcast bf16 -> fp32 for lane reduce_scatter to
+        # eliminate bf16 LSB drift in the cross-rank sum.  The downstream
+        # forward_normal still does bf16 tp_all_reduce so this fixes the
+        # lane stage only, not the TP stage.  Gated by env var for easy A/B.
+        self._fp32_reduce: bool = _os.environ.get(
+            "KUNSERVE_FP32_REDUCE", ""
+        ) in ("1", "true", "True", "yes")
+        self._probe_log(
+            f"fp32_reduce_enabled={self._fp32_reduce} "
+            f"rank={self.global_rank}"
+        )
+        # One-shot init diagnostic so we can confirm env-var propagation
+        # to the scheduler subprocess from the file content.
+        self._probe_log(
+            f"probe_init enabled={self._probe_enabled} "
+            f"detail_log={self._probe_detail_log_path!r} "
+            f"rank={self.global_rank} replica={self.replica_rank} "
+            f"lane={self.lane_rank} phase_f={self.phase_f_enabled}"
+        )
 
         # Static buffers for the fixed-padded capture path.  We pre-allocate
         # in the constructor (default cuda pool, not the cuda graph private
@@ -408,6 +443,49 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             remapped[valid] = mapping[topk_ids[valid].to(dtype=torch.long)]
         return remapped
 
+    def _probe_log(self, message: str) -> None:
+        """Append a probe line directly to KUNSERVE_DETAIL_LOG.
+
+        We can't rely on logger.warning here because dispatcher code runs
+        inside the SGLang scheduler subprocess, whose stdout/stderr is not
+        captured by Ray.  Mirror the _kunserve_ms file-append trick from
+        model_runner.py so probe events actually land in
+        ``kunserve_sglang_detail.log``.  Never raises.
+        """
+        if not self._probe_detail_log_path:
+            return
+        try:
+            import datetime as _dt
+            import os as _os
+            ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            line = f"[{ts} pid={_os.getpid()}] [KUNSERVE-DBG] {message}\n"
+            with open(self._probe_detail_log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _stats(t: torch.Tensor) -> str:
+        """Cheap numerical fingerprint for probe logs.  Includes mean/max/min,
+        finite-only mean (to detect nan/inf masking real values), nan/inf
+        counts.  Synchronous to ensure values are read after the previous
+        collective completes -- only call in probe paths."""
+        try:
+            tf = t.detach().float()
+            n_nan = int(torch.isnan(tf).sum().item())
+            n_inf = int(torch.isinf(tf).sum().item())
+            finite = tf[torch.isfinite(tf)]
+            if finite.numel() > 0:
+                return (
+                    f"shape={tuple(t.shape)} dtype={t.dtype} "
+                    f"mean={finite.mean().item():.4e} "
+                    f"absmax={finite.abs().max().item():.4e} "
+                    f"nan={n_nan} inf={n_inf}"
+                )
+            return f"shape={tuple(t.shape)} dtype={t.dtype} all_non_finite nan={n_nan} inf={n_inf}"
+        except Exception as exc:
+            return f"shape={tuple(t.shape)} dtype={t.dtype} stats_err={exc!r}"
+
     def _dispatch_dynamic(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput, local_m: int
     ) -> StandardDispatchOutput:
@@ -465,12 +543,54 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             )
             self._logged_shape = True
 
+        remapped_topk = self._remap_topk_ids(union_topk_ids)
+
+        self._dispatch_call_count += 1
+        if self._probe_enabled and self._dispatch_call_count in self._probe_milestones:
+            # Histogram of remapped_topk: how many tokens have a valid local
+            # row index (0..num_local-1) vs invalid (-1).  If too few valid
+            # tokens, the topk routing is mismatched with what this rank
+            # actually holds.
+            try:
+                rt = remapped_topk.detach().to(torch.int64)
+                valid_count = int(((rt >= 0) & (rt < self.num_local_experts)).sum().item())
+                neg_count = int((rt == -1).sum().item())
+                total = int(rt.numel())
+                # Also log the unique global expert ids that DID get routed to
+                # this rank (so we can verify they match the rank's intended
+                # expert range).  Limit to first 16 unique to keep log small.
+                global_routed = union_topk_ids[(rt >= 0) & (rt < self.num_local_experts)]
+                if global_routed.numel() > 0:
+                    uniq, counts = torch.unique(
+                        global_routed.detach().to(torch.int64), return_counts=True
+                    )
+                    uniq = uniq.tolist()[:16]
+                    counts = counts.tolist()[:16]
+                    routed_summary = list(zip(uniq, counts))
+                else:
+                    routed_summary = []
+            except Exception as exc:
+                valid_count = neg_count = total = -1
+                routed_summary = f"<err: {exc!r}>"
+            self._probe_log(
+                f"dispatch_probe call={self._dispatch_call_count} "
+                f"rank={self.global_rank} replica={self.replica_rank} "
+                f"lane={self.lane_rank} phase_f={self.phase_f_enabled} "
+                f"local_m={local_m} max_m={max_m} | "
+                f"hidden_in={self._stats(hidden_states)} | "
+                f"union_hidden={self._stats(union_hidden)} | "
+                f"union_topk_ids={self._stats(union_topk_ids.float())} | "
+                f"remapped_topk={self._stats(remapped_topk.float())} | "
+                f"routing valid={valid_count}/{total} neg={neg_count} "
+                f"routed_global_experts={routed_summary}"
+            )
+
         return StandardDispatchOutput(
             hidden_states=union_hidden,
             hidden_states_scale=None,
             topk_output=StandardTopKOutput(
                 topk_weights=union_topk_weights,
-                topk_ids=self._remap_topk_ids(union_topk_ids),
+                topk_ids=remapped_topk,
                 router_logits=router_logits,
             ),
         )
@@ -490,20 +610,51 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             # forward_normal in the model layer already calls
             # tensor_model_parallel_all_reduce after experts().  Doing it
             # here too would double-reduce and overflow after many layers.
+            #
+            # G0 (option B): when KUNSERVE_FP32_REDUCE=1, upcast to fp32
+            # before the lane reduce_scatter to eliminate bf16 LSB drift
+            # at the lane stage.  Downstream tp_all_reduce stays in bf16
+            # but the lane stage typically dominates noise contribution
+            # because it sums 2 contributions per output (vs tp_all_reduce
+            # also 2).  Cast back to bf16 at the boundary so the rest of
+            # the layer (residual add, layernorm next layer) sees bf16.
             max_m = int(self._last_max_m)
             H = hidden_states.shape[1]
+            if self._fp32_reduce:
+                hidden_for_reduce = hidden_states.float()
+                reduce_dtype = torch.float32
+            else:
+                hidden_for_reduce = hidden_states
+                reduce_dtype = hidden_states.dtype
             local_slice = torch.empty(
                 (max_m, H),
-                dtype=hidden_states.dtype,
+                dtype=reduce_dtype,
                 device=hidden_states.device,
             )
             dist.reduce_scatter_tensor(
                 local_slice,
-                hidden_states,
+                hidden_for_reduce,
                 op=dist.ReduceOp.SUM,
                 group=self.lane_group,
             )
-            return local_slice[: int(self._last_local_m)].contiguous()
+            if self._fp32_reduce:
+                local_slice = local_slice.to(hidden_states.dtype)
+            result = local_slice[: int(self._last_local_m)].contiguous()
+            self._combine_call_count += 1
+            if (
+                self._probe_enabled
+                and self._combine_call_count in self._probe_milestones
+            ):
+                self._probe_log(
+                    f"combine_probe call={self._combine_call_count} "
+                    f"rank={self.global_rank} replica={self.replica_rank} "
+                    f"lane={self.lane_rank} phase_f=True "
+                    f"last_local_m={int(self._last_local_m)} last_max_m={max_m} | "
+                    f"post_expert_union={self._stats(hidden_states)} | "
+                    f"reduce_scatter_out={self._stats(local_slice)} | "
+                    f"sliced={self._stats(result)}"
+                )
+            return result
 
         # Phase D fallback: global all_reduce on the union, then slice.
         # WARNING: this path has the same double-TP-all_reduce hazard as

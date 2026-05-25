@@ -714,6 +714,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # future restore.
         self._kunserve_keepalive_dummy_kv_slot_tensor: Optional[torch.Tensor] = None
         self._kunserve_keepalive_dummy_kv_slot: Optional[int] = None
+        # Phase E phantom req_pool entry: a permanent req_pool slot whose
+        # ``req_to_token`` row is pre-populated with ``dummy_kv_slot``, so
+        # the IDLE keepalive batch's attention kernel can read kv at a
+        # known-valid slot regardless of real-request state.  Allocated
+        # next to the dummy KV slot at commit_balloon and freed at
+        # restore_from_balloon.  None when not in BALLOON or alloc failed.
+        self._kunserve_keepalive_phantom_req_idx: Optional[int] = None
         self._balloon_local_expert_location_metadata = local_metadata
         self._balloon_global_expert_location_metadata = None
         self._balloon_prepared_active_mappings: Dict[int, torch.Tensor] = {}
@@ -1559,56 +1566,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             # CrossReplicaStandardDispatcher (sglang backend) uses each
-            # rank's OWN local weight tensor rows (0..num_local_experts-1)
-            # via the all_gather+reduce pattern — no VMM weight expansion.
+            # rank's OWN local weight tensor rows for the experts it kept
+            # after balloon donation.  The controller sends the correct
+            # narrow range:
+            #   replica 0 ranks: mapping=[0..31]  -> rows 0..31 hold the
+            #     LOWER half of each rank's original 64 experts
+            #     (rank 0: experts 0-31; rank 1: experts 64-95)
+            #   replica 1 ranks: mapping=[32..63] -> rows 32..63 hold the
+            #     UPPER half of each rank's original 64 experts
+            #     (rank 2: experts 32-63; rank 3: experts 96-127)
             #
-            # The VMM tensor has 64 rows for a 32-expert partition:
-            #   rows 0..31  — physical backing, always accessible
-            #   rows 32..63 — virtual-only, inaccessible until prepare_balloon
+            # Together the 4 ranks cover all 128 physical experts uniquely,
+            # which is exactly what the SWAP in
+            # logical_to_rank_dispatch_physical_map sets up (logical 32 ->
+            # physical 64 on rank 2, logical 64 -> physical 32 on rank 1).
             #
-            # For replica 0, the controller sends mapping=[0..31] → correct.
-            # For replica 1, the controller sends mapping=[32..63] — this is
-            # the DeepEP layout where rows 32..63 hold borrowed donor experts.
-            # But for the sglang path replica 1 also computes its OWN local
-            # experts (rows 0..31 of its own weight tensor); the dispatcher
-            # handles cross-replica token routing, not weight re-indexing.
-            #
-            # Passing mapping=[32..63] to build_dense_expert_runtime_tensors
-            # calls w13_weight.narrow(0, 32, 32) → a view into VMM rows 32..63
-            # → cudaErrorIllegalAddress during warmup capture.
-            # Passing mapping=None returns the full 64-row VMM tensor; the
-            # Triton runner reads E = w13.shape[0] = 64 and still tries to
-            # access rows 32..63 → same crash.
-            #
-            # Fix: always use the identity mapping [0..num_local_experts-1] for
-            # the sglang path.  build_dense_expert_runtime_tensors narrows to
-            # rows 0..31 (always accessible), and the Triton kernel sees E=32.
-            # The DeepEP/Mooncake paths keep the original mapping because they
-            # DO expand the weight tensor via VMM (rows 32..63 become accessible
-            # after prepare_balloon/commit_balloon).
+            # Earlier code used an unconditional `arange(num_local)` override
+            # claiming rows 32..63 caused cudaErrorIllegalAddress during
+            # warmup.  We verified (KUNSERVE_WEIGHT_PROBE in session
+            # 2026-05-24) that rows 32..63 are physically backed and the
+            # checksum of rank 2's rows 32..63 differs from rank 0's rows
+            # 0..31 -- they DO hold the upper-half experts the controller
+            # intended.  The override was causing replica 1's Triton kernel
+            # to read the LOWER half (duplicate of replica 0's experts),
+            # so experts 32..63 and 96..127 were never computed and tokens
+            # routed to those experts got garbage logits -> post-balloon
+            # output degraded into noise (e.g. "so. the. so. seeking.").
+            # See phase_e_keepalive_dilemma.md and the override-bug section
+            # of cross_replica_standard_like_dispatcher_方案综述.md for
+            # the full trail.
+            active_mapping = mapping
             sglang_path = (
                 kunserve_comm_backend == "sglang"
                 and explicit_global_dispatcher is not None
             )
-            if sglang_path:
-                num_local = int(mapping.numel())
-                active_mapping = torch.arange(num_local, dtype=torch.int32)
-                if int(layer.layer_id) == 0:
-                    _kunserve_ms(
-                        "[KUNSERVE-DBG] sglang GLOBAL bundle: overriding active_mapping "
-                        "from [%d..%d] → [0..%d] so Triton kernel sees E=%d rows "
-                        "(rows 0..%d are VMM-accessible before prepare_balloon); "
-                        "tp_rank=%s global_rank=%s",
-                        int(mapping[0].item()),
-                        int(mapping[-1].item()),
-                        num_local - 1,
-                        num_local,
-                        num_local - 1,
-                        self.tp_rank,
-                        resolved_moe_ep_rank,
-                    )
-            else:
-                active_mapping = mapping
+            if sglang_path and int(layer.layer_id) == 0:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] sglang GLOBAL bundle: preserving controller "
+                    "active_mapping=[%d..%d] (NO override); "
+                    "tp_rank=%s global_rank=%s",
+                    int(mapping[0].item()),
+                    int(mapping[-1].item()),
+                    self.tp_rank,
+                    resolved_moe_ep_rank,
+                )
             layer.register_runtime_bundle(
                 variant="global",
                 moe_runner_config=global_runner_config,
@@ -2613,6 +2614,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         exc,
                     )
 
+                # Phase E phantom req_pool entry.  The keepalive batch's
+                # IDLE attention reads kv via req_to_token[req_pool_idx][t]
+                # → kv_cache[that slot].  Without a dedicated phantom entry
+                # the IDLE batch would default to req_pool index 0, whose
+                # req_to_token row holds STALE slot indices from previous
+                # real requests; those slots may have been freed and now
+                # belong to other reqs (or to the donated KV pool segments
+                # after balloon).  Reading there triggers cudaErrorIllegal
+                # Address in the attention kernel.  Instead, claim one
+                # req_pool slot at balloon commit and pre-populate its
+                # entire req_to_token row with dummy_kv_slot, so attention
+                # reads always land on the dummy.  Done after dummy KV
+                # alloc above so we can populate immediately.
+                if (
+                    self._kunserve_keepalive_dummy_kv_slot is not None
+                    and self._kunserve_keepalive_phantom_req_idx is None
+                    and self.req_to_token_pool is not None
+                ):
+                    try:
+                        pool = self.req_to_token_pool
+                        if pool.free_slots:
+                            # pop from the tail so we don't disturb the
+                            # head order real allocs see.
+                            phantom_idx = int(pool.free_slots.pop())
+                            pool.req_to_token[phantom_idx, :] = int(
+                                self._kunserve_keepalive_dummy_kv_slot
+                            )
+                            self._kunserve_keepalive_phantom_req_idx = phantom_idx
+                            _kunserve_ms(
+                                "[KUNSERVE-MS] keepalive phantom req_pool entry "
+                                "reserved: idx=%d -> dummy_kv_slot=%d "
+                                "(req_pool free_remain=%d)",
+                                phantom_idx,
+                                self._kunserve_keepalive_dummy_kv_slot,
+                                len(pool.free_slots),
+                            )
+                        else:
+                            _kunserve_ms(
+                                "[KUNSERVE-MS] keepalive phantom alloc failed: "
+                                "req_pool free_slots empty (UNSAFE: keepalive "
+                                "attention may read stale req_pool[0])"
+                            )
+                    except Exception as exc:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] keepalive phantom alloc raised: %r "
+                            "(UNSAFE: keepalive attention may read stale "
+                            "req_pool[0])",
+                            exc,
+                        )
+
             _kunserve_ms(
                 "[KUNSERVE-MS] commit done: state=balloon variant=%s offloaded=%d added_kv_slots=%d max_total_num_tokens=%d (graph replay RESUMED)",
                 self.get_cuda_graph_runtime_variant(),
@@ -2703,6 +2754,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._kunserve_keepalive_dummy_kv_slot_tensor = None
             self._kunserve_keepalive_dummy_kv_slot = None
+        # Phase E phantom req_pool entry: return it to the req_pool free
+        # list mirror-symmetric to the commit_balloon allocation.  This
+        # must happen before any req_pool resize / verification because the
+        # phantom index would otherwise look like a leaked allocation.
+        if (
+            self._kunserve_keepalive_phantom_req_idx is not None
+            and self.req_to_token_pool is not None
+        ):
+            try:
+                pool = self.req_to_token_pool
+                # Clear the row so any post-restore reader sees zeros, not
+                # the dummy_kv_slot value (which is no longer valid after
+                # the donor segments are returned).
+                pool.req_to_token[
+                    self._kunserve_keepalive_phantom_req_idx, :
+                ] = 0
+                pool.free_slots.append(
+                    int(self._kunserve_keepalive_phantom_req_idx)
+                )
+                _kunserve_ms(
+                    "[KUNSERVE-MS] keepalive phantom req_pool entry released: "
+                    "idx=%d (req_pool free_remain=%d)",
+                    self._kunserve_keepalive_phantom_req_idx,
+                    len(pool.free_slots),
+                )
+            except Exception as exc:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] keepalive phantom free failed: %r "
+                    "(leaking 1 req_pool slot; restore continues)",
+                    exc,
+                )
+            self._kunserve_keepalive_phantom_req_idx = None
         if self._balloon_added_slots > 0:
             self.token_to_kv_pool_allocator.shrink_tail(self._balloon_added_slots)
             returned = self._get_balloon_kv_cache().shrink_tail(

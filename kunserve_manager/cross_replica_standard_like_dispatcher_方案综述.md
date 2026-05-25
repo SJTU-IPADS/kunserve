@@ -2,6 +2,45 @@
 
 > 这版文档把旧版里“global process group / lane subgroup / padded all-gather / runtime bundle / idle keepalive / pre-capture”等抽象概念全部改成一个固定场景来解释：**两个 SGLang 实例，每个实例 TP=EP=2，总共 4 个 GPU rank**。先把这个例子讲透，再给实现规划。
 
+## 实现状态快查（2026-05-24）
+
+| Phase | 状态 | 一句话总结 |
+|-------|------|-----------|
+| Phase A: manager 重构 | ✅ 已落地 | `BackendStrategy` + `kunserve_pg_names` 协议 |
+| Phase B: backend 参数统一 | ✅ 已落地 | `--comm-backend sglang/deepep` |
+| Phase C: SGLang eager correctness | ✅ 已落地（2026-05-24 修复 active_mapping override bug） | `CrossReplicaStandardDispatcher` 动态路径，weight 路由 + 数值都用 probe 验证（`KUNSERVE_DISPATCH_PROBE=1`、`KUNSERVE_WEIGHT_PROBE=1`），BALLOON 后输出从乱码变成 coherent 数学推理 |
+| Phase D: fixed_padded pre-capture | ✅ 已落地 | `KUNSERVE_CAPTURE_POLICY=fixed_padded` 启用静态 buffer + graph 安全路径 |
+| Phase E: idle keepalive | ⏳ **脚手架完成，blocked on latent bug** | 外层控制流 bug + `prepare_for_idle(target_bs>0)` 内层 CUDA illegal access。详见 § 8.4 与 [phase_e_keepalive_dilemma.md](phase_e_keepalive_dilemma.md) |
+| Phase F: lane subgroup 优化 | ✅ 已落地 | `lane_group.all_gather + reduce_scatter`，消除 `[A,A,B,B]` 冗余 |
+| Phase G: token-level a2a | 🟡 可选未做 | 等 Phase F 收益榨干后再考虑 |
+
+**当前主要阻塞**：BALLOON 模式下副本完成时间不均衡时，先 drain 的副本 hang 在 lane collective（Phase E 未完整实现）。`CrossReplicaStandardDispatcher` 本身数值正确（probe 验证 + 多个 `finish=stop` 自然 EOS 证据）。
+
+**辅助调试工具（本 session 新增）**：
+- `KUNSERVE_DISPATCH_PROBE=1` 在 dispatcher 里打 stats（NaN/Inf/mean/absmax + 路由分布），写入 `KUNSERVE_DETAIL_LOG`。
+- `KUNSERVE_WEIGHT_PROBE=1` 在 `build_dense_expert_runtime_tensors` 打 weight checksum（narrowed slice vs alt slice），写入同 detail log。**关键调试武器**：用来确认每个 rank 的 weight 实际指向哪些 experts。
+- `SGLANG_STREAMING_PROMPT_ANSWER_LOG=<path>` 在 `async_sglang_server.py` 每请求完成时立刻 dump prompt+answer，规避 trainer-level hang 导致看不到任何文本。**核心验证武器**：BALLOON 路径的乱码只在响应尾部出现（开头 pre-balloon 都正常），必须检查尾部 token。
+
+## ⚠️ 历史 bug 与教训（2026-05-24）
+
+`model_runner.py:register_balloon_global_runtime_bundle` 曾有 sglang-only `active_mapping = arange(num_local)` override：强制把所有 rank 的 weight 都 narrow 到 rows 0-31。逻辑出发点是"rows 32-63 是 VMM 虚地址、warmup capture 会触发 `cudaErrorIllegalAddress`"。
+
+实际验证（`KUNSERVE_WEIGHT_PROBE`）结果：
+- 4 个 rank 的 rows 32-63 完全 accessible，warmup / prepare / forward 都不 crash。
+- override 让 replica 1 错读 rows 0-31（实际存的是镜像于 replica 0 的 lower-half experts，且这些 row 在 balloon 后已被回收为 KV 字节）→ experts 32-63 和 96-127 **永远没被计算** → BALLOON 后期输出退化成 `"so. the. so. seeking."` 死循环乱码。
+
+修复后（2026-05-24）：dispatcher 用 controller 给的原始 mapping（`[0..31]` for replica 0，`[32..63]` for replica 1）。weight checksum 实测：
+- rank 0 rows 0-31 sum = 1.472e+06，rank 2 rows 32-63 sum = 1.378e+06（不同 experts）✓
+- rank 1 rows 0-31 sum = 1.432e+06，rank 3 rows 32-63 sum = 1.322e+06（不同 experts）✓
+- 4 rank 共同覆盖 128 unique experts，符合 [Phase C 设计](#phase-c-sglang-eager-correctness)
+
+BALLOON 后输出从死循环乱码变成 `"Set ratio = 7 ⇒ (8 - k)/k = 7 ⇒ 8 - k = 7k"` 这种真实的代数推理。
+
+**教训**：dispatcher 数值健康（无 NaN/Inf、magnitude 合理）**不等于** 路由正确。错误的 weight↔expert 绑定也会产出"看起来合理但语义错误"的 logits。验证 dispatcher correctness 必须同时检查：
+1. weight 物理布局（`KUNSERVE_WEIGHT_PROBE`）
+2. dispatcher 数值（`KUNSERVE_DISPATCH_PROBE`）
+3. 实际输出文本的 TAIL（不只是开头）
+
 ---
 
 ## 0. 先固定一个贯穿全篇的具体场景
@@ -1065,15 +1104,48 @@ poll /kunserve/status
 
 但 MoE collective 是每个 decode step、每一层都发生。manager 不可能每一层去同步两个实例。
 
-所以 idle keepalive 必须在 SGLang scheduler 内部做。当前代码已经有雏形：
+所以 idle keepalive 必须在 SGLang scheduler 内部做。当前代码已经有完整脚手架：
 
 ```text
-scheduler.py:_maybe_get_balloon_keepalive_batch()
-schedule_batch.py:prepare_for_idle()
-model_runner.py:forward_idle()
+scheduler.py: _kunserve_phase_e_active / negotiate_balloon_step_bs /
+              _build_balloon_keepalive_batch / _stop_balloon_keepalive
+model_runner.py: negotiate_balloon_step_bs (cross-replica all_gather on
+                  runtime_group, returns (max, min) of local_bs)
+                 _kunserve_keepalive_dummy_kv_slot (在 commit_balloon 预留的
+                  KV scratch slot，让 keepalive batch 写 KV 不撞到真实请求)
+schedule_batch.py: prepare_for_idle(target_bs > 0) 构造 dummy DECODE-shape batch
+model_runner.py: forward_idle() 走标准 forward 路径，触发 lane collective
 ```
 
-下一步要把它从“为 DeepEP bug 修的 keepalive”整理成 KunServe GLOBAL collective 的正式数据面协议。
+### 8.4 当前实现状态（2026-05-24）
+
+**状态**：⏳ Phase E 部分实现，存在两个 bug 阻断完整落地。
+
+- **外层 bug（控制流）**：`scheduler.py:event_loop_overlap` 里 keepalive 构造
+  放在 `elif batch is None:` 分支末尾，**只在 `last_batch` 也为 None 时**才触发；
+  转换步（last_batch 是上一个真实 batch 在 result_queue 里，本步队列空）漏过去 →
+  此步本副本不发起 lane collective → 对端 lane.all_gather 死锁。`event_loop_normal`
+  路径没有这个问题（keepalive 在 run_batch 之前构造）。
+- **内层 latent bug（kernel 安全）**：`prepare_for_idle(target_bs > 0)` 把
+  `req_pool_indices = zeros(n)`，让所有 dummy token 都指向 req_pool[0]。在没有
+  真实请求时（或者真实请求刚被回收），req_pool[0] 对应的 kv 槽位可能不可读，
+  attention kernel 读时触发 `cudaErrorIllegalAddress`。这条路径**从未被实际触发过**
+  （因为外层 bug 总是先死锁），所以 latent bug 之前一直没暴露。修外层 → 内层立刻炸。
+
+完整诊断与推荐修复方案见 [phase_e_keepalive_dilemma.md](phase_e_keepalive_dilemma.md)。
+首选方案：在 `commit_balloon` 预分配一个永久的 "phantom" req_pool entry，把它的
+`req_to_token` 整行写成 `dummy_kv_slot`，让 keepalive batch 用
+`req_pool_indices = full(n, phantom_idx)` 而不是 zeros。
+
+### 8.5 临时缓解：每请求流式 dump prompt-answer
+
+在 Phase E 完整修好之前，rollout 一旦遇到不均衡负载就会 hang，导致 trainer 走
+不到 `exit_after_rollout` 的 prompt-answer.txt 写出步骤——所有已完成请求的文本都
+看不到。为了在 hang 也能验证 dispatcher 正确性，`async_sglang_server.py` 现在
+在每个请求完成时立刻把 prompt+decoded answer 追加写到
+`${SGLANG_STREAMING_PROMPT_ANSWER_LOG}_r${replica}.txt`。`compare_kunserve_vs_baseline.sh`
+默认设这个变量为 `${rundir}/prompt_answer_streaming.txt`。即使 run 最终被 SIGTERM，
+已完成请求的文本仍然保留在文件里可供检查。
 
 ---
 
@@ -1513,7 +1585,7 @@ jq '.internal_states[] | .balloon_status.captured_graph_variants' \
 # 期望进 BALLOON 后包含 ["local","global"]
 ```
 
-### Phase E：正式化 idle keepalive
+### Phase E：正式化 idle keepalive【脚手架已就绪，blocked on latent bug】
 
 构造不均衡请求：
 
@@ -1529,6 +1601,27 @@ replica0 balloon_keepalive_steps 持续增长
 replica1 不 hang
 最后请求能正常结束
 ```
+
+**当前状态（2026-05-24）**：脚手架已实现（`_kunserve_phase_e_active`、
+`negotiate_balloon_step_bs`、`_build_balloon_keepalive_batch`、
+`_kunserve_keepalive_dummy_kv_slot` 都已落地），但 `event_loop_overlap` 里 keepalive
+构造时机有外层 bug、`prepare_for_idle(target_bs > 0)` 里的 attention 读路径有
+未被触发过的内层 latent bug。两者都必须修才能完成 Phase E。详细诊断见
+[phase_e_keepalive_dilemma.md](phase_e_keepalive_dilemma.md)。
+
+推荐修复路径（按风险从低到高）：
+1. **phantom req_pool entry**：在 `commit_balloon` 预分配 1 个永久 req_pool 槽位，
+   将其 `req_to_token` 整行填 `dummy_kv_slot`；keepalive batch 用 `req_pool_indices = phantom_idx`
+   而不是 zeros。修内层 latent bug。
+2. **早绑定 keepalive**：把 `event_loop_overlap` 里的 keepalive 构造从底部 `elif` 提到
+   Phase E 协商之后、`run_batch` 之前；修外层控制流 bug。需要同时做 (1) 否则会暴露 latent bug。
+3. **不均衡负载验证**：跑 `MAX_RESPONSE_LENGTH=10000 TRAIN_BATCH_SIZE=2` 这种容易让
+   一个副本先 drain 的配置，确认 `start balloon keepalive` 日志出现且 lane collective
+   持续匹配。
+
+**当前临时缓解**：`async_sglang_server.py` 在请求完成时立刻流式 dump prompt+answer 到
+`${SGLANG_STREAMING_PROMPT_ANSWER_LOG}_r${replica}.txt`（详见 § 8.5）。Phase E hang
+即使发生，已完成请求的文本仍可保留供检查。
 
 ### Phase F：实现 lane subgroup 优化【已完成】
 

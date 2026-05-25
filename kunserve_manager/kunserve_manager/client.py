@@ -129,14 +129,14 @@ class KunServeHttpReplicaClient:
     host: str
     port: int
     model_path: str
-    timeout: float = 60.0
+    timeout: float = 120.0  # Increased from 60s to handle slower HTTP responses during peak load/GC
     # warmup_balloon does GLOBAL cuda graph capture which empirically takes
     # 5-10 minutes on H20 (deepgemm precompile + LL Buffer creation +
     # 35 batch sizes). The default 60s × 3 attempts (180s) is way too short —
     # in ab_20260506_172822 it triggered a false-positive "warmup failed"
     # while the capture was actually mid-flight. Override that one RPC.
     warmup_timeout: float = 600.0
-    max_attempts: int = 3
+    max_attempts: int = 5  # Increased from 3 to allow more retries for transient failures
     retry_delay: float = 2.0
     max_start_wait_time: float = 300.0
     max_connections: int = 64

@@ -1284,7 +1284,36 @@ class Scheduler(
                         self.negotiate_balloon_step_bs(local_padded)
                     )
 
-            if batch is not None:
+            # Phase E EARLY keepalive build (overlap loop).  The original
+            # elif at the bottom of this loop only fires when ``last_batch``
+            # is also None, leaving a one-step gap on the transition
+            # "last real batch still in result_queue" → "queue empty".
+            # During that gap the peer replica's lane_group.all_gather has
+            # no participant on this rank → deadlock until SILENCE_THRESHOLD
+            # or NCCL timeout kills the run.  Building the keepalive HERE
+            # (before run_batch) closes that gap.  Safe to do alongside an
+            # in-flight last_batch because (a) the phantom req_pool entry
+            # is distinct from any real request's req_pool slot, (b) the
+            # dummy_kv_slot is reserved permanently, and (c) the keepalive
+            # batch goes through the same overlap pipeline (result queued,
+            # popped on next iter).
+            real_batch_this_step = batch is not None
+            if (
+                batch is None
+                and phase_e_negotiated_max is not None
+                and phase_e_negotiated_max > 0
+                and phase_e_status is not None
+            ):
+                batch = self._build_balloon_keepalive_batch(
+                    int(phase_e_negotiated_max), phase_e_status
+                )
+            elif (
+                batch is None
+                and phase_e_negotiated_max == 0
+            ):
+                self._stop_balloon_keepalive("all replicas idle")
+
+            if real_batch_this_step:
                 self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
@@ -3219,20 +3248,25 @@ class Scheduler(
                 int(target_bs),
             )
 
-        # Pull the keepalive KV scratch slot from model_runner.  None
-        # means commit_balloon didn't reserve one (legacy DeepEP path,
-        # or alloc failed); prepare_for_idle will then fall back to
-        # slot 0 with a warning printed earlier.
+        # Pull the keepalive KV scratch slot and phantom req_pool entry
+        # from model_runner.  None means commit_balloon didn't reserve them
+        # (legacy DeepEP path, or alloc failed); prepare_for_idle will
+        # then fall back to slot 0 / req_pool[0] with a warning.
         dummy_kv_slot: Optional[int] = None
+        phantom_req_idx: Optional[int] = None
         model_runner = getattr(self.tp_worker, "model_runner", None)
         if model_runner is not None and int(target_bs) > 0:
             dummy_kv_slot = getattr(
                 model_runner, "_kunserve_keepalive_dummy_kv_slot", None
             )
+            phantom_req_idx = getattr(
+                model_runner, "_kunserve_keepalive_phantom_req_idx", None
+            )
 
         keepalive_batch = self.get_idle_batch(
             target_bs=int(max(target_bs, 0)),
             dummy_kv_slot=dummy_kv_slot,
+            phantom_req_idx=phantom_req_idx,
         )
         # Same shape-fixup as before: force attn_tp_size dummy tokens for
         # mlp_sync paths so the DP-attention scatter doesn't see [0,0]

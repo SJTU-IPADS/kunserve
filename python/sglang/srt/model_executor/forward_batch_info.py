@@ -457,7 +457,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
-            ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            # KunServe Phase E: an IDLE batch with target_bs > 0 carries
+            # ``batch_size()`` dummy decode tokens whose positions need to
+            # be valid indices, otherwise the attention kernel reads
+            # ``positions[i]`` for i in 0..batch_size-1 from a size-0
+            # tensor and triggers cudaErrorIllegalAddress.  We use
+            # zeros(batch_size) -- the dummy tokens point at position 0
+            # of the phantom req_pool entry whose req_to_token row was
+            # pre-populated with dummy_kv_slot at commit_balloon time
+            # (see ModelRunner._kunserve_keepalive_phantom_req_idx), so
+            # reads land on the dummy slot regardless of position.  The
+            # legacy IDLE path (target_bs == 0) keeps the original
+            # zero-size tensor.
+            # ModelWorkerBatch has no batch_size() method; use len(input_ids).
+            n = int(len(batch.input_ids)) if batch.input_ids is not None else 0
+            if n > 0:
+                ret.positions = torch.zeros(n, dtype=torch.int64, device=device)
+            else:
+                ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
 
         # Override the positions with diffusion LLM or spec_info

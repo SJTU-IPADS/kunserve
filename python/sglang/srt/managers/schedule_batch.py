@@ -1929,7 +1929,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(
-        self, target_bs: int = 0, dummy_kv_slot: Optional[int] = None
+        self,
+        target_bs: int = 0,
+        dummy_kv_slot: Optional[int] = None,
+        phantom_req_idx: Optional[int] = None,
     ):
         """Build an IDLE batch.
 
@@ -1984,7 +1987,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.out_cache_loc = torch.full(
                 (n,), kv_loc_value, dtype=torch.int64, device=self.device
             )
-            self.req_pool_indices = torch.zeros(n, dtype=torch.int32, device=self.device)
+            # KunServe Phase E: point req_pool_indices at the phantom slot
+            # whose req_to_token[:] was pre-populated with dummy_kv_slot at
+            # commit_balloon time.  Without phantom_req_idx the IDLE batch
+            # would inherit req_pool[0] which holds stale kv-slot indices
+            # from the previously-finished real request -- those slots may
+            # have been freed and the attention kernel's KV read would
+            # trigger cudaErrorIllegalAddress.  See commit_balloon /
+            # _kunserve_keepalive_phantom_req_idx for the reservation.
+            phantom_value = (
+                int(phantom_req_idx) if phantom_req_idx is not None else 0
+            )
+            self.req_pool_indices = torch.full(
+                (n,), phantom_value, dtype=torch.int32, device=self.device
+            )
             self.seq_lens_sum = int(n)
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
