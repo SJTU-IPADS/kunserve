@@ -1101,22 +1101,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         other_map = getattr(metadata, "logical_to_rank_dispatch_physical_map", None)
         before = None
         after_other = None
-        if live_map is not None and live_map.numel() >= 65:
+        if live_map is not None and live_map.dim() >= 2 and live_map.shape[1] > 96:
             before = (
                 int(live_map[0, 0].item()),
                 int(live_map[0, 32].item()),
                 int(live_map[0, 64].item()),
+                int(live_map[0, 96].item()),
             )
-        if other_map is not None and other_map.numel() >= 65:
+        if other_map is not None and other_map.dim() >= 2 and other_map.shape[1] > 96:
             after_other = (
                 int(other_map[0, 0].item()),
                 int(other_map[0, 32].item()),
                 int(other_map[0, 64].item()),
+                int(other_map[0, 96].item()),
             )
         _kunserve_ms(
             "[KUNSERVE-DBG] _update_live_expert_location_metadata BEFORE: "
             "tp_rank=%s live_map_is_none=%s other_map_is_none=%s "
-            "live[layer0,(0,32,64)]=%s other[layer0,(0,32,64)]=%s",
+            "live[layer0,(0,32,64,96)]=%s other[layer0,(0,32,64,96)]=%s",
             getattr(self, "tp_rank", None),
             live_map is None,
             other_map is None,
@@ -1130,15 +1132,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             live_metadata, "logical_to_rank_dispatch_physical_map", None
         )
         after = None
-        if live_map_after is not None and live_map_after.numel() >= 65:
+        if (
+            live_map_after is not None
+            and live_map_after.dim() >= 2
+            and live_map_after.shape[1] > 96
+        ):
             after = (
                 int(live_map_after[0, 0].item()),
                 int(live_map_after[0, 32].item()),
                 int(live_map_after[0, 64].item()),
+                int(live_map_after[0, 96].item()),
             )
         _kunserve_ms(
             "[KUNSERVE-DBG] _update_live_expert_location_metadata AFTER: "
-            "tp_rank=%s live[layer0,(0,32,64)]=%s same_storage=%s",
+            "tp_rank=%s live[layer0,(0,32,64,96)]=%s same_storage=%s",
             getattr(self, "tp_rank", None),
             after,
             (
@@ -1497,18 +1504,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     local_tp_group = None
 
-                explicit_global_dispatcher = CrossReplicaStandardDispatcher(
-                    group=runtime_group,
-                    moe_runner_config=global_runner_config,
-                    local_expert_mapping=dispatcher_local_expert_mapping,
-                    local_ep_size=local_ep_size,
-                    replica_rank=resolved_moe_ep_rank // local_ep_size,
-                    global_rank=resolved_moe_ep_rank,
-                    world_size=resolved_ep_size,
-                    capture_max_m=resolved_capture_max_m,
-                    lane_group=lane_group,
-                    local_tp_group=local_tp_group,
+                # Phase G toggle: KUNSERVE_PHASE_G=1 selects token-level
+                # a2a dispatcher; default is Phase F dense all_gather +
+                # reduce_scatter dispatcher.
+                _phase_g = os.environ.get("KUNSERVE_PHASE_G", "") in (
+                    "1", "true", "True", "yes"
                 )
+                if _phase_g and lane_group is not None and local_tp_group is not None:
+                    from sglang.srt.layers.moe.token_dispatcher.kunserve_token_a2a import (
+                        CrossReplicaTokenA2ADispatcher,
+                    )
+                    explicit_global_dispatcher = CrossReplicaTokenA2ADispatcher(
+                        group=runtime_group,
+                        moe_runner_config=global_runner_config,
+                        local_expert_mapping=dispatcher_local_expert_mapping,
+                        local_ep_size=local_ep_size,
+                        replica_rank=resolved_moe_ep_rank // local_ep_size,
+                        global_rank=resolved_moe_ep_rank,
+                        world_size=resolved_ep_size,
+                        lane_group=lane_group,
+                        local_tp_group=local_tp_group,
+                    )
+                    if int(layer.layer_id) == 0:
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] GLOBAL bundle uses Phase G "
+                            "CrossReplicaTokenA2ADispatcher (token-level a2a): "
+                            "tp_rank=%s global_rank=%s",
+                            self.tp_rank,
+                            resolved_moe_ep_rank,
+                        )
+                else:
+                    explicit_global_dispatcher = CrossReplicaStandardDispatcher(
+                        group=runtime_group,
+                        moe_runner_config=global_runner_config,
+                        local_expert_mapping=dispatcher_local_expert_mapping,
+                        local_ep_size=local_ep_size,
+                        replica_rank=resolved_moe_ep_rank // local_ep_size,
+                        global_rank=resolved_moe_ep_rank,
+                        world_size=resolved_ep_size,
+                        capture_max_m=resolved_capture_max_m,
+                        lane_group=lane_group,
+                        local_tp_group=local_tp_group,
+                    )
                 # Use the normal Standard/Triton MoE core for the correctness
                 # backend. This avoids DeepEP/NVSHMEM and DeepGEMM entirely;
                 # the dispatcher itself performs global all-gather + all-reduce.
@@ -2530,7 +2567,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _kunserve_ms(
                     "[KUNSERVE-DBG] commit_balloon variant=global: "
                     "tp_rank=%s _balloon_global_expert_location_metadata is %s, "
-                    "ep_dispatch_algorithm=%s, will_call_update=%s",
+                    "ep_dispatch_algorithm=%s, comm_backend=%s, "
+                    "will_call_update=%s",
                     self.tp_rank,
                     (
                         "None"
@@ -2538,21 +2576,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else "set"
                     ),
                     getattr(self.server_args, "ep_dispatch_algorithm", None),
+                    self._balloon_kunserve_comm_backend,
                     self._balloon_global_expert_location_metadata is not None,
                 )
-                # For the sglang backend, CrossReplicaStandardDispatcher uses
-                # all_gather + reduce_scatter, so per-expert dispatch routing
-                # is not used. The BALLOON metadata maps some logical experts
-                # to GLOBAL physical positions that correspond to donated rows
-                # (rows 32..63 on both EP ranks) or out-of-bounds rows (>=64),
-                # which would cause cudaErrorIllegalAddress when
-                # ep_dispatch_algorithm=static remaps topk_ids at CUDA graph
-                # replay time.  Skip the update for the sglang path.
-                if (
-                    self._balloon_global_expert_location_metadata is not None
-                    and str(self._balloon_kunserve_comm_backend or "").lower()
-                    != "sglang"
-                ):
+                # The SGLang global dispatcher/runtimes still consume the
+                # dispatch-domain physical expert ids produced by the static
+                # topk remap. If this live metadata stays LOCAL while the
+                # FusedMoE bundle has switched to GLOBAL, logical experts from
+                # the donated half are routed to the wrong lane without an
+                # obvious collective error, which shows up as post-balloon
+                # generation drift.
+                if self._balloon_global_expert_location_metadata is not None:
                     self._update_live_expert_location_metadata(
                         self._balloon_global_expert_location_metadata
                     )
@@ -3611,15 +3645,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return True, "Process group already initialized."
 
+        timeout_sec = float(os.environ.get("KUNSERVE_PG_INIT_TIMEOUT_SEC", "60"))
+        pg_timeout = datetime.timedelta(seconds=max(1.0, timeout_sec))
+
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, "
+            f"backend={backend}, timeout={pg_timeout}"
         )
 
         try:
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
+                timeout=pg_timeout,
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
