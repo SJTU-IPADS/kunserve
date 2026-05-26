@@ -32,14 +32,15 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
       CUDA-graph-safe. Used for prefill, mismatched batch sizes, and any path
       that does not go through cuda graph replay.
 
-    * **Fixed-padded capture** (when ``capture_max_m`` is provided): the
+    * **Fixed-padded static** (when ``capture_max_m`` is provided): the
       constructor pre-allocates static buffers sized for ``capture_max_m``
-      rows per rank. While ``torch.cuda.is_current_stream_capturing()`` is
-      True the dispatcher uses ``all_gather_into_tensor`` + static slice
-      copies + ``all_reduce`` over those buffers, no host syncs, no
-      ``torch.empty_like`` inside the hot path. This is what makes
-      ``capture_policy=fixed_padded`` Phase D possible for the sglang
-      backend.
+      rows per rank. During graph-capture warmup/capture the dispatcher uses
+      fixed-shape collectives and static slice copies over those buffers, no
+      host syncs, no ``torch.empty_like`` inside the hot path. The fixed shapes
+      are necessary for CUDA graph capture, but the current cross-replica
+      groups still call raw ``torch.distributed`` collectives; those collectives
+      are not graph-safe unless replaced by SGLang registered/custom
+      collectives.
 
     The FusedMoE contract is preserved in both modes: ``dispatch`` takes
     ``hidden_states[local_m, H]`` for this replica and ``combine`` returns
@@ -334,16 +335,27 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
     # ------------------------------------------------------------------
 
     def _use_static_path(self) -> bool:
-        """Return True iff we should take the graph-safe static path.
+        """Return True iff we should take the fixed-shape static path.
 
-        Only chosen while a cuda graph is being captured.  Eager forward
-        (BALLOON without captured graph, or batch sizes outside capture_bs)
-        always falls through to the dynamic path.
+        During CUDA graph capture SGLang runs two warmup forwards before
+        entering ``torch.cuda.CUDAGraph`` capture.  Those warmups are inside
+        ``model_capture_mode()`` but ``torch.cuda.is_current_stream_capturing``
+        is still false, so key off both signals.  Eager BALLOON forward remains
+        dynamic unless it is part of graph capture/recapture.
         """
         if not self._static_buffers_ready:
             return False
         try:
-            return bool(torch.cuda.is_current_stream_capturing())
+            if torch.cuda.is_current_stream_capturing():
+                return True
+        except Exception:
+            return False
+        try:
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                get_is_capture_mode,
+            )
+
+            return bool(get_is_capture_mode())
         except Exception:
             return False
 
@@ -761,7 +773,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         mapping = self.local_expert_mapping  # already on device
         union_ids = self._buf_union_topk_ids
         valid = (union_ids >= 0) & (union_ids < self.num_experts)
-        safe_ids = torch.clamp(union_ids, min=0).to(dtype=torch.long)
+        safe_ids = torch.clamp(
+            union_ids, min=0, max=self.num_experts - 1
+        ).to(dtype=torch.long)
         looked = mapping[safe_ids].to(union_ids.dtype)
         self._buf_union_topk_ids_remapped.copy_(
             torch.where(valid, looked, self._neg_one_int32)

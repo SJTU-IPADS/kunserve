@@ -698,6 +698,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_runtime_variant = "local"
         self._balloon_prepared_variant = None
         self._balloon_graph_replay_enabled = True
+        self._balloon_global_cuda_graph_captured = False
         # Phase E per-step override: scheduler flips this on when the
         # cross-replica bs negotiation detects an asymmetric busy/busy
         # step that would otherwise replay graphs with mismatched NCCL
@@ -1036,13 +1037,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def cuda_graph_capture_variant_scope(self, variant: str):
         previous_variant = self.get_cuda_graph_runtime_variant()
         normalized_variant = self._normalize_balloon_variant(variant)
+        previous_metadata = None
+        metadata_switched = False
+        if not self.is_draft_worker and normalized_variant == "global":
+            live_metadata = get_global_expert_location_metadata()
+            global_metadata = getattr(
+                self, "_balloon_global_expert_location_metadata", None
+            )
+            if live_metadata is not None and global_metadata is not None:
+                previous_metadata = copy.deepcopy(live_metadata)
+                _kunserve_ms(
+                    "[KUNSERVE-MS] cuda graph capture metadata switch: "
+                    "variant=global previous_variant=%s tp_rank=%s",
+                    previous_variant,
+                    getattr(self, "tp_rank", None),
+                )
+                self._update_live_expert_location_metadata(global_metadata)
+                metadata_switched = True
         if previous_variant != normalized_variant:
             self._switch_all_fused_moe_runtime_bundles(normalized_variant)
         try:
             yield
         finally:
-            if previous_variant != normalized_variant:
-                self._switch_all_fused_moe_runtime_bundles(previous_variant)
+            try:
+                if previous_variant != normalized_variant:
+                    self._switch_all_fused_moe_runtime_bundles(previous_variant)
+            finally:
+                if metadata_switched and previous_metadata is not None:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] cuda graph capture metadata restore: "
+                        "previous_variant=%s tp_rank=%s",
+                        previous_variant,
+                        getattr(self, "tp_rank", None),
+                    )
+                    self._update_live_expert_location_metadata(previous_metadata)
 
     def get_cuda_graph_capture_variants(self) -> List[str]:
         variants = ["local"]
@@ -1858,26 +1886,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # ensure_cuda_graph_variant_captured short-circuits when the graph for
         # this variant is already in `self.graphs`.
         if capture_cuda_graph:
-            # Skip GLOBAL capture for known dynamic-shape data paths:
+            # Skip GLOBAL capture for known unsupported communication paths:
             #   - deepep + DEEPEP_NORMAL=True  → DeepEP NORMAL dispatch_a/b
             #     has dynamic shape (no NVSHMEM so we can't go to LL).
             #   - sglang + capture_policy != fixed_padded → the dispatcher
             #     stays in dynamic eager mode (no static buffers, host syncs
             #     present).
-            # The sglang+fixed_padded path uses pre-allocated static buffers
-            # in CrossReplicaStandardDispatcher and IS graph-safe.
+            #   - sglang + fixed_padded currently uses raw torch.distributed
+            #     ProcessGroupNCCL collectives on KunServe's custom
+            #     cross-replica groups. SGLang's graph_capture path explicitly
+            #     supports registered/custom collectives for graphs, not raw
+            #     torch.distributed collectives. Capturing those collectives can
+            #     poison NCCL/CUDA with illegal memory access.
             backend_lower = str(kunserve_comm_backend or "deepep").lower()
             policy_lower = str(capture_policy or "auto").lower()
-            if backend_lower == "sglang":
-                skip_capture = (
-                    target_variant == "global"
-                    and policy_lower != "fixed_padded"
-                )
-            else:
-                skip_capture = (
-                    target_variant == "global"
-                    and envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
-                )
+            allow_torch_dist_cudagraph = (
+                os.environ.get("KUNSERVE_ALLOW_TORCH_DIST_CUDAGRAPH", "")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+            skip_capture = False
+            skip_capture_reason = ""
+            if target_variant == "global":
+                if backend_lower == "sglang":
+                    if policy_lower != "fixed_padded":
+                        skip_capture = True
+                        skip_capture_reason = (
+                            "GLOBAL bundle uses a dynamic eager communication path"
+                        )
+                    elif not allow_torch_dist_cudagraph:
+                        skip_capture = True
+                        skip_capture_reason = (
+                            "sglang fixed_padded uses raw torch.distributed "
+                            "cross-replica NCCL process groups; SGLang "
+                            "graph_capture does not support those collectives "
+                            "inside CUDA graphs"
+                        )
+                else:
+                    skip_capture = bool(
+                        envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
+                    )
+                    if skip_capture:
+                        skip_capture_reason = (
+                            "DeepEP NORMAL uses a dynamic-shape eager "
+                            "communication path"
+                        )
             if not skip_capture:
                 # NCCL communicator preheat for the sglang fixed_padded
                 # path.  The static CrossReplicaStandardDispatcher uses
@@ -2092,9 +2146,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         # If THIS raises, the error is from a background
                         # GPU operation (NCCL side-effect), NOT from the
                         # embedding weight pointer.
-                        # If this passes but Phase 2 raises, the weight
-                        # data pointer itself is invalid (memory mapping
-                        # issue).
+                        # If this passes but an explicitly enabled
+                        # Phase 2 data probe raises, the weight data read
+                        # itself is invalid (memory mapping issue).
                         try:
                             torch.cuda.synchronize()
                             _kunserve_ms(
@@ -2113,31 +2167,92 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 _sync_exc,
                             )
                             raise
-                        # Phase 2: probe the embedding weight pointer.
-                        try:
-                            _probe_val = float(
-                                _emb_weight.detach().sum().item()
-                            )
+                        # Phase 2: optional data probe.  By default do
+                        # not launch a kernel over the embedding table here:
+                        # with CUDA VMM enabled, the old full-table sum could
+                        # be the first operation to fault and poison the CUDA
+                        # context before GLOBAL capture even starts.  Metadata
+                        # is enough for the default warmup path; set
+                        # KUNSERVE_PRECAPTURE_EMBED_PROBE=tiny or full when
+                        # explicitly debugging embedding storage.
+                        _probe_mode = os.environ.get(
+                            "KUNSERVE_PRECAPTURE_EMBED_PROBE", "metadata"
+                        ).strip().lower()
+                        if _probe_mode in (
+                            "1",
+                            "true",
+                            "yes",
+                            "tiny",
+                            "sample",
+                        ):
+                            try:
+                                _flat = _emb_weight.detach().reshape(-1)
+                                _n = min(16, int(_flat.numel()))
+                                _probe_val = (
+                                    float(_flat[:_n].float().sum().item())
+                                    if _n > 0
+                                    else 0.0
+                                )
+                                _kunserve_ms(
+                                    "[KUNSERVE-DBG] pre-capture "
+                                    "embed_tokens.weight tiny probe OK: "
+                                    "shape=%s dtype=%s device=%s "
+                                    "sample_n=%d sample_sum=%.4f",
+                                    tuple(_emb_weight.shape),
+                                    _emb_weight.dtype,
+                                    _emb_weight.device,
+                                    _n,
+                                    _probe_val,
+                                )
+                            except Exception as exc:
+                                _kunserve_ms(
+                                    "[KUNSERVE-DBG] pre-capture "
+                                    "embed_tokens.weight tiny probe FAILED "
+                                    "AFTER clean sync: %r -- CUDA context "
+                                    "is poisoned; aborting before capture.",
+                                    exc,
+                                )
+                                raise
+                        elif _probe_mode in ("full", "sum", "full_sum"):
+                            try:
+                                _probe_val = float(
+                                    _emb_weight.detach().sum().item()
+                                )
+                                _kunserve_ms(
+                                    "[KUNSERVE-DBG] pre-capture "
+                                    "embed_tokens.weight full probe OK: "
+                                    "shape=%s dtype=%s device=%s sum=%.4f",
+                                    tuple(_emb_weight.shape),
+                                    _emb_weight.dtype,
+                                    _emb_weight.device,
+                                    _probe_val,
+                                )
+                            except Exception as exc:
+                                _kunserve_ms(
+                                    "[KUNSERVE-DBG] pre-capture "
+                                    "embed_tokens.weight full probe FAILED "
+                                    "AFTER clean sync: %r -- CUDA context "
+                                    "is poisoned; aborting before capture.",
+                                    exc,
+                                )
+                                raise
+                        else:
+                            try:
+                                _data_ptr = int(_emb_weight.data_ptr())
+                                _data_ptr_text = hex(_data_ptr)
+                            except Exception as exc:
+                                _data_ptr_text = f"<unavailable: {exc!r}>"
                             _kunserve_ms(
                                 "[KUNSERVE-DBG] pre-capture "
-                                "embed_tokens.weight probe OK: shape=%s "
-                                "dtype=%s device=%s sum=%.4f",
+                                "embed_tokens.weight metadata: shape=%s "
+                                "dtype=%s device=%s data_ptr=%s "
+                                "probe_mode=%s (no device read)",
                                 tuple(_emb_weight.shape),
                                 _emb_weight.dtype,
                                 _emb_weight.device,
-                                _probe_val,
+                                _data_ptr_text,
+                                _probe_mode,
                             )
-                        except Exception as exc:
-                            _kunserve_ms(
-                                "[KUNSERVE-DBG] pre-capture "
-                                "embed_tokens.weight probe FAILED "
-                                "AFTER clean sync: %r -- "
-                                "the embedding weight DATA POINTER "
-                                "is invalid (GPU virtual address not "
-                                "backed / freed under us).",
-                                exc,
-                            )
-                            raise
                 _kunserve_ms(
                     "[KUNSERVE-MS] GLOBAL cuda graph capture BEGIN "
                     "(variant=%s pid=%d) — this blocks the GPU for "
@@ -2147,6 +2262,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     os.getpid(),
                 )
                 self.ensure_cuda_graph_variant_captured(target_variant)
+                if target_variant == "global":
+                    graph_runner = getattr(self, "graph_runner", None)
+                    self._balloon_global_cuda_graph_captured = bool(
+                        graph_runner is not None
+                        and hasattr(graph_runner, "has_captured_variant")
+                        and graph_runner.has_captured_variant(target_variant)
+                    )
                 _kunserve_ms(
                     "[KUNSERVE-MS] GLOBAL cuda graph capture COMPLETE "
                     "(variant=%s pid=%d) — GPU is now free; FSDP NCCL "
@@ -2155,11 +2277,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     os.getpid(),
                 )
             else:
+                if target_variant == "global":
+                    self._balloon_global_cuda_graph_captured = False
                 _kunserve_ms(
                     "[KUNSERVE-MS] skip GLOBAL cuda graph capture: "
-                    "GLOBAL bundle uses a dynamic eager communication path "
-                    "(comm_backend=%s, capture_policy=%s). BALLOON forward "
-                    "will run eager.",
+                    "%s (comm_backend=%s, capture_policy=%s). BALLOON "
+                    "forward will run eager. Set "
+                    "KUNSERVE_ALLOW_TORCH_DIST_CUDAGRAPH=1 only to reproduce "
+                    "the experimental raw torch.distributed capture path.",
+                    skip_capture_reason,
                     kunserve_comm_backend,
                     capture_policy,
                 )
@@ -2606,7 +2732,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._balloon_offloaded_local_experts = int(offload_local_experts)
             self._balloon_added_slots = int(added_slots)
             self._balloon_last_error = None
-            self._balloon_graph_replay_enabled = True
+            if target_variant == "global":
+                graph_runner = getattr(self, "graph_runner", None)
+                graph_replay_enabled = bool(
+                    graph_runner is not None
+                    and hasattr(graph_runner, "has_captured_variant")
+                    and graph_runner.has_captured_variant("global")
+                )
+                self._balloon_global_cuda_graph_captured = graph_replay_enabled
+                self._balloon_graph_replay_enabled = graph_replay_enabled
+                if not graph_replay_enabled:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] GLOBAL cuda graph replay disabled: "
+                        "no captured GLOBAL graph is available; BALLOON "
+                        "forward will use eager execution."
+                    )
+            else:
+                self._balloon_graph_replay_enabled = True
 
             # Phase E: reserve a dummy KV slot for keepalive batches.
             # Done after the KV pool has been expanded (so we draw from

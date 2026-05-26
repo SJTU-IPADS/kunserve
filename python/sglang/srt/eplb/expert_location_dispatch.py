@@ -106,15 +106,33 @@ class ExpertLocationDispatchInfo:
                         ep_dispatch_algorithm,
                     )
             else:
-                if _is_cuda_graph_capturing(partial_dispatch):
-                    sig = ("layer0_capture", ep_dispatch_algorithm)
+                probe_values = os.environ.get(
+                    "KUNSERVE_EXPERT_LOCATION_PROBE", ""
+                ).lower() in ("1", "true", "yes", "on")
+                is_capturing = _is_cuda_graph_capturing(partial_dispatch)
+                if is_capturing or not probe_values:
+                    sig = (
+                        "layer0_capture" if is_capturing else "layer0_metadata",
+                        ep_dispatch_algorithm,
+                        tuple(partial_dispatch.shape),
+                        str(partial_dispatch.device),
+                    )
                     if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
                         _KUNSERVE_DBG_LAST_SIG[sig] = True
+                        reason = (
+                            "cuda graph capture"
+                            if is_capturing
+                            else "probe disabled"
+                        )
                         _kunserve_dbg(
                             "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
-                            "first8=<skipped: cuda graph capture> logical32->phys=None "
-                            "logical64->phys=None",
+                            "first8=<skipped: %s> logical32->phys=None "
+                            "logical64->phys=None shape=%s dtype=%s device=%s",
                             ep_dispatch_algorithm,
+                            reason,
+                            tuple(partial_dispatch.shape),
+                            partial_dispatch.dtype,
+                            partial_dispatch.device,
                         )
                 else:
                     sample = (
