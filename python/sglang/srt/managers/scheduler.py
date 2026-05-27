@@ -153,6 +153,10 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.kunserve_forward_timing import (
+    kunserve_scheduler_gap_timing_enabled,
+    kunserve_timing_log,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -816,6 +820,17 @@ class Scheduler(
         self.expand_request_reason: Optional[str] = None
         self.balloon_keepalive_step_ct: int = 0
         self._balloon_keepalive_active = False
+        self._kunserve_prefill_blocked_full_log_ct: int = 0
+        self._kunserve_graph_prefill_defer_log_ct: int = 0
+        self._kunserve_phase_e_prefill_defer_log_ct: int = 0
+        self._phase_e_negotiate_interval: int = max(
+            1, get_int_env_var("KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL", 16)
+        )
+        self._phase_e_cache_valid: bool = False
+        self._phase_e_cached_max_bs: int = 0
+        self._phase_e_cached_min_bs: int = 0
+        self._phase_e_cached_any_force_eager: bool = False
+        self._phase_e_cached_steps_left: int = 0
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1168,18 +1183,89 @@ class Scheduler(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
 
+    def _kunserve_scheduler_gap_log(
+        self,
+        event: str,
+        start_ns: int,
+        *,
+        batch: Optional[ScheduleBatch] = None,
+        **fields: Any,
+    ) -> None:
+        if not kunserve_scheduler_gap_timing_enabled():
+            return
+
+        now_ns = time.perf_counter_ns()
+        payload: Dict[str, Any] = {
+            "elapsed_ms": round((now_ns - start_ns) / 1_000_000.0, 3),
+            "forward_ct": int(self.forward_ct),
+            "running": len(self.running_batch.reqs),
+            "waiting": len(self.waiting_queue),
+            "last_batch_mode": (
+                str(self.last_batch.forward_mode) if self.last_batch is not None else "None"
+            ),
+            "last_batch_size": (
+                int(self.last_batch.batch_size()) if self.last_batch is not None else 0
+            ),
+        }
+        if self._last_run_batch_end_ts is not None:
+            payload["since_last_run_end_ms"] = round(
+                (time.perf_counter() - self._last_run_batch_end_ts) * 1000.0,
+                3,
+            )
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is not None:
+            payload["result_queue_len"] = len(result_queue)
+        if batch is not None:
+            payload.update(
+                {
+                    "mode": str(batch.forward_mode),
+                    "batch_size": int(batch.batch_size()),
+                    "is_decode": bool(batch.forward_mode.is_decode()),
+                    "is_extend": bool(batch.forward_mode.is_extend()),
+                    "is_idle": bool(batch.forward_mode.is_idle()),
+                    "is_extend_in_batch": bool(
+                        getattr(batch, "is_extend_in_batch", False)
+                    ),
+                }
+            )
+        else:
+            payload.update({"mode": "None", "batch_size": 0})
+        payload.update(fields)
+        kunserve_timing_log(event, **payload)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             # Receive requests
+            stage_ns = time.perf_counter_ns()
             recv_reqs = self.recv_requests()
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_recv_requests_end",
+                stage_ns,
+                recv_count=len(recv_reqs),
+                loop="normal",
+            )
+            stage_ns = time.perf_counter_ns()
             self.process_input_requests(recv_reqs)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_input_end",
+                stage_ns,
+                recv_count=len(recv_reqs),
+                loop="normal",
+            )
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            stage_ns = time.perf_counter_ns()
             batch = self.get_next_batch_to_run()
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_get_next_batch_end",
+                stage_ns,
+                batch=batch,
+                loop="normal",
+            )
 
             # Phase E (sglang backend only): negotiate the per-step bs
             # across the cross-replica runtime_group so all 4 ranks enter
@@ -1189,35 +1275,78 @@ class Scheduler(
             # tensor -> NCCL shape mismatch / silent hang.
             phase_e_force_eager_set = False
             if self._kunserve_phase_e_active():
+                stage_ns = time.perf_counter_ns()
                 local_status = self._local_balloon_status_or_stop()
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_phase_e_status_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="normal",
+                    status_state=(
+                        str(local_status.get("state"))
+                        if isinstance(local_status, dict)
+                        else "None"
+                    ),
+                )
                 if local_status is not None:
-                    local_bs = batch.batch_size() if batch is not None else 0
-                    # Negotiate using the *padded* bs the local graph
-                    # would actually replay with, so the agreed value
-                    # matches what each rank's can_run() resolves to.
-                    local_padded = self._padded_capture_bs(local_bs)
-                    negotiated_max_bs, negotiated_min_bs = (
-                        self.negotiate_balloon_step_bs(local_padded)
+                    (
+                        negotiated_max_bs,
+                        negotiated_min_bs,
+                        negotiated_any_force_eager,
+                        phase_e_from_cache,
+                    ) = self._phase_e_get_step_decision(
+                        batch=batch,
+                        local_status=local_status,
+                        loop="normal",
                     )
                     if batch is None and negotiated_max_bs > 0:
                         # Peer has real work; build a matching keepalive batch.
+                        stage_ns = time.perf_counter_ns()
                         batch = self._build_balloon_keepalive_batch(
                             negotiated_max_bs, local_status
+                        )
+                        self._kunserve_scheduler_gap_log(
+                            "scheduler_gap_build_keepalive_end",
+                            stage_ns,
+                            batch=batch,
+                            loop="normal",
+                            target_bs=int(negotiated_max_bs),
                         )
                     elif batch is None and negotiated_max_bs == 0:
                         # All replicas idle -> stop keepalive, skip this step.
                         self._stop_balloon_keepalive("all replicas idle")
                     # Symmetric force-eager decision: every rank
                     # observed the same (max, min) so we all agree.
+                    stage_ns = time.perf_counter_ns()
                     self._phase_e_apply_step_decision(
                         negotiated_max_bs=negotiated_max_bs,
                         negotiated_min_bs=negotiated_min_bs,
+                        negotiated_any_force_eager=negotiated_any_force_eager,
+                        graph_bs_override_hint=(
+                            negotiated_max_bs if phase_e_from_cache else None
+                        ),
+                    )
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_phase_e_apply_decision_end",
+                        stage_ns,
+                        batch=batch,
+                        loop="normal",
+                        max_bs=int(negotiated_max_bs),
+                        min_bs=int(negotiated_min_bs),
+                        any_force_eager=bool(negotiated_any_force_eager),
                     )
                     phase_e_force_eager_set = True
             elif batch is None:
                 # Non-sglang backends (DeepEP NORMAL): keep the legacy
                 # local-only keepalive behavior.
+                stage_ns = time.perf_counter_ns()
                 batch = self._maybe_get_balloon_keepalive_batch()
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_maybe_keepalive_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="normal",
+                )
             else:
                 self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
@@ -1229,20 +1358,47 @@ class Scheduler(
             try:
                 if batch:
                     result = self.run_batch(batch)
+                    stage_ns = time.perf_counter_ns()
                     self.process_batch_result(batch, result)
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_process_batch_result_end",
+                        stage_ns,
+                        batch=batch,
+                        loop="normal",
+                    )
                 else:
                     # When the server is idle, do self-check and re-init some states
+                    stage_ns = time.perf_counter_ns()
                     self.self_check_during_idle()
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_self_check_idle_end",
+                        stage_ns,
+                        loop="normal",
+                    )
             finally:
                 if phase_e_force_eager_set:
+                    stage_ns = time.perf_counter_ns()
                     mr = getattr(self.tp_worker, "model_runner", None)
                     if mr is not None:
                         mr.set_balloon_step_force_eager(False)
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_phase_e_clear_decision_end",
+                        stage_ns,
+                        batch=batch,
+                        loop="normal",
+                    )
 
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                stage_ns = time.perf_counter_ns()
                 self.self_check_during_busy()
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_self_check_busy_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="normal",
+                )
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -1253,18 +1409,47 @@ class Scheduler(
 
         def pop_and_process():
             # Process the results of the last batch
+            stage_ns = time.perf_counter_ns()
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_overlap_pop_process_end",
+                stage_ns,
+                batch=tmp_batch,
+                loop="overlap",
+                result_queue_len_after=len(self.result_queue),
+            )
 
         while True:
             # Receive requests
+            stage_ns = time.perf_counter_ns()
             recv_reqs = self.recv_requests()
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_recv_requests_end",
+                stage_ns,
+                recv_count=len(recv_reqs),
+                loop="overlap",
+            )
+            stage_ns = time.perf_counter_ns()
             self.process_input_requests(recv_reqs)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_input_end",
+                stage_ns,
+                recv_count=len(recv_reqs),
+                loop="overlap",
+            )
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            stage_ns = time.perf_counter_ns()
             batch = self.get_next_batch_to_run()
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_get_next_batch_end",
+                stage_ns,
+                batch=batch,
+                loop="overlap",
+            )
 
             # Phase E (sglang backend only): negotiate per-step bs with
             # peer replicas BEFORE deciding overlap & launching.  See the
@@ -1274,14 +1459,33 @@ class Scheduler(
             # matching keepalive on the same step.
             phase_e_negotiated_max: Optional[int] = None
             phase_e_negotiated_min: Optional[int] = None
+            phase_e_negotiated_any_force_eager: bool = False
+            phase_e_from_cache: bool = False
             phase_e_status: Optional[Dict[str, Any]] = None
             if self._kunserve_phase_e_active():
+                stage_ns = time.perf_counter_ns()
                 phase_e_status = self._local_balloon_status_or_stop()
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_phase_e_status_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="overlap",
+                    status_state=(
+                        str(phase_e_status.get("state"))
+                        if isinstance(phase_e_status, dict)
+                        else "None"
+                    ),
+                )
                 if phase_e_status is not None:
-                    local_bs = batch.batch_size() if batch is not None else 0
-                    local_padded = self._padded_capture_bs(local_bs)
-                    phase_e_negotiated_max, phase_e_negotiated_min = (
-                        self.negotiate_balloon_step_bs(local_padded)
+                    (
+                        phase_e_negotiated_max,
+                        phase_e_negotiated_min,
+                        phase_e_negotiated_any_force_eager,
+                        phase_e_from_cache,
+                    ) = self._phase_e_get_step_decision(
+                        batch=batch,
+                        local_status=phase_e_status,
+                        loop="overlap",
                     )
 
             # Phase E EARLY keepalive build (overlap loop).  The original
@@ -1304,8 +1508,16 @@ class Scheduler(
                 and phase_e_negotiated_max > 0
                 and phase_e_status is not None
             ):
+                stage_ns = time.perf_counter_ns()
                 batch = self._build_balloon_keepalive_batch(
                     int(phase_e_negotiated_max), phase_e_status
+                )
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_build_keepalive_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="overlap",
+                    target_bs=int(phase_e_negotiated_max),
                 )
             elif (
                 batch is None
@@ -1316,7 +1528,15 @@ class Scheduler(
             if real_batch_this_step:
                 self._stop_balloon_keepalive("scheduled real batch")
             self.cur_batch = batch
+            stage_ns = time.perf_counter_ns()
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_disable_overlap_check_end",
+                stage_ns,
+                batch=batch,
+                loop="overlap",
+                disable_overlap_for_batch=bool(disable_overlap_for_batch),
+            )
 
             # Phase E force-eager decision for the current batch (if any).
             # Done after we know the launched bs; will be applied before
@@ -1329,9 +1549,23 @@ class Scheduler(
                 and phase_e_negotiated_min is not None
                 and batch is not None
             ):
+                stage_ns = time.perf_counter_ns()
                 self._phase_e_apply_step_decision(
                     negotiated_max_bs=int(phase_e_negotiated_max),
                     negotiated_min_bs=int(phase_e_negotiated_min),
+                    negotiated_any_force_eager=phase_e_negotiated_any_force_eager,
+                    graph_bs_override_hint=(
+                        int(phase_e_negotiated_max) if phase_e_from_cache else None
+                    ),
+                )
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_phase_e_apply_decision_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="overlap",
+                    max_bs=int(phase_e_negotiated_max),
+                    min_bs=int(phase_e_negotiated_min),
+                    any_force_eager=bool(phase_e_negotiated_any_force_eager),
                 )
                 phase_e_force_eager_set = True
 
@@ -1345,15 +1579,30 @@ class Scheduler(
             try:
                 if batch:
                     batch_result = self.run_batch(batch)
+                    stage_ns = time.perf_counter_ns()
                     self.result_queue.append((batch.copy(), batch_result))
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_overlap_result_queue_append_end",
+                        stage_ns,
+                        batch=batch,
+                        loop="overlap",
+                        result_queue_len_after=len(self.result_queue),
+                    )
                 else:
                     batch_result = None
             finally:
                 if phase_e_force_eager_set:
+                    stage_ns = time.perf_counter_ns()
                     mr = getattr(self.tp_worker, "model_runner", None)
                     if mr is not None:
                         mr.set_balloon_step_force_eager(False)
                     phase_e_force_eager_set = False
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_phase_e_clear_decision_end",
+                        stage_ns,
+                        batch=batch,
+                        loop="overlap",
+                    )
 
             # Process the last batch
             if self.last_batch:
@@ -1363,14 +1612,29 @@ class Scheduler(
                 if phase_e_negotiated_max is not None:
                     # Phase E branch: only enter keepalive if peer is busy.
                     if phase_e_negotiated_max > 0 and phase_e_status is not None:
+                        stage_ns = time.perf_counter_ns()
                         keepalive_batch = self._build_balloon_keepalive_batch(
                             int(phase_e_negotiated_max), phase_e_status
+                        )
+                        self._kunserve_scheduler_gap_log(
+                            "scheduler_gap_build_keepalive_end",
+                            stage_ns,
+                            batch=keepalive_batch,
+                            loop="overlap_tail",
+                            target_bs=int(phase_e_negotiated_max),
                         )
                     else:
                         self._stop_balloon_keepalive("all replicas idle")
                         keepalive_batch = None
                 else:
+                    stage_ns = time.perf_counter_ns()
                     keepalive_batch = self._maybe_get_balloon_keepalive_batch()
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_maybe_keepalive_end",
+                        stage_ns,
+                        batch=keepalive_batch,
+                        loop="overlap_tail",
+                    )
 
                 if keepalive_batch is not None:
                     batch = keepalive_batch
@@ -1382,32 +1646,88 @@ class Scheduler(
                         phase_e_negotiated_max is not None
                         and phase_e_negotiated_min is not None
                     ):
+                        stage_ns = time.perf_counter_ns()
                         self._phase_e_apply_step_decision(
                             negotiated_max_bs=int(phase_e_negotiated_max),
                             negotiated_min_bs=int(phase_e_negotiated_min),
+                            negotiated_any_force_eager=phase_e_negotiated_any_force_eager,
+                            graph_bs_override_hint=(
+                                int(phase_e_negotiated_max)
+                                if phase_e_from_cache
+                                else None
+                            ),
+                        )
+                        self._kunserve_scheduler_gap_log(
+                            "scheduler_gap_phase_e_apply_decision_end",
+                            stage_ns,
+                            batch=batch,
+                            loop="overlap_keepalive",
+                            max_bs=int(phase_e_negotiated_max),
+                            min_bs=int(phase_e_negotiated_min),
+                            any_force_eager=bool(phase_e_negotiated_any_force_eager),
                         )
                         phase_e_force_eager_set = True
                     try:
                         batch_result = self.run_batch(batch)
+                        stage_ns = time.perf_counter_ns()
                         self.result_queue.append((batch.copy(), batch_result))
+                        self._kunserve_scheduler_gap_log(
+                            "scheduler_gap_overlap_result_queue_append_end",
+                            stage_ns,
+                            batch=batch,
+                            loop="overlap_keepalive",
+                            result_queue_len_after=len(self.result_queue),
+                        )
                     finally:
                         if phase_e_force_eager_set:
+                            stage_ns = time.perf_counter_ns()
                             mr2 = getattr(self.tp_worker, "model_runner", None)
                             if mr2 is not None:
                                 mr2.set_balloon_step_force_eager(False)
+                            self._kunserve_scheduler_gap_log(
+                                "scheduler_gap_phase_e_clear_decision_end",
+                                stage_ns,
+                                batch=batch,
+                                loop="overlap_keepalive",
+                            )
                 else:
                     # When the server is idle, do self-check and re-init some states
+                    stage_ns = time.perf_counter_ns()
                     self.self_check_during_idle()
+                    self._kunserve_scheduler_gap_log(
+                        "scheduler_gap_self_check_idle_end",
+                        stage_ns,
+                        loop="overlap",
+                    )
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
+                stage_ns = time.perf_counter_ns()
                 self.launch_batch_sample_if_needed(batch_result)
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_launch_sample_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="overlap",
+                    has_batch_result=batch_result is not None,
+                    delayed_sample=(
+                        batch_result is not None
+                        and batch_result.delay_sample_func is not None
+                    ),
+                )
 
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                stage_ns = time.perf_counter_ns()
                 self.self_check_during_busy()
+                self._kunserve_scheduler_gap_log(
+                    "scheduler_gap_self_check_busy_end",
+                    stage_ns,
+                    batch=batch,
+                    loop="overlap",
+                )
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -2111,12 +2431,19 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        stage_ns = time.perf_counter_ns()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_get_next_precheck_end",
+            stage_ns,
+            loop="get_next",
+        )
 
         # Merge the prefill batch into the running batch
+        stage_ns = time.perf_counter_ns()
         chunked_req_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
@@ -2155,11 +2482,25 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_get_next_merge_last_end",
+            stage_ns,
+            loop="get_next",
+            chunked_exclude=len(chunked_req_to_exclude),
+        )
 
+        stage_ns = time.perf_counter_ns()
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_get_next_prefill_select_end",
+            stage_ns,
+            batch=new_batch,
+            loop="get_next",
+            got_new_batch=new_batch is not None,
+        )
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -2175,14 +2516,29 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode
+            stage_ns = time.perf_counter_ns()
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_get_next_decode_select_end",
+                stage_ns,
+                batch=ret,
+                loop="get_next",
+            )
 
         # Handle DP attention and log stats
+        stage_ns = time.perf_counter_ns()
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_get_next_mlp_sync_end",
+            stage_ns,
+            batch=ret,
+            loop="get_next",
+            need_mlp_sync=bool(need_mlp_sync),
+        )
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
@@ -2203,12 +2559,27 @@ class Scheduler(
                 self.prefill_delayer, token_usage=token_usage
             )
 
+        stage_ns = time.perf_counter_ns()
         ret = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass
         )
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_get_new_batch_prefill_raw_end",
+            stage_ns,
+            batch=ret,
+            loop="get_new_batch_prefill",
+            has_prefill_delayer=self.prefill_delayer is not None,
+        )
 
         if self.prefill_delayer:
+            stage_ns = time.perf_counter_ns()
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_prefill_delayer_finalize_end",
+                stage_ns,
+                batch=ret,
+                loop="get_new_batch_prefill",
+            )
 
         return ret
 
@@ -2225,9 +2596,114 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        if self._phase_e_may_defer_prefill_for_cache():
+            self._kunserve_phase_e_prefill_defer_log_ct += 1
+            log_ct = self._kunserve_phase_e_prefill_defer_log_ct
+            try:
+                available_tokens = self.token_to_kv_pool_allocator.available_size()
+            except Exception:
+                available_tokens = -1
+            if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] defer prefill under phase-e cached bucket: "
+                    "count=%d running=%d waiting=%d chunked=%s cached_bs=%d "
+                    "steps_left=%d available_tokens=%d max_total=%d",
+                    log_ct,
+                    len(self.running_batch.reqs),
+                    len(self.waiting_queue),
+                    self.chunked_req is not None,
+                    int(self._phase_e_cached_max_bs),
+                    int(self._phase_e_cached_steps_left),
+                    int(available_tokens),
+                    int(self.max_total_num_tokens),
+                )
+            kunserve_timing_log(
+                "scheduler_prefill_deferred_phase_e_cache",
+                count=int(self._kunserve_phase_e_prefill_defer_log_ct),
+                running=len(self.running_batch.reqs),
+                waiting=len(self.waiting_queue),
+                chunked=self.chunked_req is not None,
+                cached_max_bs=int(self._phase_e_cached_max_bs),
+                cached_steps_left=int(self._phase_e_cached_steps_left),
+                available_tokens=int(available_tokens),
+                max_total=int(self.max_total_num_tokens),
+            )
+            return None
+
+        if (
+            self.chunked_req is None
+            and self._kunserve_should_defer_prefill_for_global_graph()
+        ):
+            self._kunserve_graph_prefill_defer_log_ct += 1
+            log_ct = self._kunserve_graph_prefill_defer_log_ct
+            try:
+                available_tokens = self.token_to_kv_pool_allocator.available_size()
+            except Exception:
+                available_tokens = -1
+            if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
+                retracted_waiting = sum(
+                    1
+                    for req in self.waiting_queue
+                    if bool(getattr(req, "is_retracted", False))
+                    or bool(getattr(req, "retracted_stain", False))
+                )
+                _kunserve_ms(
+                    "[KUNSERVE-MS] defer prefill under global graph: "
+                    "count=%d running=%d waiting=%d retracted_waiting=%d "
+                    "batch_is_full=%s available_tokens=%d max_total=%d",
+                    log_ct,
+                    len(self.running_batch.reqs),
+                    len(self.waiting_queue),
+                    int(retracted_waiting),
+                    bool(getattr(self.running_batch, "batch_is_full", False)),
+                    int(available_tokens),
+                    int(self.max_total_num_tokens),
+                )
+            kunserve_timing_log(
+                "scheduler_prefill_deferred_global_graph",
+                count=int(self._kunserve_graph_prefill_defer_log_ct),
+                running=len(self.running_batch.reqs),
+                waiting=len(self.waiting_queue),
+                available_tokens=int(available_tokens),
+                max_total=int(self.max_total_num_tokens),
+            )
+            return None
+
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if self.running_batch.batch_is_full and len(self.waiting_queue) > 0:
+                self._kunserve_prefill_blocked_full_log_ct += 1
+                log_ct = self._kunserve_prefill_blocked_full_log_ct
+                if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
+                    try:
+                        available_tokens = (
+                            self.token_to_kv_pool_allocator.available_size()
+                        )
+                    except Exception:
+                        available_tokens = -1
+                    mr = getattr(self.tp_worker, "model_runner", None)
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] prefill blocked by batch_is_full: "
+                        "count=%d state=%s variant=%s running=%d waiting=%d "
+                        "available_tokens=%d max_total=%d expand_requested=%s",
+                        log_ct,
+                        getattr(mr, "_balloon_state", "local"),
+                        getattr(mr, "_balloon_runtime_variant", "local"),
+                        len(self.running_batch.reqs),
+                        len(self.waiting_queue),
+                        int(available_tokens),
+                        int(self.max_total_num_tokens),
+                        bool(self.expand_requested),
+                    )
+            if self.running_batch.batch_is_full and len(self.waiting_queue) > 0:
+                kunserve_timing_log(
+                    "scheduler_prefill_blocked_batch_full",
+                    count=int(self._kunserve_prefill_blocked_full_log_ct),
+                    running=len(self.running_batch.reqs),
+                    waiting=len(self.waiting_queue),
+                    max_total=int(self.max_total_num_tokens),
+                )
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2355,6 +2831,15 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+        kunserve_timing_log(
+            "scheduler_prefill_scheduled",
+            new_reqs=len(can_run_list),
+            running=len(self.running_batch.reqs),
+            waiting_before=len(self.waiting_queue),
+            chunked_req=self.chunked_req is not None,
+        )
+        self._kunserve_prefill_blocked_full_log_ct = 0
+        self._kunserve_graph_prefill_defer_log_ct = 0
 
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
@@ -2472,6 +2957,17 @@ class Scheduler(
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
+            kunserve_timing_log(
+                "scheduler_retract_decode",
+                retracted=len(retracted_reqs),
+                running_after=batch.batch_size(),
+                waiting=len(self.waiting_queue),
+                old_available=int(old_available_tokens),
+                new_available=int(new_available_tokens),
+                gained=int(new_token_gained),
+                max_total=int(self.max_total_num_tokens),
+                kv_full=bool(kv_full_retract_flag),
+            )
 
             self.num_retracted_reqs = len(retracted_reqs)
             if self.enable_metrics and len(retracted_reqs) > 0:
@@ -2591,6 +3087,15 @@ class Scheduler(
         if self._last_run_batch_end_ts is not None:
             gap_ms = (now - self._last_run_batch_end_ts) * 1000
         step_start = now
+        run_timing_fields = {
+            "forward_ct": int(self.forward_ct),
+            "mode": str(batch.forward_mode),
+            "batch_size": int(batch.batch_size()),
+            "running": len(self.running_batch.reqs),
+            "waiting": len(self.waiting_queue),
+            "gap_ms": round(gap_ms, 3),
+        }
+        kunserve_timing_log("scheduler_run_batch_begin", **run_timing_fields)
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -2737,6 +3242,11 @@ class Scheduler(
 
         self._log_decode_step_timing(batch, ret, step_start, gap_ms)
         self._last_run_batch_end_ts = time.perf_counter()
+        kunserve_timing_log(
+            "scheduler_run_batch_end",
+            elapsed_ms=round((self._last_run_batch_end_ts - step_start) * 1000.0, 3),
+            **run_timing_fields,
+        )
         return ret
 
     def _accumulate_retract_wasted_ms(self, req: Req) -> None:
@@ -2903,35 +3413,129 @@ class Scheduler(
         if batch_result is None or batch_result.delay_sample_func is None:
             return
 
+        stage_ns = time.perf_counter_ns()
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.default_stream)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_launch_sample_wait_stream_end",
+                stage_ns,
+                batch=self.cur_batch,
+                loop="launch_sample",
+            )
+            stage_ns = time.perf_counter_ns()
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_launch_sample_func_end",
+                stage_ns,
+                batch=self.cur_batch,
+                loop="launch_sample",
+            )
+            stage_ns = time.perf_counter_ns()
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_launch_sample_store_future_end",
+                stage_ns,
+                batch=self.cur_batch,
+                loop="launch_sample",
+            )
+            stage_ns = time.perf_counter_ns()
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_launch_sample_copy_to_cpu_end",
+                stage_ns,
+                batch=self.cur_batch,
+                loop="launch_sample",
+            )
 
     def process_batch_result(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        stage_ns = time.perf_counter_ns()
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_result_core_end",
+                stage_ns,
+                batch=batch,
+                loop="process_batch_result",
+                core="decode",
+            )
+            stage_ns = time.perf_counter_ns()
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_result_trace_end",
+                stage_ns,
+                batch=batch,
+                loop="process_batch_result",
+            )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
+                core = "dllm"
             else:
                 self.process_batch_result_prefill(batch, result)
+                core = "prefill"
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_result_core_end",
+                stage_ns,
+                batch=batch,
+                loop="process_batch_result",
+                core=core,
+            )
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_result_core_end",
+                stage_ns,
+                batch=batch,
+                loop="process_batch_result",
+                core="prebuilt",
+            )
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
+            self._kunserve_scheduler_gap_log(
+                "scheduler_gap_process_result_core_end",
+                stage_ns,
+                batch=batch,
+                loop="process_batch_result",
+                core="idle",
+            )
 
+        stage_ns = time.perf_counter_ns()
         self.log_batch_result_stats(batch, result)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_process_result_stats_end",
+            stage_ns,
+            batch=batch,
+            loop="process_batch_result",
+        )
+        stage_ns = time.perf_counter_ns()
         self._maybe_clear_mm_inputs(batch)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_process_result_clear_mm_end",
+            stage_ns,
+            batch=batch,
+            loop="process_batch_result",
+        )
+        stage_ns = time.perf_counter_ns()
         self._maybe_dump_finished_reqs(batch)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_process_result_dump_finished_end",
+            stage_ns,
+            batch=batch,
+            loop="process_batch_result",
+        )
+        stage_ns = time.perf_counter_ns()
         self.maybe_send_health_check_signal()
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_process_result_health_end",
+            stage_ns,
+            batch=batch,
+            loop="process_batch_result",
+        )
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:
@@ -3087,6 +3691,69 @@ class Scheduler(
             )
         return no_request
 
+    def _kunserve_prepare_for_memory_release(self) -> None:
+        """Drain harmless KunServe overlap state before SGLang memory release.
+
+        ``release_memory_occupation`` is issued as a control request at the top
+        of the overlap scheduler loop.  With Phase E cached GLOBAL graph replay
+        the previous iteration can leave an IDLE keepalive result in
+        ``result_queue`` even though all real requests are already finished.
+        That queued IDLE result makes the original SGLang no-request assertion
+        fail.  We process queued results first, then let the original assertion
+        continue to reject any real ongoing request.
+        """
+        result_queue = getattr(self, "result_queue", None)
+        result_queue_len_before = len(result_queue) if result_queue is not None else 0
+        drained = 0
+        if self.enable_overlap and result_queue is not None:
+            while len(result_queue) > 0:
+                tmp_batch, tmp_result = result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+                drained += 1
+
+        self._stop_balloon_keepalive("memory release")
+        self._phase_e_reset_cached_decision("memory release")
+
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is not None:
+            try:
+                model_runner.set_balloon_step_force_eager(False)
+            except Exception:
+                pass
+            try:
+                model_runner.set_balloon_step_graph_bs_override(None)
+            except Exception:
+                pass
+
+        if drained > 0 and self.running_batch.is_empty():
+            self.last_batch = None
+            self.cur_batch = None
+        elif self.last_batch is not None and self.last_batch.is_empty():
+            self.last_batch = None
+            if self.cur_batch is not None and self.cur_batch.is_empty():
+                self.cur_batch = None
+
+        logger.info(
+            "[KunServeScheduler] memory release cleanup: drained_overlap=%d "
+            "result_queue_before=%d result_queue_after=%d running=%d waiting=%d "
+            "no_request=%s",
+            drained,
+            result_queue_len_before,
+            len(result_queue) if result_queue is not None else 0,
+            len(self.running_batch.reqs),
+            len(self.waiting_queue),
+            self._is_no_request(),
+        )
+        kunserve_timing_log(
+            "kunserve_memory_release_cleanup",
+            drained_overlap=int(drained),
+            result_queue_before=int(result_queue_len_before),
+            result_queue_after=int(len(result_queue) if result_queue is not None else 0),
+            running=len(self.running_batch.reqs),
+            waiting=len(self.waiting_queue),
+            no_request=bool(self._is_no_request()),
+        )
+
     def _stop_balloon_keepalive(self, reason: str) -> None:
         if self._balloon_keepalive_active:
             logger.info(
@@ -3099,11 +3766,12 @@ class Scheduler(
     def _kunserve_phase_e_active(self) -> bool:
         """Whether Phase E cross-replica bs sync should run this step.
 
-        Only the sglang backend's static-buffer dispatcher requires per
-        step lockstep with the peer replica (because its captured graph
-        embeds a specific bs into all_gather_into_tensor / all_reduce).
-        DeepEP backends manage their own per-step coordination via
-        DeepEPMode.NORMAL's buffer setup and do not need this sync.
+        For the sglang GLOBAL backend every rank must enter the MoE collective
+        path on every decode step.  Fixed-padded CUDA graph replay additionally
+        needs matching padded bs values, but eager GLOBAL still needs a
+        non-empty keepalive when a peer replica is busy.  Otherwise an idle
+        replica sends an empty IDLE batch through Qwen3 prepare_mlp / global
+        collectives while its peer is decoding, which can crash or hang.
         """
         model_runner = getattr(self.tp_worker, "model_runner", None)
         if model_runner is None:
@@ -3115,8 +3783,284 @@ class Scheduler(
         ).lower()
         if backend != "sglang":
             return False
+        try:
+            variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
+            runtime_variant = str(variant_getter())
+        except Exception:
+            runtime_variant = str(
+                getattr(model_runner, "_balloon_runtime_variant", "local")
+            )
+        if runtime_variant != "global":
+            return False
         # Skip the sync until a runtime_group has actually been resolved.
         return getattr(model_runner, "_balloon_process_group_name", None) is not None
+
+    def _kunserve_global_graph_replay_active(self) -> bool:
+        """True only for the fixed-padded GLOBAL CUDA graph steady state."""
+        if not self._kunserve_phase_e_active():
+            return False
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return False
+        capture_policy = str(
+            getattr(model_runner, "_balloon_capture_policy", "auto") or "auto"
+        ).lower()
+        if capture_policy != "fixed_padded":
+            return False
+        try:
+            if not bool(model_runner.is_cuda_graph_replay_enabled()):
+                return False
+        except Exception:
+            if not bool(getattr(model_runner, "_balloon_graph_replay_enabled", False)):
+                return False
+        return True
+
+    def _kunserve_should_defer_prefill_for_global_graph(self) -> bool:
+        """Legacy conservative gate for keeping graph replay decode-only.
+
+        This is now disabled by default.  Phase E separately gathers a
+        per-step ``force_eager`` bit, so an EXTEND/re-prefill step can run
+        immediately after BALLOON without letting any peer replay a mismatched
+        GLOBAL CUDA graph.  Re-enable only for reproducing old graph issues.
+        """
+        if os.environ.get("KUNSERVE_DEFER_PREFILL_UNDER_GLOBAL_GRAPH", "0") not in (
+            "1",
+            "true",
+            "True",
+            "yes",
+        ):
+            return False
+
+        running_batch = getattr(self, "running_batch", None)
+        if (
+            running_batch is None
+            or running_batch.is_empty()
+            or len(self.waiting_queue) == 0
+        ):
+            return False
+
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return False
+        if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
+            return False
+
+        try:
+            variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
+            runtime_variant = str(variant_getter())
+        except Exception:
+            runtime_variant = str(
+                getattr(model_runner, "_balloon_runtime_variant", "local")
+            )
+        if runtime_variant != "global":
+            return False
+
+        return self._kunserve_global_graph_replay_active()
+
+    def _phase_e_reset_cached_decision(self, reason: str) -> None:
+        if self._phase_e_cache_valid:
+            kunserve_timing_log(
+                "phase_e_cache_reset",
+                reason=str(reason),
+                cached_max_bs=int(self._phase_e_cached_max_bs),
+                cached_min_bs=int(self._phase_e_cached_min_bs),
+                cached_steps_left=int(self._phase_e_cached_steps_left),
+            )
+        self._phase_e_cache_valid = False
+        self._phase_e_cached_max_bs = 0
+        self._phase_e_cached_min_bs = 0
+        self._phase_e_cached_any_force_eager = False
+        self._phase_e_cached_steps_left = 0
+
+    def _phase_e_cache_enabled(self) -> bool:
+        return (
+            self._phase_e_negotiate_interval > 1
+            and self._kunserve_global_graph_replay_active()
+        )
+
+    def _phase_e_cache_due(self) -> bool:
+        if not self._phase_e_cache_enabled():
+            return True
+        if not self._phase_e_cache_valid:
+            return True
+        return self._phase_e_cached_steps_left <= 0
+
+    def _phase_e_may_defer_prefill_for_cache(self) -> bool:
+        """Hold new prefill until the next scheduled Phase E refresh.
+
+        Skipping Phase E negotiation is safe only while every rank keeps
+        replaying the same cached decode bucket.  A local EXTEND/mixed step
+        would need all peers to force eager on that same scheduler step, so
+        we admit prefill only on refresh steps where all ranks negotiate.
+        """
+        if not self._phase_e_cache_enabled():
+            return False
+        if not self._phase_e_cache_valid:
+            return False
+        if self._phase_e_cached_steps_left <= 0:
+            return False
+        if len(self.waiting_queue) == 0 and self.chunked_req is None:
+            return False
+        return True
+
+    def _phase_e_update_cached_decision(
+        self,
+        *,
+        negotiated_max_bs: int,
+        negotiated_min_bs: int,
+        negotiated_any_force_eager: bool,
+    ) -> None:
+        if not self._phase_e_cache_enabled():
+            self._phase_e_reset_cached_decision("cache disabled")
+            return
+
+        negotiated_max_bs = int(negotiated_max_bs)
+        negotiated_min_bs = int(negotiated_min_bs)
+        cacheable = (
+            negotiated_max_bs > 0
+            and not bool(negotiated_any_force_eager)
+            and self._capture_bs_supported(negotiated_max_bs)
+        )
+        if not cacheable:
+            self._phase_e_reset_cached_decision("uncacheable negotiated step")
+            return
+
+        self._phase_e_cache_valid = True
+        self._phase_e_cached_max_bs = negotiated_max_bs
+        self._phase_e_cached_min_bs = negotiated_min_bs
+        self._phase_e_cached_any_force_eager = bool(negotiated_any_force_eager)
+        self._phase_e_cached_steps_left = max(
+            0, int(self._phase_e_negotiate_interval) - 1
+        )
+        kunserve_timing_log(
+            "phase_e_cache_update",
+            interval=int(self._phase_e_negotiate_interval),
+            cached_max_bs=int(self._phase_e_cached_max_bs),
+            cached_min_bs=int(self._phase_e_cached_min_bs),
+            cached_any_force_eager=bool(self._phase_e_cached_any_force_eager),
+            cached_steps_left=int(self._phase_e_cached_steps_left),
+        )
+
+    def _phase_e_try_reuse_cached_decision(
+        self,
+        *,
+        local_padded: int,
+        local_force_eager: bool,
+    ) -> Optional[Tuple[int, int, bool]]:
+        if not self._phase_e_cache_enabled() or not self._phase_e_cache_valid:
+            return None
+        if self._phase_e_cached_steps_left <= 0:
+            return None
+        if local_force_eager:
+            # This should normally be prevented by prefill deferral.  Do not
+            # replay a decode graph for a local EXTEND/mixed batch.
+            self._phase_e_reset_cached_decision("local force eager")
+            return None
+        if int(local_padded) > int(self._phase_e_cached_max_bs):
+            # A local growth beyond the cached bucket means the cache is no
+            # longer safe.  With prefill deferral this should be rare, but a
+            # refresh is the only safe way to make every rank switch together.
+            self._phase_e_reset_cached_decision("local padded exceeds cache")
+            return None
+
+        self._phase_e_cached_steps_left -= 1
+        kunserve_timing_log(
+            "phase_e_cache_reuse",
+            interval=int(self._phase_e_negotiate_interval),
+            local_padded=int(local_padded),
+            local_force_eager=bool(local_force_eager),
+            cached_max_bs=int(self._phase_e_cached_max_bs),
+            cached_min_bs=int(self._phase_e_cached_min_bs),
+            cached_any_force_eager=bool(self._phase_e_cached_any_force_eager),
+            cached_steps_left=int(self._phase_e_cached_steps_left),
+        )
+        return (
+            int(self._phase_e_cached_max_bs),
+            int(self._phase_e_cached_min_bs),
+            bool(self._phase_e_cached_any_force_eager),
+        )
+
+    def _phase_e_get_step_decision(
+        self,
+        *,
+        batch: Optional[ScheduleBatch],
+        local_status: Dict[str, Any],
+        loop: str,
+    ) -> Tuple[int, int, bool, bool]:
+        local_bs = batch.batch_size() if batch is not None else 0
+        stage_ns = time.perf_counter_ns()
+        local_force_eager = self._kunserve_batch_requires_eager_for_phase_e(batch)
+        local_padded = self._padded_capture_bs(local_bs)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_phase_e_local_shape_end",
+            stage_ns,
+            batch=batch,
+            loop=loop,
+            local_bs=int(local_bs),
+            local_padded=int(local_padded),
+            local_force_eager=bool(local_force_eager),
+        )
+
+        cached = self._phase_e_try_reuse_cached_decision(
+            local_padded=int(local_padded),
+            local_force_eager=bool(local_force_eager),
+        )
+        if cached is not None:
+            negotiated_max_bs, negotiated_min_bs, negotiated_any_force_eager = cached
+            kunserve_timing_log(
+                "phase_e_negotiated",
+                source="cache",
+                forward_ct=self.forward_ct,
+                mode=str(batch.forward_mode) if batch is not None else "None",
+                local_bs=int(local_bs),
+                local_padded=int(local_padded),
+                local_force_eager=bool(local_force_eager),
+                max_bs=int(negotiated_max_bs),
+                min_bs=int(negotiated_min_bs),
+                any_force_eager=bool(negotiated_any_force_eager),
+                running=len(self.running_batch.reqs),
+                waiting=len(self.waiting_queue),
+                cached_steps_left=int(self._phase_e_cached_steps_left),
+            )
+            return (
+                int(negotiated_max_bs),
+                int(negotiated_min_bs),
+                bool(negotiated_any_force_eager),
+                True,
+            )
+
+        (
+            negotiated_max_bs,
+            negotiated_min_bs,
+            negotiated_any_force_eager,
+        ) = self.negotiate_balloon_step_bs(
+            local_padded, local_force_eager=local_force_eager
+        )
+        kunserve_timing_log(
+            "phase_e_negotiated",
+            source="collective",
+            forward_ct=self.forward_ct,
+            mode=str(batch.forward_mode) if batch is not None else "None",
+            local_bs=int(local_bs),
+            local_padded=int(local_padded),
+            local_force_eager=bool(local_force_eager),
+            max_bs=int(negotiated_max_bs),
+            min_bs=int(negotiated_min_bs),
+            any_force_eager=bool(negotiated_any_force_eager),
+            running=len(self.running_batch.reqs),
+            waiting=len(self.waiting_queue),
+        )
+        self._phase_e_update_cached_decision(
+            negotiated_max_bs=int(negotiated_max_bs),
+            negotiated_min_bs=int(negotiated_min_bs),
+            negotiated_any_force_eager=bool(negotiated_any_force_eager),
+        )
+        return (
+            int(negotiated_max_bs),
+            int(negotiated_min_bs),
+            bool(negotiated_any_force_eager),
+            False,
+        )
 
     def _padded_capture_bs(self, local_bs: int) -> int:
         """Mirror cuda_graph_runner.can_run's bisect-up rule.
@@ -3129,6 +4073,21 @@ class Scheduler(
         if local_bs <= 0:
             return 0
         model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return int(local_bs)
+        capture_policy = str(
+            getattr(model_runner, "_balloon_capture_policy", "auto") or "auto"
+        ).lower()
+        if capture_policy != "fixed_padded":
+            return int(local_bs)
+        try:
+            replay_enabled = bool(model_runner.is_cuda_graph_replay_enabled())
+        except Exception:
+            replay_enabled = bool(
+                getattr(model_runner, "_balloon_graph_replay_enabled", False)
+            )
+        if not replay_enabled:
+            return int(local_bs)
         graph_runner = getattr(model_runner, "graph_runner", None) if model_runner else None
         if graph_runner is None:
             return int(local_bs)
@@ -3143,39 +4102,87 @@ class Scheduler(
             return int(local_bs)
         return int(capture_bs[idx])
 
+    def _capture_bs_supported(self, target_bs: int) -> bool:
+        if int(target_bs) <= 0:
+            return False
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        graph_runner = getattr(model_runner, "graph_runner", None) if model_runner else None
+        capture_bs = getattr(graph_runner, "capture_bs", None) or []
+        return int(target_bs) in {int(bs) for bs in capture_bs}
+
+    def _kunserve_batch_requires_eager_for_phase_e(
+        self, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        if batch is None:
+            return False
+        try:
+            if batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                return True
+        except Exception:
+            pass
+        return bool(getattr(batch, "is_extend_in_batch", False))
+
     def _phase_e_apply_step_decision(
         self,
         *,
         negotiated_max_bs: int,
         negotiated_min_bs: int,
+        negotiated_any_force_eager: bool = False,
+        graph_bs_override_hint: Optional[int] = None,
     ) -> None:
         """Set ``_balloon_step_force_eager`` based on the negotiation.
 
         Symmetric rule (every rank sees the same ``(max, min)`` and
         reaches the same decision):
 
-        * ``min_bs == 0 and max_bs > 0`` -- idle/busy split.  Idle
-          replicas have already been told to build a keepalive batch
-          of size ``max_bs``, so post-build every rank's effective bs
-          equals ``max_bs``.  No force_eager needed.
-        * ``min_bs > 0 and min_bs != max_bs`` -- busy/busy with
-          mismatched padded bs.  Each rank's captured graph would
-          carry a different NCCL shape; we MUST force eager.
-        * ``min_bs == max_bs`` -- uniform, graph replay safe.
-
-        Compactly: ``force_eager = (0 < min_bs < max_bs)``.
+        * ``any_force_eager`` -- at least one rank is running EXTEND/mixed
+          prefill.  All ranks must skip graph replay because GLOBAL graph
+          collectives are fixed to decode-shaped token counts.
+        * ``min_bs == 0 and max_bs > 0`` -- idle/busy decode split.  Idle
+          replicas build a keepalive batch of size ``max_bs`` and graph replay
+          is safe only when ``any_force_eager`` is false.
+        * ``min_bs > 0 and min_bs != max_bs`` -- busy/busy with mismatched
+          padded bs.  All ranks replay the ``max_bs`` GLOBAL graph bucket and
+          smaller local batches pad extra rows to dummy KV.
+        * ``min_bs == max_bs`` -- uniform decode shape, graph replay safe.
         """
         model_runner = getattr(self.tp_worker, "model_runner", None)
         if model_runner is None:
             return
-        force_eager = (
-            int(negotiated_min_bs) > 0
-            and int(negotiated_min_bs) != int(negotiated_max_bs)
+        negotiated_max_bs = int(negotiated_max_bs)
+        negotiated_min_bs = int(negotiated_min_bs)
+        graph_bs_override: Optional[int] = None
+        force_eager = bool(negotiated_any_force_eager)
+        mismatch_decode = (
+            negotiated_min_bs > 0 and negotiated_min_bs != negotiated_max_bs
         )
+        if graph_bs_override_hint is not None and not force_eager:
+            graph_bs_override_hint = int(graph_bs_override_hint)
+            if self._capture_bs_supported(graph_bs_override_hint):
+                graph_bs_override = graph_bs_override_hint
+            else:
+                force_eager = True
+        elif mismatch_decode and not force_eager:
+            if self._capture_bs_supported(negotiated_max_bs):
+                graph_bs_override = negotiated_max_bs
+            else:
+                force_eager = True
         try:
             model_runner.set_balloon_step_force_eager(force_eager)
+            if not force_eager:
+                model_runner.set_balloon_step_graph_bs_override(graph_bs_override)
         except Exception:
             pass
+        kunserve_timing_log(
+            "phase_e_step_decision",
+            max_bs=int(negotiated_max_bs),
+            min_bs=int(negotiated_min_bs),
+            any_force_eager=bool(negotiated_any_force_eager),
+            mismatch_decode=bool(mismatch_decode),
+            force_eager=bool(force_eager),
+            graph_bs_override=graph_bs_override,
+            graph_bs_override_hint=graph_bs_override_hint,
+        )
 
     def _local_balloon_status_or_stop(self) -> Optional[Dict[str, Any]]:
         try:
@@ -3191,24 +4198,33 @@ class Scheduler(
             return None
         return local_status
 
-    def negotiate_balloon_step_bs(self, local_bs: int) -> Tuple[int, int]:
+    def negotiate_balloon_step_bs(
+        self, local_bs: int, local_force_eager: bool = False
+    ) -> Tuple[int, int, bool]:
         """Phase E entry point in the scheduler.
 
-        Returns ``(max_bs, min_bs)`` across the cross-replica runtime
-        group.  Callers use:
-
-        * ``max_bs`` as the negotiated batch size (idle replicas pad
-          their keepalive batch to this size).
-        * ``min_bs`` (with ``max_bs``) to derive the symmetric
-          force-eager decision: every rank that observes
-          ``0 < min_bs < max_bs`` must skip graph replay this step,
-          because the captured (variant, bs) graphs across ranks would
-          carry mismatched NCCL collective shapes otherwise.
+        Returns ``(max_bs, min_bs, any_force_eager)`` across the
+        cross-replica runtime group.  Callers use ``max_bs`` for idle
+        keepalive size and the other two fields for the symmetric graph/eager
+        decision.
         """
-        max_bs, min_bs = self.tp_worker.model_runner.negotiate_balloon_step_bs(
-            int(local_bs)
+        stage_ns = time.perf_counter_ns()
+        max_bs, min_bs, any_force_eager = (
+            self.tp_worker.model_runner.negotiate_balloon_step_bs(
+                int(local_bs), bool(local_force_eager)
+            )
         )
-        return int(max_bs), int(min_bs)
+        self._kunserve_scheduler_gap_log(
+            "scheduler_gap_phase_e_negotiate_end",
+            stage_ns,
+            loop="phase_e",
+            local_bs=int(local_bs),
+            local_force_eager=bool(local_force_eager),
+            max_bs=int(max_bs),
+            min_bs=int(min_bs),
+            any_force_eager=bool(any_force_eager),
+        )
+        return int(max_bs), int(min_bs), bool(any_force_eager)
 
     def _build_balloon_keepalive_batch(
         self, target_bs: int, local_status: Dict[str, Any]
@@ -3336,6 +4352,38 @@ class Scheduler(
         ):
             self.model_worker.max_total_num_tokens = int(max_total_num_tokens)
 
+    def _clear_batch_full_after_capacity_growth(
+        self, source: str, old_max_total: int, new_max_total: int
+    ) -> None:
+        if int(new_max_total) <= int(old_max_total):
+            return
+        running_batch = getattr(self, "running_batch", None)
+        if running_batch is None:
+            return
+
+        was_full = bool(getattr(running_batch, "batch_is_full", False))
+        running_batch.batch_is_full = False
+        self._kunserve_prefill_blocked_full_log_ct = 0
+        self._kunserve_graph_prefill_defer_log_ct = 0
+        defer_prefill = self._kunserve_should_defer_prefill_for_global_graph()
+        try:
+            available_tokens = self.token_to_kv_pool_allocator.available_size()
+        except Exception:
+            available_tokens = -1
+        _kunserve_ms(
+            "[KUNSERVE-MS] %s capacity grew; cleared batch_is_full: "
+            "old_max_total=%d new_max_total=%d was_full=%s running=%d "
+            "waiting=%d available_tokens=%d defer_prefill_global_graph=%s",
+            source,
+            int(old_max_total),
+            int(new_max_total),
+            was_full,
+            len(running_batch.reqs),
+            len(self.waiting_queue),
+            int(available_tokens),
+            bool(defer_prefill),
+        )
+
     def _format_balloon_status(self, status: Dict[str, Any]) -> str:
         if not status:
             return "status=<empty>"
@@ -3386,6 +4434,19 @@ class Scheduler(
                         False,
                     )
                 ),
+                "phase_e_graph_bs_override": getattr(
+                    getattr(self.tp_worker, "model_runner", None),
+                    "_balloon_step_graph_bs_override",
+                    None,
+                ),
+                "phase_e_negotiate_interval": int(
+                    self._phase_e_negotiate_interval
+                ),
+                "phase_e_cache_valid": bool(self._phase_e_cache_valid),
+                "phase_e_cached_max_bs": int(self._phase_e_cached_max_bs),
+                "phase_e_cached_steps_left": int(
+                    self._phase_e_cached_steps_left
+                ),
             }
         )
         return GetBalloonStatusReqOutput(status=status)
@@ -3405,6 +4466,7 @@ class Scheduler(
             recv_req.capture_cuda_graph,
         )
         try:
+            self._phase_e_reset_cached_decision("prepare_balloon")
             status = self.tp_worker.prepare_balloon(recv_req)
             logger.info(
                 "[KunServeScheduler] prepare_balloon success: %s",
@@ -3474,8 +4536,14 @@ class Scheduler(
             recv_req.require_prepared,
         )
         try:
+            old_max_total = int(self.max_total_num_tokens)
             status = self.tp_worker.commit_balloon(recv_req)
-            self._sync_runtime_capacity_cache(status["max_total_num_tokens"])
+            self._phase_e_reset_cached_decision("commit_balloon")
+            new_max_total = int(status["max_total_num_tokens"])
+            self._sync_runtime_capacity_cache(new_max_total)
+            self._clear_batch_full_after_capacity_growth(
+                "commit_balloon", old_max_total, new_max_total
+            )
             self.expand_requested = False
             self.expand_request_reason = None
             logger.info(
@@ -3522,6 +4590,7 @@ class Scheduler(
 
         try:
             status = self.tp_worker.restore_from_balloon(recv_req)
+            self._phase_e_reset_cached_decision("restore_from_balloon")
             self._sync_runtime_capacity_cache(status["max_total_num_tokens"])
             self.expand_requested = False
             self.expand_request_reason = None
@@ -3552,8 +4621,13 @@ class Scheduler(
             recv_req.delta_slots,
         )
         try:
+            old_max_total = int(self.max_total_num_tokens)
             status = self.tp_worker.sync_kv_capacity(recv_req)
-            self._sync_runtime_capacity_cache(status["max_total_num_tokens"])
+            new_max_total = int(status["max_total_num_tokens"])
+            self._sync_runtime_capacity_cache(new_max_total)
+            self._clear_batch_full_after_capacity_growth(
+                "sync_kv_capacity", old_max_total, new_max_total
+            )
             logger.info(
                 "[KunServeScheduler] sync_kv_capacity success: %s",
                 self._format_balloon_status(status),

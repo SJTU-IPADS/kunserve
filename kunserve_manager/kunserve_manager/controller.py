@@ -71,11 +71,18 @@ class KunServeController:
         # warmup_balloon payload so each replica can resolve its lane
         # process group by name.
         self.lane_group_names: dict[int, str] = {}
-        self.backend = backend
         self.runtime_backend = KunServeRuntimeBackendConfig(
             comm_backend=comm_backend,
             capture_policy=capture_policy,
         )
+        requested_backend = str(backend or "nccl")
+        if (
+            self.runtime_backend.comm_backend == "sglang"
+            and requested_backend.lower() in ("nccl", "")
+        ):
+            self.backend = "kunserve_pynccl"
+        else:
+            self.backend = requested_backend
         # Disabling RESTORE keeps the control surface minimal for the first
         # end-to-end bring-up. The restore code paths are preserved unchanged
         # so they can be re-enabled later as a follow-up optimization.
@@ -438,8 +445,8 @@ class KunServeController:
             if running_waiting != self._last_asymmetric_balloon_signature:
                 logger.warning(
                     "[KunServeController] balloon runtime asymmetric drain detected: %s. "
-                    "This is the current high-risk condition for cross-replica MoE collectives "
-                    "because there is not yet a dummy-participation tick.",
+                    "This path requires scheduler Phase E keepalive so idle replicas "
+                    "continue participating in cross-replica MoE collectives.",
                     self._summarize_statuses(statuses),
                 )
                 self._last_asymmetric_balloon_signature = running_waiting
@@ -1026,14 +1033,22 @@ class KunServeController:
             force,
             self.group_name,
         )
+        group_names = [self.group_name]
+        group_names.extend(
+            lane_name
+            for lane_name in self.lane_group_names.values()
+            if lane_name not in group_names
+        )
         await asyncio.gather(
             *[
-                replica.destroy_weights_update_group(self.group_name)
+                replica.destroy_weights_update_group(group_name)
                 for replica in self._replicas
+                for group_name in group_names
             ],
             return_exceptions=True,
         )
         self._process_group_initialized = False
+        self.lane_group_names = {}
         logger.info("[KunServeController] process group destroyed.")
 
     def _should_enter_balloon(

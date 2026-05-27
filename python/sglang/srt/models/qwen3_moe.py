@@ -60,6 +60,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.kunserve_forward_timing import (
+    kunserve_detailed_timing_enabled,
+    kunserve_timing_scope,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
@@ -298,27 +302,53 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        detail_timing = kunserve_detailed_timing_enabled()
+        timing_fields = {
+            "layer_id": int(self.layer_id),
+            "num_tokens": int(num_tokens),
+            "hidden_dim": int(hidden_dim),
+        }
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        if detail_timing:
+            with kunserve_timing_scope("qwen3_moe_router_gate", **timing_fields):
+                router_logits, _ = self.gate(hidden_states)
+        else:
+            router_logits, _ = self.gate(hidden_states)
         expert_location_dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_global_server_args().ep_dispatch_algorithm is not None
             else None
         )
-        topk_output = self.topk(
-            hidden_states,
-            router_logits,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-        )
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if detail_timing:
+            with kunserve_timing_scope("qwen3_moe_topk", **timing_fields):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                )
+            with kunserve_timing_scope("qwen3_moe_experts_total", **timing_fields):
+                final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+            final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if detail_timing:
+                with kunserve_timing_scope("qwen3_moe_mlp_all_reduce", **timing_fields):
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -775,26 +805,60 @@ class Qwen3MoeDecoderLayer(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-                **kwargs,
+        detail_timing = kunserve_detailed_timing_enabled()
+        timing_fields = {
+            "layer_id": int(self.layer_id),
+            "mode": str(forward_batch.forward_mode),
+            "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
+            "num_tokens": int(hidden_states.shape[0]),
+        }
+
+        if detail_timing:
+            with kunserve_timing_scope("qwen3_moe_layer_prepare_attn", **timing_fields):
+                hidden_states, residual = (
+                    self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                        captured_last_layer_outputs=captured_last_layer_outputs,
+                        **kwargs,
+                    )
+                )
+        else:
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                    **kwargs,
+                )
             )
-        )
 
         if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            if detail_timing:
+                with kunserve_timing_scope("qwen3_moe_layer_attention", **timing_fields):
+                    hidden_states = self.self_attn(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                    )
+            else:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        if detail_timing:
+            with kunserve_timing_scope("qwen3_moe_layer_prepare_mlp", **timing_fields):
+                hidden_states, residual = self.layer_communicator.prepare_mlp(
+                    hidden_states, residual, forward_batch
+                )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -807,9 +871,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
             forward_batch
         )
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
+        if detail_timing:
+            mlp_fields = dict(timing_fields)
+            mlp_fields["num_tokens"] = int(hidden_states.shape[0])
+            with kunserve_timing_scope("qwen3_moe_layer_mlp", **mlp_fields):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
+        else:
+            hidden_states = self.mlp(
+                hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -942,22 +1017,33 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        timing_fields = {
+            "mode": str(forward_batch.forward_mode),
+            "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
+            "input_tokens": int(input_ids.numel()),
+        }
+        with kunserve_timing_scope("qwen3_moe_transformer", **timing_fields):
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+            with kunserve_timing_scope("qwen3_moe_logits_processor", **timing_fields):
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
         else:
             return hidden_states
 

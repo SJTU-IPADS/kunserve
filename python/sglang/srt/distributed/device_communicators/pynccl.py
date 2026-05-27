@@ -405,7 +405,8 @@ class PyNcclCommunicator:
 
         self.stream = stream
         self.disabled = not enable
-        yield
-
-        self.disabled = old_disable
-        self.stream = old_stream
+        try:
+            yield
+        finally:
+            self.disabled = old_disable
+            self.stream = old_stream

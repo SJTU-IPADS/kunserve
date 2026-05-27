@@ -121,6 +121,12 @@ class SchedulerUpdateWeightsMixin:
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
+        kunserve_cleanup = getattr(
+            self, "_kunserve_prepare_for_memory_release", None
+        )
+        if kunserve_cleanup is not None:
+            kunserve_cleanup()
+
         assert (
             self._is_no_request()
         ), "release_memory_occupation should be called only when no ongoing request."

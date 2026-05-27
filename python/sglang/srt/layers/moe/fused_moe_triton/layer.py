@@ -1,4 +1,6 @@
+import datetime
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -60,6 +62,10 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.kunserve_forward_timing import (
+    kunserve_detailed_timing_enabled,
+    kunserve_timing_scope,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -89,6 +95,26 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
+
+
+def _kunserve_runtime_log(message: str, *args) -> None:
+    # Best-effort direct file log for scheduler subprocess diagnostics.
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    try:
+        logger.info(message, *args)
+    except Exception:
+        pass
+    if not path:
+        return
+    try:
+        rendered = message % args if args else message
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"[{ts} pid={os.getpid()}] [KUNSERVE-DBG] {rendered}\n"
+            )
+    except Exception:
+        pass
 
 
 def create_moe_dispatcher(
@@ -565,6 +591,48 @@ class FusedMoE(torch.nn.Module):
         if dispatcher_local_expert_mapping is not None:
             dispatcher.local_expert_mapping = dispatcher_local_expert_mapping
             dispatcher.active_local_expert_mapping = dispatcher_local_expert_mapping
+            # CrossReplicaStandardDispatcher allocates graph-static buffers in
+            # __init__ and moves the mapping to CUDA there.  This shared legacy
+            # assignment can clobber that CUDA mapping back to CPU for explicit
+            # KunServe dispatchers, so re-normalize before any graph capture
+            # scope starts.
+            mapping_on = getattr(dispatcher, "_mapping_on", None)
+            if callable(mapping_on) and torch.cuda.is_available():
+                try:
+                    target_device = None
+                    for attr in (
+                        "_buf_padded_hidden",
+                        "_buf_gathered_hidden",
+                        "_buf_union_hidden",
+                    ):
+                        tensor = getattr(dispatcher, attr, None)
+                        if isinstance(tensor, torch.Tensor):
+                            target_device = tensor.device
+                            break
+                    if target_device is None:
+                        target_device = torch.device(
+                            "cuda", torch.cuda.current_device()
+                        )
+                    mapping_on(target_device)
+                    _kunserve_runtime_log(
+                        "register_runtime_bundle normalized dispatcher mapping: "
+                        "variant=%s layer_id=%s dispatcher=%s device=%s "
+                        "shape=%s",
+                        variant.value if hasattr(variant, "value") else variant,
+                        getattr(self, "layer_id", None),
+                        type(dispatcher).__name__,
+                        getattr(dispatcher.local_expert_mapping, "device", None),
+                        tuple(dispatcher.local_expert_mapping.shape),
+                    )
+                except Exception:
+                    _kunserve_runtime_log(
+                        "register_runtime_bundle FAILED to normalize dispatcher "
+                        "mapping: variant=%s layer_id=%s dispatcher=%s",
+                        variant.value if hasattr(variant, "value") else variant,
+                        getattr(self, "layer_id", None),
+                        type(dispatcher).__name__,
+                    )
+                    raise
 
         current_quant_config = getattr(self.dispatcher, "quant_config", None)
         if current_quant_config is not None:
@@ -1297,10 +1365,24 @@ class FusedMoE(torch.nn.Module):
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
+        detail_timing = kunserve_detailed_timing_enabled()
+        timing_fields = {
+            "layer_id": int(self.layer_id),
+            "num_tokens": int(hidden_states.shape[0]),
+            "hidden_dim": int(origin_hidden_states_dim),
+            "moe_tp_size": int(self.moe_tp_size),
+            "moe_ep_size": int(self.moe_ep_size),
+        }
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        if detail_timing:
+            with kunserve_timing_scope("fused_moe_dispatch", **timing_fields):
+                dispatch_output = self.dispatcher.dispatch(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+        else:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
         local_expert_mapping = getattr(
             self.dispatcher, "local_expert_mapping", self.active_local_expert_mapping
         )
@@ -1314,14 +1396,28 @@ class FusedMoE(torch.nn.Module):
                 .to(device="cuda")
             )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+        if detail_timing:
+            with kunserve_timing_scope("fused_moe_core", **timing_fields):
+                combine_input = self.run_moe_core(
+                    dispatch_output=dispatch_output,
+                )
+        else:
+            combine_input = self.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            if detail_timing:
+                with kunserve_timing_scope("fused_moe_combine", **timing_fields):
+                    final_hidden_states = self.dispatcher.combine(
+                        combine_input=combine_input
+                    )
+            else:
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
 
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
@@ -1329,7 +1425,13 @@ class FusedMoE(torch.nn.Module):
             ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if detail_timing:
+                with kunserve_timing_scope("fused_moe_all_reduce", **timing_fields):
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
 

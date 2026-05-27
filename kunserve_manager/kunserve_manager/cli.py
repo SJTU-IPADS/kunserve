@@ -91,7 +91,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--backend",
         default=_env_or("KUNSERVE_MANAGER_BACKEND", "nccl"),
-        help="init_weights_update_group backend (default: nccl).",
+        help=(
+            "init_weights_update_group backend (default: nccl; comm_backend=sglang "
+            "maps the default to kunserve_pynccl)."
+        ),
     )
     p.add_argument(
         "--comm-backend",
@@ -231,13 +234,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info(
         "kunserve_manager starting: replicas=%s model_path=%s poll=%.2fs "
-        "group=%s backend=%s comm_backend=%s capture_policy=%s eager_warmup=%s "
+        "group=%s backend=%s effective_backend=%s comm_backend=%s capture_policy=%s eager_warmup=%s "
         "enable_restore=%s output_dir=%s bw_log=%s",
         replicas,
         args.model_path,
         args.poll_interval,
         args.group_name,
         args.backend,
+        controller.backend,
         args.comm_backend,
         args.capture_policy,
         args.eager_warmup,

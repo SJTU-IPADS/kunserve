@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.kunserve_forward_timing import kunserve_timing_log, kunserve_timing_scope
 from sglang.srt.managers.io_struct import (
     CommitBalloonReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -521,29 +522,51 @@ class TpModelWorker(BaseTpWorker):
         #               which requires preparing replay to always be in this function
 
         # Get forward batch from model worker batch
+        kunserve_timing_log(
+            "tp_worker_forward_batch_generation_begin",
+            has_model_worker_batch=model_worker_batch is not None,
+            pp_last_rank=bool(self.pp_group.is_last_rank),
+            skip_attn_backend_init=bool(skip_attn_backend_init),
+        )
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            with kunserve_timing_scope("tp_worker_forward_batch_init"):
+                forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+
+        kunserve_timing_log(
+            "tp_worker_forward_batch_ready",
+            mode=str(forward_batch.forward_mode),
+            batch_size=getattr(forward_batch, "batch_size", None),
+            input_tokens=int(forward_batch.input_ids.numel())
+            if hasattr(forward_batch, "input_ids")
+            else None,
+        )
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
+            with kunserve_timing_scope(
+                "tp_worker_model_runner_forward",
+                mode=str(forward_batch.forward_mode),
+                batch_size=getattr(forward_batch, "batch_size", None),
+            ):
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                kunserve_graph_timing_meta=out.kunserve_graph_timing_meta,
             )
 
             if is_verify:
@@ -557,9 +580,14 @@ class TpModelWorker(BaseTpWorker):
             ):
 
                 def sample_batch_func():
-                    batch_result.next_token_ids = self.model_runner.sample(
-                        logits_output, forward_batch
-                    )
+                    with kunserve_timing_scope(
+                        "tp_worker_sample_delayed",
+                        mode=str(forward_batch.forward_mode),
+                        batch_size=getattr(forward_batch, "batch_size", None),
+                    ):
+                        batch_result.next_token_ids = self.model_runner.sample(
+                            logits_output, forward_batch
+                        )
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -567,9 +595,14 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
-                )
+                with kunserve_timing_scope(
+                    "tp_worker_sample",
+                    mode=str(forward_batch.forward_mode),
+                    batch_size=getattr(forward_batch, "batch_size", None),
+                ):
+                    batch_result.next_token_ids = self.model_runner.sample(
+                        logits_output, forward_batch
+                    )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -589,16 +622,22 @@ class TpModelWorker(BaseTpWorker):
 
             return batch_result
         else:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
+            with kunserve_timing_scope(
+                "tp_worker_model_runner_forward",
+                mode=str(forward_batch.forward_mode),
+                batch_size=getattr(forward_batch, "batch_size", None),
+            ):
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                kunserve_graph_timing_meta=out.kunserve_graph_timing_meta,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
@@ -622,6 +661,7 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            kunserve_graph_timing_meta=out.kunserve_graph_timing_meta,
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

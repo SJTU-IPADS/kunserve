@@ -36,6 +36,22 @@ def _is_cuda_graph_capturing(tensor: Optional[torch.Tensor]) -> bool:
         return True
 
 
+def _is_pre_capture_warmup(tensor: Optional[torch.Tensor]) -> bool:
+    if tensor is None or not tensor.is_cuda or not torch.cuda.is_available():
+        return False
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+    except Exception:
+        return False
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        return bool(get_is_capture_mode())
+    except Exception:
+        return False
+
+
 def _kunserve_dbg(message: str, *args) -> None:
     _logger.warning(message, *args)
     path = os.environ.get("KUNSERVE_DETAIL_LOG")
@@ -51,6 +67,19 @@ def _kunserve_dbg(message: str, *args) -> None:
             fh.write(f"[{ts} pid={os.getpid()}] {rendered}\n")
     except Exception:
         pass
+
+
+def _tensor_meta(tensor: Optional[torch.Tensor]) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return "None"
+    try:
+        ptr = hex(int(tensor.data_ptr()))
+    except Exception as exc:
+        ptr = f"<ptr_err:{exc!r}>"
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} ptr={ptr} contiguous={tensor.is_contiguous()}"
+    )
 
 
 @dataclass
@@ -209,7 +238,51 @@ def topk_ids_logical_to_physical(
 def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
-    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
+    # The two CUDA-graph pre-capture warmup forwards only initialize kernels and
+    # communicator state; their outputs are discarded.  Avoid exercising the
+    # mutable KunServe GLOBAL expert-location table in that phase.  The real
+    # CUDAGraph capture still records the logical->physical remap below.
+    if _is_pre_capture_warmup(topk_ids):
+        return topk_ids
+
+    mapping = info.partial_logical_to_rank_dispatch_physical_map
+    sig = (
+        "topk_static_remap",
+        tuple(topk_ids.shape),
+        str(topk_ids.dtype),
+        str(topk_ids.device),
+        str(getattr(mapping, "dtype", None)),
+        str(getattr(mapping, "device", None)),
+        _is_cuda_graph_capturing(topk_ids),
+    )
+    if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
+        _KUNSERVE_DBG_LAST_SIG[sig] = True
+        _kunserve_dbg(
+            "[KUNSERVE-DBG] topk_static_remap enter: topk_ids=%s mapping=%s capturing=%s pre_capture=%s",
+            _tensor_meta(topk_ids),
+            _tensor_meta(mapping),
+            _is_cuda_graph_capturing(topk_ids),
+            _is_pre_capture_warmup(topk_ids),
+        )
+    if mapping is None:
+        raise RuntimeError(
+            "ExpertLocationDispatchInfo static remap requires a non-None "
+            "partial_logical_to_rank_dispatch_physical_map."
+        )
+    if mapping.device != topk_ids.device:
+        _kunserve_dbg(
+            "[KUNSERVE-DBG] TOPK_STATIC_REMAP_DEVICE_MISMATCH: topk_ids=%s mapping=%s",
+            _tensor_meta(topk_ids),
+            _tensor_meta(mapping),
+        )
+        raise RuntimeError(
+            "ExpertLocationDispatchInfo static remap mapping must be on the "
+            f"same device as topk_ids; mapping={mapping.device}, "
+            f"topk_ids={topk_ids.device}."
+        )
+    flat_ids = topk_ids.reshape(-1).to(dtype=torch.long)
+    mapped = torch.gather(mapping, 0, flat_ids)
+    return mapped.view(topk_ids.shape)
 
 
 def _topk_ids_logical_to_physical_dynamic(

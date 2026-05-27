@@ -6,8 +6,7 @@ Each token's K expert assignments are sent ONLY to the ranks whose
 experts those assignments target.  The original top-k width is preserved
 for the MoE runner; columns not owned by the destination peer are masked
 as expert=-1, weight=0.  Expert outputs are then sent back to the origin
-rank and reduced per-token in fp32, matching the numerical behavior of a
-single-replica EP=4 fused MoE.
+rank and reduced per-token in the model dtype.
 
 Lane-level a2a (2-rank groups) is used rather than full 4-way a2a to
 keep the existing TP-all_reduce-handles-lane-combine architecture.
@@ -48,11 +47,9 @@ logger = logging.getLogger(__name__)
 class CrossReplicaTokenA2ADispatcher(BaseDispatcher):
     """KunServe Phase G GLOBAL dispatcher.
 
-    Numerical equivalence: each origin token's K expert contributions
-    are summed in fp32 on the origin rank in the same order as a
-    single-replica EP=N fused MoE.  Compared to Phase F
-    (lane.all_gather + lane.reduce_scatter + tp_all_reduce), only the
-    final tp_all_reduce bf16 step remains as a noise source.
+    Numerical equivalence: each origin token's K expert contributions are
+    summed on the origin rank without changing the original top-k width.
+    The combine dtype is the MoE output dtype.
 
     Constructor mirrors :class:`CrossReplicaStandardDispatcher`.
     """
@@ -468,15 +465,10 @@ class CrossReplicaTokenA2ADispatcher(BaseDispatcher):
         # Each recv_back row is one destination peer's partial MoE output for
         # flat_t[i].  The runner has already reduced that peer's local top-k
         # subset with topk_weights applied; here we sum peer partials per origin
-        # token in fp32.
-        out_fp32 = torch.zeros((M, H), dtype=torch.float32, device=device)
+        # token in the model dtype.
+        result = torch.zeros((M, H), dtype=post_expert.dtype, device=device)
         if num_send > 0:
-            # Upcast to fp32 for the reduction (matches single-replica EP
-            # numerical behavior).
-            recv_back_fp32 = recv_back.to(torch.float32)
-            out_fp32.index_add_(0, self._last_flat_t, recv_back_fp32)
-
-        result = out_fp32.to(post_expert.dtype)
+            result.index_add_(0, self._last_flat_t, recv_back)
 
         self._combine_call_count += 1
         if self._combine_call_count in (1, 5, 20, 100, 500):

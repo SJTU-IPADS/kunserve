@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import datetime
 import gc
 import inspect
 import logging
@@ -52,6 +53,13 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.kunserve_forward_timing import (
+    kunserve_cuda_graph_timing_capture,
+    kunserve_graph_internal_timing_enabled,
+    kunserve_graph_internal_timing_interval,
+    kunserve_timing_log,
+    kunserve_timing_scope,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -86,6 +94,26 @@ except ImportError:
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _kunserve_graph_log(message: str, *args) -> None:
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    try:
+        logger.info(message, *args)
+    except Exception:
+        pass
+    if not path:
+        return
+    try:
+        rendered = message % args if args else message
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"[{ts} pid={os.getpid()}] [KUNSERVE-DBG] cuda_graph {rendered}\n"
+            )
+    except Exception:
+        pass
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -263,6 +291,7 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self._kunserve_graph_padding_log_ct = 0
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -419,6 +448,36 @@ class CudaGraphRunner:
                 variants.add(key[1])
         return sorted(variants)
 
+    def drop_captured_variant(self, variant: Optional[Union[str, object]]) -> int:
+        """Drop all graphs for one runtime variant.
+
+        KunServe GLOBAL changes expert/KV VMM mappings during balloon commit.
+        A graph captured before that transition can still contain old device
+        pointers.  Dropping the variant lets commit recapture against the final
+        post-balloon memory layout.
+        """
+        normalized_variant = self._normalize_runtime_variant(variant)
+        keys_to_drop = [
+            key
+            for key in self.graphs
+            if (
+                key[0] == normalized_variant
+                if len(key) == 2
+                else key[1] == normalized_variant
+            )
+        ]
+        for key in keys_to_drop:
+            self.graphs.pop(key, None)
+            self.output_buffers.pop(key, None)
+        if keys_to_drop and normalized_variant == "global":
+            _kunserve_graph_log(
+                "drop_captured_variant variant=%s dropped=%d remaining_variants=%s",
+                normalized_variant,
+                len(keys_to_drop),
+                self.get_captured_variants(),
+            )
+        return len(keys_to_drop)
+
     def ensure_variant_captured(self, variant: Optional[Union[str, object]]) -> None:
         normalized_variant = self._normalize_runtime_variant(variant)
         if self.has_captured_variant(normalized_variant):
@@ -429,9 +488,44 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _kunserve_graph_bs_override(self, forward_batch: ForwardBatch) -> Optional[int]:
+        try:
+            runtime_variant = self.model_runner.get_cuda_graph_runtime_variant()
+        except Exception:
+            return None
+        if runtime_variant != "global":
+            return None
+        if str(getattr(self.model_runner, "_balloon_state", "local")) != "balloon":
+            return None
+        try:
+            if not (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_idle()
+            ):
+                return None
+        except Exception:
+            return None
+        getter = getattr(self.model_runner, "get_balloon_step_graph_bs_override", None)
+        if getter is None:
+            return None
+        try:
+            target_bs = getter()
+        except Exception:
+            return None
+        if target_bs is None:
+            return None
+        target_bs = int(target_bs)
+        if target_bs <= 0:
+            return None
+        raw_bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+        if target_bs < raw_bs:
+            return None
+        return target_bs
+
     def can_run(self, forward_batch: ForwardBatch):
         if not self.model_runner.is_cuda_graph_replay_enabled():
             return False
+        graph_bs_override = self._kunserve_graph_bs_override(forward_batch)
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -441,6 +535,8 @@ class CudaGraphRunner:
             )
         else:
             cuda_graph_bs = forward_batch.batch_size
+        if graph_bs_override is not None:
+            cuda_graph_bs = max(int(cuda_graph_bs), int(graph_bs_override))
 
         runtime_variant = self.model_runner.get_cuda_graph_runtime_variant()
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
@@ -632,6 +728,22 @@ class CudaGraphRunner:
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
+        try:
+            runtime_variant_for_log = self.model_runner.get_cuda_graph_runtime_variant()
+        except Exception:
+            runtime_variant_for_log = None
+        if runtime_variant_for_log == "global":
+            _kunserve_graph_log(
+                "capture_one_batch_size enter variant=%s bs=%d num_tokens=%d "
+                "stream_idx=%s tp_rank=%s graph=%s stream=%s",
+                runtime_variant_for_log,
+                bs,
+                num_tokens,
+                stream_idx,
+                getattr(self.model_runner, "tp_rank", None),
+                hex(id(graph)),
+                stream,
+            )
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -798,18 +910,88 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
+        skip_pre_capture_warmup = False
+        try:
+            runtime_variant = self.model_runner.get_cuda_graph_runtime_variant()
+            skip_pre_capture_warmup = runtime_variant == "global" and bool(
+                getattr(self.model_runner, "_kunserve_skip_global_pre_capture_warmup", True)
+            )
+        except Exception:
+            runtime_variant = None
+            skip_pre_capture_warmup = False
+
+        if skip_pre_capture_warmup:
+            # KunServe GLOBAL uses a different MoE dispatcher/runtime bundle and
+            # non-TP registered collectives.  The two generic SGLang warmup
+            # forwards run under graph_capture() but before torch.cuda.CUDAGraph
+            # capture; their outputs are discarded, and they have repeatedly
+            # poisoned CUDA before the actual graph capture begins.  We already
+            # preheat the KunServe communicators explicitly, so go straight to
+            # the real capture where the dispatcher takes its fixed static path.
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
-            run_once()
+            logger.info(
+                "Skip pre-capture warmup forwards for KunServe GLOBAL cuda graph."
+            )
+            _kunserve_graph_log(
+                "skip_pre_capture_warmup variant=%s bs=%d num_tokens=%d "
+                "stream_idx=%s tp_rank=%s",
+                runtime_variant,
+                bs,
+                num_tokens,
+                stream_idx,
+                getattr(self.model_runner, "tp_rank", None),
+            )
+        else:
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+        if runtime_variant_for_log == "global":
+            _kunserve_graph_log(
+                "capture_graph_begin variant=%s bs=%d num_tokens=%d "
+                "stream_idx=%s tp_rank=%s pool=%s",
+                runtime_variant_for_log,
+                bs,
+                num_tokens,
+                stream_idx,
+                getattr(self.model_runner, "tp_rank", None),
+                get_global_graph_memory_pool(),
+            )
+        try:
+            graph_key = self._graph_key(runtime_variant_for_log, bs, stream_idx)
+            with kunserve_cuda_graph_timing_capture(str(graph_key)):
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
+        except Exception as exc:
+            if runtime_variant_for_log == "global":
+                _kunserve_graph_log(
+                    "capture_graph_failed variant=%s bs=%d num_tokens=%d "
+                    "stream_idx=%s tp_rank=%s exc=%r",
+                    runtime_variant_for_log,
+                    bs,
+                    num_tokens,
+                    stream_idx,
+                    getattr(self.model_runner, "tp_rank", None),
+                    exc,
+                )
+            raise
+        if runtime_variant_for_log == "global":
+            _kunserve_graph_log(
+                "capture_graph_complete variant=%s bs=%d num_tokens=%d "
+                "stream_idx=%s tp_rank=%s",
+                runtime_variant_for_log,
+                bs,
+                num_tokens,
+                stream_idx,
+                getattr(self.model_runner, "tp_rank", None),
+            )
 
         return graph, out
 
@@ -857,6 +1039,7 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
+        graph_bs_override = self._kunserve_graph_bs_override(forward_batch)
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
@@ -865,9 +1048,16 @@ class CudaGraphRunner:
                 or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
             )
+            if graph_bs_override is not None:
+                max_batch_size = max(int(max_batch_size), int(graph_bs_override))
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
+            replay_bs = (
+                max(int(raw_bs), int(graph_bs_override))
+                if graph_bs_override is not None
+                else raw_bs
+            )
+            index = bisect.bisect_left(self.capture_bs, replay_bs)
         bs = self.capture_bs[index]
 
         seq_lens_cpu = buffers.populate_from_forward_batch(
@@ -884,6 +1074,19 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        replay_seq_lens_sum = forward_batch.seq_lens_sum + (
+            bs - raw_bs
+        ) * self.seq_len_fill_value
+        if self._kunserve_patch_global_graph_padding(
+            buffers=buffers,
+            forward_batch=forward_batch,
+            raw_bs=raw_bs,
+            raw_num_token=raw_num_token,
+            bs=bs,
+        ):
+            replay_seq_lens_sum = forward_batch.seq_lens_sum + (bs - raw_bs)
+            if seq_lens_cpu is not None:
+                seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -903,7 +1106,7 @@ class CudaGraphRunner:
             bs,
             buffers.req_pool_indices[:bs],
             buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            replay_seq_lens_sum,
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
             self.capture_forward_mode,
             forward_batch.spec_info,
@@ -915,6 +1118,90 @@ class CudaGraphRunner:
         self.raw_num_token = raw_num_token
         self.bs = bs
 
+    def _kunserve_patch_global_graph_padding(
+        self,
+        *,
+        buffers: GraphInputBuffers,
+        forward_batch: ForwardBatch,
+        raw_bs: int,
+        raw_num_token: int,
+        bs: int,
+    ) -> bool:
+        """Redirect KunServe GLOBAL graph padding rows to reserved dummy state.
+
+        SGLang CUDA graph replay may use a larger captured bucket than the live
+        decode batch, e.g. replaying bs=8 for raw_bs=6.  The stock padding path
+        resets seq_lens/out_cache_loc but leaves req_pool_indices[raw_bs:bs]
+        untouched.  After a request finishes, those stale entries can point at
+        a freed req_to_token row whose KV indices are invalid, poisoning CUDA in
+        the next graph replay.  KunServe already reserves a phantom req_pool row
+        and dummy KV slot for keepalive; use the same pair for padding rows.
+        """
+        if int(bs) <= int(raw_bs):
+            return False
+        try:
+            runtime_variant = self.model_runner.get_cuda_graph_runtime_variant()
+        except Exception:
+            runtime_variant = getattr(
+                self.model_runner, "_balloon_runtime_variant", "local"
+            )
+        if str(runtime_variant) != "global":
+            return False
+        if str(getattr(self.model_runner, "_balloon_state", "local")) != "balloon":
+            return False
+
+        pad_rows = int(bs) - int(raw_bs)
+        pad_tokens = pad_rows * int(self.num_tokens_per_bs)
+        pad_req_idx = getattr(
+            self.model_runner, "_kunserve_keepalive_phantom_req_idx", None
+        )
+        pad_kv_slot = getattr(
+            self.model_runner, "_kunserve_keepalive_dummy_kv_slot", None
+        )
+        fallback_req_idx = None
+        if pad_req_idx is None and int(raw_bs) > 0:
+            try:
+                fallback_req_idx = int(forward_batch.req_pool_indices[0].item())
+            except Exception:
+                fallback_req_idx = None
+
+        req_idx_value = (
+            int(pad_req_idx)
+            if pad_req_idx is not None
+            else (int(fallback_req_idx) if fallback_req_idx is not None else 0)
+        )
+        kv_value = int(pad_kv_slot) if pad_kv_slot is not None else 0
+
+        buffers.req_pool_indices[raw_bs:bs].fill_(req_idx_value)
+        buffers.seq_lens[raw_bs:bs].fill_(1)
+        buffers.seq_lens_cpu[raw_bs:bs].fill_(1)
+        token_end = int(raw_num_token) + int(pad_tokens)
+        buffers.input_ids[raw_num_token:token_end].zero_()
+        buffers.positions[raw_num_token:token_end].zero_()
+        buffers.mrope_positions[:, raw_num_token:token_end].zero_()
+        buffers.out_cache_loc[raw_num_token:token_end].fill_(kv_value)
+
+        self._kunserve_graph_padding_log_ct += 1
+        log_ct = self._kunserve_graph_padding_log_ct
+        if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
+            _kunserve_graph_log(
+                "global_padding_patch count=%d raw_bs=%d bs=%d pad_rows=%d "
+                "raw_num_token=%d pad_tokens=%d req_idx=%d dummy_kv=%d "
+                "phantom_available=%s dummy_available=%s tp_rank=%s",
+                log_ct,
+                int(raw_bs),
+                int(bs),
+                int(pad_rows),
+                int(raw_num_token),
+                int(pad_tokens),
+                int(req_idx_value),
+                int(kv_value),
+                pad_req_idx is not None,
+                pad_kv_slot is not None,
+                getattr(self.model_runner, "tp_rank", None),
+            )
+        return True
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -923,8 +1210,15 @@ class CudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
 
+        replay_fields = {
+            "runtime_variant": self.model_runner.get_cuda_graph_runtime_variant(),
+            "raw_batch_size": getattr(forward_batch, "batch_size", None),
+            "graph_bs_override": self._kunserve_graph_bs_override(forward_batch),
+            "skip_attn_backend_init": bool(skip_attn_backend_init),
+        }
         if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            with kunserve_timing_scope("cuda_graph_replay_prepare", **replay_fields):
+                self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
@@ -941,7 +1235,79 @@ class CudaGraphRunner:
             graph_key = self._graph_key(
                 self.model_runner.get_cuda_graph_runtime_variant(), self.bs
             )
-        self.graphs[graph_key].replay()
+        try:
+            runtime_variant_for_log = self.model_runner.get_cuda_graph_runtime_variant()
+        except Exception:
+            runtime_variant_for_log = None
+        if runtime_variant_for_log == "global":
+            replay_log_ct = int(getattr(self, "_kunserve_global_replay_log_ct", 0)) + 1
+            self._kunserve_global_replay_log_ct = replay_log_ct
+            if replay_log_ct in (1, 2, 3, 10, 100) or replay_log_ct % 1000 == 0:
+                _kunserve_graph_log(
+                    "replay variant=global count=%d graph_key=%s raw_bs=%d bs=%d "
+                    "raw_num_token=%d replay_enabled=%s state=%s tp_rank=%s",
+                    replay_log_ct,
+                    graph_key,
+                    int(self.raw_bs),
+                    int(self.bs),
+                    int(self.raw_num_token),
+                    bool(self.model_runner.is_cuda_graph_replay_enabled()),
+                    getattr(self.model_runner, "_balloon_state", None),
+                    getattr(self.model_runner, "tp_rank", None),
+                )
+        kunserve_timing_log(
+            "cuda_graph_replay_selected",
+            graph_key=str(graph_key),
+            raw_bs=int(self.raw_bs),
+            bs=int(self.bs),
+            raw_num_token=int(self.raw_num_token),
+            **replay_fields,
+        )
+        replay_ct = int(getattr(self, "_kunserve_graph_internal_replay_ct", 0)) + 1
+        self._kunserve_graph_internal_replay_ct = replay_ct
+        internal_interval = kunserve_graph_internal_timing_interval()
+        sample_internal = (
+            kunserve_graph_internal_timing_enabled()
+            and (replay_ct <= 3 or replay_ct % internal_interval == 0)
+        )
+        graph_start_event = graph_end_event = None
+        if sample_internal:
+            try:
+                graph_start_event = torch.cuda.Event(enable_timing=True)
+                graph_end_event = torch.cuda.Event(enable_timing=True)
+                graph_start_event.record()
+            except Exception:
+                graph_start_event = graph_end_event = None
+        with kunserve_timing_scope(
+            "cuda_graph_replay_launch",
+            graph_key=str(graph_key),
+            raw_bs=int(self.raw_bs),
+            bs=int(self.bs),
+            raw_num_token=int(self.raw_num_token),
+            **replay_fields,
+        ):
+            self.graphs[graph_key].replay()
+        if graph_end_event is not None:
+            try:
+                graph_end_event.record()
+            except Exception:
+                graph_start_event = graph_end_event = None
+        self._kunserve_last_replay_timing_meta = (
+            {
+                "graph_key": str(graph_key),
+                "graph_replay_count": int(replay_ct),
+                "graph_internal_sample": bool(sample_internal),
+                "graph_internal_interval": int(internal_interval),
+                "graph_start_event": graph_start_event,
+                "graph_end_event": graph_end_event,
+                "raw_bs": int(self.raw_bs),
+                "bs": int(self.bs),
+                "raw_num_token": int(self.raw_num_token),
+                **replay_fields,
+            }
+            if sample_internal
+            else None
+        )
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
