@@ -294,6 +294,9 @@ class KunServePyNcclGroup:
             pynccl_comm.all_gather(ag_out, ag_in)
             ar_buf = torch.zeros(1, device=self.device)
             pynccl_comm.all_reduce(ar_buf)
+            rs_in = torch.zeros(self.world_size, 1, device=self.device)
+            rs_out = torch.zeros(1, device=self.device)
+            pynccl_comm.reduce_scatter(rs_out, rs_in)
         torch.cuda.synchronize()
         self._diag_log(
             f"graph_comm_preheated name={self.name} unique={self.unique_name} "

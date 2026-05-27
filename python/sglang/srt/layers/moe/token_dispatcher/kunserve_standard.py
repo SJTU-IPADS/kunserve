@@ -203,7 +203,8 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         # group (intra-replica 2-rank group).  When both are available
         # dispatch uses lane_group.all_gather_into_tensor to avoid the
         # ``[A, A, B, B]`` redundancy of the global group, and combine
-        # uses lane_group.reduce_scatter_tensor + local_tp_group.all_reduce
+        # uses lane_group.reduce_scatter_tensor + the model layer's normal
+        # local TP all_reduce
         # instead of a global all_reduce so each rank only receives the
         # union slice it actually needs.  When either is None the
         # dispatcher transparently falls back to the Phase D path on
@@ -253,8 +254,19 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._static_dispatch_logged: bool = False
         self._static_after_gather_logged: bool = False
         self._static_combine_logged: bool = False
+        self._static_combine_mode_logged: bool = False
         self._static_mapping_mismatch_logged: bool = False
         self._probe_milestones = {1, 5, 20, 100, 500, 2000}
+        static_combine_mode = str(
+            _os.environ.get("KUNSERVE_STATIC_COMBINE_MODE", "reduce_scatter")
+        ).strip().lower()
+        if static_combine_mode not in ("reduce_scatter", "all_reduce"):
+            logger.warning(
+                "Invalid KUNSERVE_STATIC_COMBINE_MODE=%r; using reduce_scatter.",
+                static_combine_mode,
+            )
+            static_combine_mode = "reduce_scatter"
+        self._static_combine_mode = static_combine_mode
         # One-shot init diagnostic so we can confirm env-var propagation
         # to the scheduler subprocess from the file content.
         self._probe_log(
@@ -456,6 +468,31 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             return bool(torch.cuda.is_current_stream_capturing())
         except Exception:
             return False
+
+    def _require_static_graph_collective_group(self, group: Any, op_name: str) -> None:
+        """Fail early if the static CUDA graph path would hit torch.distributed.
+
+        The fixed-padded path is only meant to record KunServe PyNccl/SGLang
+        registered collectives.  A silent fallback to raw torch distributed
+        inside capture can hang or record non-replayable work.
+        """
+        try:
+            capturing = bool(torch.cuda.is_current_stream_capturing())
+        except Exception:
+            capturing = False
+        if not capturing:
+            return
+        if group is None or not hasattr(group, op_name):
+            raise RuntimeError(
+                "KunServe static GLOBAL CUDA graph requires a group exposing "
+                f"{op_name}; got {_group_name(group)}."
+            )
+        if not bool(getattr(group, "kunserve_graph_safe", False)):
+            raise RuntimeError(
+                "KunServe static GLOBAL CUDA graph requires registered/PyNccl "
+                f"collectives; group={_group_name(group)} op={op_name} would "
+                "fall back to raw torch.distributed."
+            )
 
     # ------------------------------------------------------------------
     # dynamic (eager) path - preserved from the correctness-first version
@@ -943,6 +980,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             gather_group = self.lane_group
         else:
             gather_group = self.group
+        self._require_static_graph_collective_group(
+            gather_group, "all_gather_into_tensor"
+        )
         with _detail_scope(
             detail_timing, "kunserve_dispatch_static_all_gather", **timing_fields
         ):
@@ -1089,16 +1129,16 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             self._static_combine_logged = True
 
         if self.phase_f_enabled:
-            # Phase F combine: lane all_reduce + local slice.
+            # Phase F combine: lane collective + local slice.
             #
             # Input shape: [NR*M, H] -- partial expert sum from this rank's
             # local_experts over the whole union batch.
             #
-            # reduce_scatter would be the bandwidth-optimal operation here,
-            # but the GLOBAL CUDA graph path has shown replay-only corruption
-            # with registered reduce_scatter.  all_reduce on the same lane
-            # subgroup is mathematically equivalent; each rank then slices out
-            # the replica chunk it needs:
+            # reduce_scatter is the bandwidth-optimal operation here: each rank
+            # only needs its own replica chunk after summing the lane peers.
+            # all_reduce remains available via KUNSERVE_STATIC_COMBINE_MODE for
+            # quick rollback if a driver/NCCL stack regresses registered
+            # reduce_scatter replay.
             #   lane0 rank → experts 0..63 partial for its replica's tokens
             #   lane1 rank → experts 64..127 partial for its replica's tokens
             #
@@ -1108,8 +1148,48 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             # Doing it here too would double-reduce every layer and overflow
             # after many MoE layers.
             M = int(self._capture_max_m)
+            timing_fields["combine_mode"] = self._static_combine_mode
+            if not self._static_combine_mode_logged:
+                self._probe_log(
+                    f"static_combine_mode rank={self.global_rank} "
+                    f"replica={self.replica_rank} lane={self.lane_rank} "
+                    f"mode={self._static_combine_mode} phase_f={self.phase_f_enabled} "
+                    f"lane_group={_group_name(self.lane_group)} "
+                    f"slice_buf={_tensor_meta(getattr(self, '_buf_combine_local_slice', None))}"
+                )
+                self._static_combine_mode_logged = True
+            if self._static_combine_mode == "reduce_scatter":
+                local_slice = self._buf_combine_local_slice
+                if (
+                    local_slice is None
+                    or tuple(local_slice.shape) != (M, int(hidden_states.shape[1]))
+                    or local_slice.dtype != hidden_states.dtype
+                    or local_slice.device != hidden_states.device
+                ):
+                    raise RuntimeError(
+                        "KunServe static reduce_scatter combine buffer mismatch: "
+                        f"slice={_tensor_meta(local_slice)} "
+                        f"input={_tensor_meta(hidden_states)} M={M}."
+                    )
+                self._require_static_graph_collective_group(
+                    self.lane_group, "reduce_scatter_tensor"
+                )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_combine_static_lane_reduce_scatter",
+                    **timing_fields,
+                ):
+                    _reduce_scatter_tensor(self.lane_group, local_slice, hidden_states)
+                with _detail_scope(
+                    detail_timing, "kunserve_combine_static_slice", **timing_fields
+                ):
+                    return local_slice[: int(self._last_local_m)].contiguous()
+
+            self._require_static_graph_collective_group(self.lane_group, "all_reduce")
             with _detail_scope(
-                detail_timing, "kunserve_combine_static_lane_all_reduce", **timing_fields
+                detail_timing,
+                "kunserve_combine_static_lane_all_reduce",
+                **timing_fields,
             ):
                 _all_reduce(self.lane_group, hidden_states)
             start = int(self.replica_rank) * M
@@ -1128,6 +1208,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         with _detail_scope(
             detail_timing, "kunserve_combine_static_global_all_reduce", **timing_fields
         ):
+            self._require_static_graph_collective_group(self.group, "all_reduce")
             _all_reduce(self.group, hidden_states)
 
         start = self.replica_rank * self._capture_max_m

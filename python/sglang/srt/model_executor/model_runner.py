@@ -1595,7 +1595,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 #   dispatch -> all_gather_into_tensor on lane_group
                 #               (no [A,A,B,B] redundancy)
                 #   combine  -> reduce_scatter on lane_group +
-                #               all_reduce on local_tp_group
+                #               the model layer's normal local TP all_reduce
                 #               (no wasted all_gather half)
                 # When unavailable it transparently falls back to the
                 # Phase D path on the global runtime_group.
@@ -1919,6 +1919,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ar_buf = torch.zeros(1, device=preheat_device)
                 self._kunserve_all_reduce(group, ar_buf)
                 torch.cuda.synchronize()
+                if world > 1 and hasattr(group, "reduce_scatter_tensor"):
+                    rs_in = torch.zeros(world, 1, device=preheat_device)
+                    rs_out = torch.zeros(1, device=preheat_device)
+                    self._kunserve_reduce_scatter_tensor(group, rs_out, rs_in)
+                    torch.cuda.synchronize()
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] preheat %s: reduce_scatter_tensor OK",
+                        label,
+                    )
                 _kunserve_ms(
                     "[KUNSERVE-MS] NCCL communicator preheat done for %s: world=%d",
                     label,
@@ -2372,8 +2381,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     #
                     # Phase F (lane_group + local_tp_group):
                     #   dispatch  → lane_group.all_gather_into_tensor
-                    #   combine   → lane_group.all_reduce + slice
-                    #               + local_tp_group.all_reduce
+                    #   combine   → lane_group.reduce_scatter_tensor + slice
+                    #               + the model layer's normal TP all_reduce
                     # Phase D fallback (runtime_group only):
                     #   dispatch  → runtime_group.all_gather_into_tensor
                     #   combine   → runtime_group.all_reduce
@@ -2415,6 +2424,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             )
                             self._kunserve_all_reduce(group, ar_buf)
                             torch.cuda.synchronize()
+                            if world > 1 and hasattr(group, "reduce_scatter_tensor"):
+                                rs_in = torch.zeros(
+                                    world, 1, device=preheat_device
+                                )
+                                rs_out = torch.zeros(
+                                    1, device=preheat_device
+                                )
+                                self._kunserve_reduce_scatter_tensor(
+                                    group, rs_out, rs_in
+                                )
+                                torch.cuda.synchronize()
+                                _kunserve_ms(
+                                    "[KUNSERVE-MS] preheat %s: "
+                                    "reduce_scatter_tensor OK",
+                                    label,
+                                )
                             _kunserve_ms(
                                 "[KUNSERVE-MS] NCCL communicator preheat "
                                 "done for %s: world=%d",

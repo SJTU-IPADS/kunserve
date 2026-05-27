@@ -136,12 +136,12 @@ graph_bs_override
 
 ## 8. cached negotiate 策略
 
-每步 negotiate 太慢，因此当前用短窗口 cache。
+每步 negotiate 太慢，因此当前用 lockstep cache。单个 rank 不能仅凭本地 batch 变化独自 negotiate，否则 peer rank 可能还在复用 cache，最终造成 collective participation 不一致。
 
 默认：
 
 ```bash
-KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=16
+KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=256
 ```
 
 refresh step：
@@ -157,7 +157,7 @@ cache step：
 - 如果本地增长超过 cached max，立即 reset cache；
 - 如果本地出现 prefill，推迟到下一次 refresh。
 
-这保留了 “batch 变化需要重新 negotiate” 的安全性，但承认一个事实：peer shrink 在没有通信时不可见，所以只能在 refresh step 观察。这个 tradeoff 的收益是大幅降低 scheduler gap。
+这保留了 “不安全 batch 变化需要重新 negotiate” 的安全性，但承认一个事实：peer shrink 在没有通信时不可见，所以只能在 refresh step 观察。默认 refresh interval 从 16 放大到 256，用更少的重复协商换取更长的 shrink/prefill admission 滞后。
 
 ## 9. 2026-05-27 release cleanup
 

@@ -823,8 +823,17 @@ class Scheduler(
         self._kunserve_prefill_blocked_full_log_ct: int = 0
         self._kunserve_graph_prefill_defer_log_ct: int = 0
         self._kunserve_phase_e_prefill_defer_log_ct: int = 0
+        # Phase E negotiation is a lockstep collective.  A rank cannot safely
+        # decide to negotiate only because its own local batch changed; peers
+        # that reuse a cached decision would deadlock.  The cache therefore
+        # behaves event-driven for steady decode/shrink steps by reusing the
+        # last shared bucket, with a low-frequency deterministic refresh to
+        # admit prefill/growth and to eventually lower the shared bucket after
+        # all ranks shrink.  The old default (16) made refresh cost visible in
+        # every profile; 256 keeps the safety valve while removing most steady
+        # decode negotiations.
         self._phase_e_negotiate_interval: int = max(
-            1, get_int_env_var("KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL", 16)
+            1, get_int_env_var("KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL", 256)
         )
         self._phase_e_cache_valid: bool = False
         self._phase_e_cached_max_bs: int = 0
@@ -3886,12 +3895,14 @@ class Scheduler(
         return self._phase_e_cached_steps_left <= 0
 
     def _phase_e_may_defer_prefill_for_cache(self) -> bool:
-        """Hold new prefill until the next scheduled Phase E refresh.
+        """Hold new prefill until the next lockstep Phase E refresh.
 
         Skipping Phase E negotiation is safe only while every rank keeps
         replaying the same cached decode bucket.  A local EXTEND/mixed step
-        would need all peers to force eager on that same scheduler step, so
-        we admit prefill only on refresh steps where all ranks negotiate.
+        would need all peers to force eager on that same scheduler step.  The
+        deterministic refresh interval is the lockstep event boundary that
+        lets a local waiting request become globally visible without letting
+        one rank enter the collective alone.
         """
         if not self._phase_e_cache_enabled():
             return False
@@ -3952,8 +3963,9 @@ class Scheduler(
         if self._phase_e_cached_steps_left <= 0:
             return None
         if local_force_eager:
-            # This should normally be prevented by prefill deferral.  Do not
-            # replay a decode graph for a local EXTEND/mixed batch.
+            # This should normally be prevented by prefill deferral until a
+            # deterministic refresh step where every rank negotiates together.
+            # Do not replay a decode graph for a local EXTEND/mixed batch.
             self._phase_e_reset_cached_decision("local force eager")
             return None
         if int(local_padded) > int(self._phase_e_cached_max_bs):

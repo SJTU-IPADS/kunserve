@@ -15,12 +15,12 @@ GLOBAL graph replay 有两个硬约束：
 
 ## 2. 当前策略
 
-当前策略是 “定期 collective refresh + 本地安全失效 + 窗口内复用 cache”。
+当前策略是 “低频 lockstep collective refresh + 本地安全失效 + 窗口内复用 cache”。它不是让某个 rank 因为本地 batch 变化而单独进入 collective；这种纯本地事件触发会和 peer 的 cache reuse 形成死锁。
 
 默认窗口：
 
 ```bash
-KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=16
+KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=256
 ```
 
 每个 refresh step：
@@ -98,9 +98,9 @@ _phase_e_may_defer_prefill_for_cache()
 
 因此当前实现是：
 
-- 本地变化导致不安全时立刻 reset。
-- peer 变化通过定期 refresh 观察。
-- interval 控制最坏滞后和通信开销。
+- 本地变化导致不安全时立刻 reset，并等待 lockstep refresh。
+- peer 变化通过低频 refresh 观察。
+- interval 控制最坏滞后和通信开销；默认从 16 放大到 256，以减少 steady decode 中重复的 `max=8/min=8` negotiation。
 
 如果未来 manager heartbeat 能低成本广播 peer batch bucket，可以进一步接近真正的 “变化时 negotiate”。
 
@@ -172,9 +172,9 @@ kunserve_memory_release_cleanup
 ## 11. 调参建议
 
 - `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=1`：退回每步 negotiate，适合 debug。
-- `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=8`：更保守，peer shrink 滞后较小。
-- `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=16`：当前默认。
-- 更大 interval：降低协商开销，但增加 padding/keepalive 浪费和 prefill admission 滞后。
+- `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=8` 或 `16`：更保守，peer shrink/prefill admission 滞后较小，但 negotiation 开销更高。
+- `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=256`：当前默认，用于降低 steady decode 中重复协商。
+- 更大 interval：进一步降低协商开销，但增加 padding/keepalive 浪费和 prefill admission 滞后。
 
 性能实验应同时看：
 

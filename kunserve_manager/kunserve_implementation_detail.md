@@ -153,10 +153,10 @@ from_cache
 环境变量：
 
 ```bash
-KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=16
+KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=256
 ```
 
-默认每 16 步做一次 collective negotiate，其余步骤复用 cache。
+默认每 256 步做一次 lockstep collective refresh，其余步骤复用 cache。这个 refresh 是安全边界：单个 rank 不能只因为本地 batch 变化就独自进入 negotiate，否则 peer rank 可能仍复用 cache。
 
 cache 可用条件：
 

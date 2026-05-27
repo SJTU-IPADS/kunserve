@@ -116,7 +116,7 @@ GLOBAL graph/replay 的硬约束：所有 lane rank 必须在同一步进入同�
 
 逐 token 都做跨 replica negotiate 的开销很高，timing 里曾看到 scheduler gap 被 negotiate 放大到 20ms 量级。因此当前策略不是每步 collective，而是缓存最近一次决策：
 
-- 默认 `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=16`。
+- 默认 `KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL=256`。
 - refresh step：用 `runtime_group` collective 交换 `(local_padded_bs, local_force_eager)`。
 - cache step：复用上次 `cached_max_bs/cached_min_bs/cached_any_force_eager`。
 - cache step 上所有 rank 都 replay `cached_max_bs` 对应 graph bucket，小 batch padding 到该 bucket。
@@ -128,7 +128,7 @@ GLOBAL graph/replay 的硬约束：所有 lane rank 必须在同一步进入同�
 - cache 未到期时若 waiting queue 有 prefill：暂缓 prefill 到下一次 refresh，避免一边 replay decode graph、一边另一个 rank 需要 eager。
 - cache 到期后必须 collective refresh；如果所有 rank idle，`max_bs=0`，停止 keepalive。
 
-这不是 “永久固定 batch=8”。它是 bounded cached decision：在一个短窗口内固定 graph bucket，窗口结束或本地 shape 不安全时重新协商。
+这不是 “永久固定 batch=8”。它是 bounded cached decision：在一个 lockstep 窗口内固定 graph bucket，窗口结束或本地 shape 不安全时重新协商。不能让单个 rank 仅凭本地 batch 变化独自进入 negotiate，否则 peer rank 可能仍复用 cache 并导致 collective 死锁。
 
 ## 7. 2026-05-27 release bug
 
