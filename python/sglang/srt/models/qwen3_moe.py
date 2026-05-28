@@ -320,27 +320,43 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if get_global_server_args().ep_dispatch_algorithm is not None
             else None
         )
-        if detail_timing:
-            with kunserve_timing_scope("qwen3_moe_topk", **timing_fields):
+        allow_kunserve_tp_allreduce_fusion = (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        )
+        dispatcher = getattr(self.experts, "dispatcher", None)
+        set_kunserve_fusion = getattr(
+            dispatcher, "set_static_tp_allreduce_fusion_enabled", None
+        )
+        if callable(set_kunserve_fusion):
+            set_kunserve_fusion(allow_kunserve_tp_allreduce_fusion)
+        try:
+            if detail_timing:
+                with kunserve_timing_scope("qwen3_moe_topk", **timing_fields):
+                    topk_output = self.topk(
+                        hidden_states,
+                        router_logits,
+                        expert_location_dispatch_info=expert_location_dispatch_info,
+                    )
+                with kunserve_timing_scope("qwen3_moe_experts_total", **timing_fields):
+                    final_hidden_states = self.experts(hidden_states, topk_output)
+            else:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-            with kunserve_timing_scope("qwen3_moe_experts_total", **timing_fields):
                 final_hidden_states = self.experts(hidden_states, topk_output)
-        else:
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
-            final_hidden_states = self.experts(hidden_states, topk_output)
+        finally:
+            if callable(set_kunserve_fusion):
+                set_kunserve_fusion(False)
         if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            allow_kunserve_tp_allreduce_fusion
+            and not bool(
+                getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
+            )
         ):
             if detail_timing:
                 with kunserve_timing_scope("qwen3_moe_mlp_all_reduce", **timing_fields):

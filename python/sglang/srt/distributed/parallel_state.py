@@ -172,6 +172,28 @@ def reg_reduce_scatter_tensor(
     group._reduce_scatter_tensor(output, input)
 
 
+@register_custom_op(mutates_args=["output"])
+def kunserve_lane_reduce_scatter_then_tp_all_reduce(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    lane_group_name: str,
+    tp_group_name: str,
+) -> None:
+    assert lane_group_name in _groups, f"Group {lane_group_name} is not found."
+    lane_group = _groups[lane_group_name]()
+    if lane_group is None:
+        raise ValueError(f"Group {lane_group_name} is destroyed.")
+
+    assert tp_group_name in _groups, f"Group {tp_group_name} is not found."
+    tp_group = _groups[tp_group_name]()
+    if tp_group is None:
+        raise ValueError(f"Group {tp_group_name} is destroyed.")
+
+    lane_group._reduce_scatter_tensor(output, input)
+    if int(getattr(tp_group, "world_size", 1)) > 1:
+        tp_group._all_reduce_in_place(output)
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.

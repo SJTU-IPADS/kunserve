@@ -1420,9 +1420,17 @@ class FusedMoE(torch.nn.Module):
                 )
 
             # TODO: should we add some conditions here?
+            kunserve_tp_allreduce_done = bool(
+                getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
+            )
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+            if kunserve_tp_allreduce_done:
+                try:
+                    final_hidden_states._kunserve_tp_allreduce_done = True
+                except Exception:
+                    pass
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             if detail_timing:

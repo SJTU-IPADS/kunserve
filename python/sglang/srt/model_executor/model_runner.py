@@ -1624,8 +1624,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 try:
                     from sglang.srt.distributed.parallel_state import get_tp_group
 
-                    tp_coord = get_tp_group()
-                    local_tp_group = getattr(tp_coord, "device_group", None)
+                    local_tp_group = get_tp_group()
                 except Exception as exc:
                     _kunserve_ms(
                         "[KUNSERVE-MS] Phase F local TP group unavailable: "
@@ -2363,9 +2362,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             get_tp_group,
                         )
 
-                        preheat_groups.append(
-                            ("local_tp", get_tp_group().device_group)
-                        )
+                        preheat_groups.append(("local_tp", get_tp_group()))
                     except Exception as exc:
                         _kunserve_ms(
                             "[KUNSERVE-MS] preheat: failed to resolve "

@@ -7,6 +7,9 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.parallel_state import (
+    kunserve_lane_reduce_scatter_then_tp_all_reduce,
+)
 from sglang.srt.kunserve_forward_timing import (
     kunserve_detailed_timing_enabled,
     kunserve_timing_scope,
@@ -113,6 +116,11 @@ def _group_name(group: Any) -> str:
         if value is not None:
             return str(value)
     return type(group).__name__
+
+
+def _group_unique_name(group: Any) -> Optional[str]:
+    value = getattr(group, "unique_name", None)
+    return str(value) if value is not None else None
 
 
 class CrossReplicaStandardDispatcher(BaseDispatcher):
@@ -260,13 +268,23 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         static_combine_mode = str(
             _os.environ.get("KUNSERVE_STATIC_COMBINE_MODE", "reduce_scatter")
         ).strip().lower()
-        if static_combine_mode not in ("reduce_scatter", "all_reduce"):
+        enable_composite_fusion = _os.environ.get(
+            "KUNSERVE_STATIC_COMBINE_TP_ALLREDUCE_FUSION", ""
+        ) in ("1", "true", "True", "yes", "on")
+        if enable_composite_fusion and static_combine_mode == "reduce_scatter":
+            static_combine_mode = "reduce_scatter_tp_all_reduce"
+        if static_combine_mode not in (
+            "reduce_scatter",
+            "reduce_scatter_tp_all_reduce",
+            "all_reduce",
+        ):
             logger.warning(
                 "Invalid KUNSERVE_STATIC_COMBINE_MODE=%r; using reduce_scatter.",
                 static_combine_mode,
             )
             static_combine_mode = "reduce_scatter"
         self._static_combine_mode = static_combine_mode
+        self._allow_static_tp_allreduce_fusion: bool = False
         # One-shot init diagnostic so we can confirm env-var propagation
         # to the scheduler subprocess from the file content.
         self._probe_log(
@@ -1158,7 +1176,10 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     f"slice_buf={_tensor_meta(getattr(self, '_buf_combine_local_slice', None))}"
                 )
                 self._static_combine_mode_logged = True
-            if self._static_combine_mode == "reduce_scatter":
+            if self._static_combine_mode in (
+                "reduce_scatter",
+                "reduce_scatter_tp_all_reduce",
+            ):
                 local_slice = self._buf_combine_local_slice
                 if (
                     local_slice is None
@@ -1174,6 +1195,44 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 self._require_static_graph_collective_group(
                     self.lane_group, "reduce_scatter_tensor"
                 )
+                if (
+                    self._static_combine_mode == "reduce_scatter_tp_all_reduce"
+                    and self._allow_static_tp_allreduce_fusion
+                ):
+                    lane_group_name = _group_unique_name(self.lane_group)
+                    tp_group_name = _group_unique_name(self.local_tp_group)
+                    if lane_group_name is None or tp_group_name is None:
+                        raise RuntimeError(
+                            "KunServe static TP all-reduce fusion requires registered "
+                            f"group names; lane_group={_group_name(self.lane_group)} "
+                            f"local_tp_group={_group_name(self.local_tp_group)}."
+                        )
+                    if not hasattr(self.local_tp_group, "_all_reduce_in_place"):
+                        raise RuntimeError(
+                            "KunServe static TP all-reduce fusion requires the "
+                            "SGLang TP GroupCoordinator, not a raw ProcessGroup."
+                        )
+                    with _detail_scope(
+                        detail_timing,
+                        "kunserve_combine_static_lane_reduce_scatter_tp_all_reduce",
+                        **timing_fields,
+                    ):
+                        kunserve_lane_reduce_scatter_then_tp_all_reduce(
+                            local_slice,
+                            hidden_states,
+                            lane_group_name,
+                            tp_group_name,
+                        )
+                    with _detail_scope(
+                        detail_timing, "kunserve_combine_static_slice", **timing_fields
+                    ):
+                        result = local_slice[: int(self._last_local_m)].contiguous()
+                    try:
+                        result._kunserve_tp_allreduce_done = True
+                    except Exception:
+                        pass
+                    return result
+
                 with _detail_scope(
                     detail_timing,
                     "kunserve_combine_static_lane_reduce_scatter",
@@ -1219,6 +1278,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
     # ------------------------------------------------------------------
     # public BaseDispatcher API
     # ------------------------------------------------------------------
+
+    def set_static_tp_allreduce_fusion_enabled(self, enabled: bool) -> None:
+        self._allow_static_tp_allreduce_fusion = bool(enabled)
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
