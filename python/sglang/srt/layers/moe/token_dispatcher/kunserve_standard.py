@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.kunserve_pynccl import (
+    get_kunserve_combine_alt_stream,
+)
 from sglang.srt.distributed.parallel_state import (
     kunserve_lane_reduce_scatter_then_tp_all_reduce,
 )
@@ -25,6 +28,18 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
+from sglang.srt.utils.common import get_current_device_stream_fast
+
+
+def _is_capture_mode() -> bool:
+    # Lazy import: top-level ``from sglang.srt.model_executor.cuda_graph_runner
+    # import get_is_capture_mode`` triggers a circular import via
+    # cuda_graph_runner → two_batch_overlap → token_dispatcher → this file.
+    # Importing inside the function defers the resolution until first call,
+    # by which time all module bodies have finished executing.
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    return get_is_capture_mode()
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +48,26 @@ def _detail_scope(enabled: bool, event: str, **fields: Any):
     if enabled:
         return kunserve_timing_scope(event, **fields)
     return nullcontext()
+
+
+@contextmanager
+def _alt_stream_fork_join(alt_stream: Optional[torch.cuda.Stream]):
+    """Fork the captured stream onto ``alt_stream`` for the body, then join.
+
+    Used by Phase B.1 combine to issue NCCL on a side stream while the main
+    capture stream proceeds (and to overlap with expert compute in B.2).
+    No-op when ``alt_stream`` is ``None`` so call sites can be unconditional.
+    """
+    if alt_stream is None:
+        yield
+        return
+    current = get_current_device_stream_fast()
+    alt_stream.wait_stream(current)
+    try:
+        with torch.cuda.stream(alt_stream):
+            yield
+    finally:
+        current.wait_stream(alt_stream)
 
 
 def _group_world_size(group: Any) -> int:
@@ -294,6 +329,18 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "KUNSERVE_DISPATCH_NCCL_GROUP", "1"
         ) in ("1", "true", "True", "yes", "on")
         self._dispatch_ncclgroup_logged: bool = False
+        # Phase B.1: combine NCCL on alt stream.  When enabled, the
+        # lane-reduce-scatter (and optional TP all-reduce composite) in
+        # _combine_static is forked to a side stream so a future
+        # Phase B.2 chunked-expert path can overlap expert compute with
+        # combine comm.  B.1 itself produces no overlap (expert is still
+        # one big kernel ahead of combine), but verifies the alt-stream
+        # NCCL pattern is graph-safe and numerically identical.  Default
+        # off until verified.
+        self._combine_alt_stream_enabled: bool = _os.environ.get(
+            "KUNSERVE_COMBINE_ALT_STREAM", "0"
+        ) in ("1", "true", "True", "yes", "on")
+        self._combine_alt_stream_logged: bool = False
         # One-shot init diagnostic so we can confirm env-var propagation
         # to the scheduler subprocess from the file content.
         self._probe_log(
@@ -301,7 +348,8 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             f"detail_log={self._probe_detail_log_path!r} "
             f"rank={self.global_rank} replica={self.replica_rank} "
             f"lane={self.lane_rank} phase_f={self.phase_f_enabled} "
-            f"dispatch_ncclgroup={self._dispatch_ncclgroup_enabled}"
+            f"dispatch_ncclgroup={self._dispatch_ncclgroup_enabled} "
+            f"combine_alt_stream={self._combine_alt_stream_enabled}"
         )
 
         # Static buffers for the fixed-padded capture path.  We pre-allocate
@@ -1230,6 +1278,28 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 self._require_static_graph_collective_group(
                     self.lane_group, "reduce_scatter_tensor"
                 )
+                # Phase B.1: only fork the lane NCCL onto an alt stream when
+                # we're actually inside a CUDA graph capture.  Outside
+                # capture (eager / extend) the fork/join cost dwarfs any
+                # benefit and the dynamic path doesn't expect side-stream
+                # NCCL.  ``alt_stream`` is None → ``_alt_stream_fork_join``
+                # is a no-op, so the call site stays unconditional.
+                use_alt_stream = (
+                    self._combine_alt_stream_enabled and _is_capture_mode()
+                )
+                alt_stream = (
+                    get_kunserve_combine_alt_stream(hidden_states.device)
+                    if use_alt_stream
+                    else None
+                )
+                if use_alt_stream and not self._combine_alt_stream_logged:
+                    self._probe_log(
+                        f"combine_alt_stream_active rank={self.global_rank} "
+                        f"replica={self.replica_rank} lane={self.lane_rank} "
+                        f"phase_f={self.phase_f_enabled} "
+                        f"mode={self._static_combine_mode}"
+                    )
+                    self._combine_alt_stream_logged = True
                 if (
                     self._static_combine_mode == "reduce_scatter_tp_all_reduce"
                     and self._allow_static_tp_allreduce_fusion
@@ -1252,12 +1322,13 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                         "kunserve_combine_static_lane_reduce_scatter_tp_all_reduce",
                         **timing_fields,
                     ):
-                        kunserve_lane_reduce_scatter_then_tp_all_reduce(
-                            local_slice,
-                            hidden_states,
-                            lane_group_name,
-                            tp_group_name,
-                        )
+                        with _alt_stream_fork_join(alt_stream):
+                            kunserve_lane_reduce_scatter_then_tp_all_reduce(
+                                local_slice,
+                                hidden_states,
+                                lane_group_name,
+                                tp_group_name,
+                            )
                     with _detail_scope(
                         detail_timing, "kunserve_combine_static_slice", **timing_fields
                     ):
@@ -1273,7 +1344,10 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     "kunserve_combine_static_lane_reduce_scatter",
                     **timing_fields,
                 ):
-                    _reduce_scatter_tensor(self.lane_group, local_slice, hidden_states)
+                    with _alt_stream_fork_join(alt_stream):
+                        _reduce_scatter_tensor(
+                            self.lane_group, local_slice, hidden_states
+                        )
                 with _detail_scope(
                     detail_timing, "kunserve_combine_static_slice", **timing_fields
                 ):

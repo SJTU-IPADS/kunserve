@@ -295,7 +295,13 @@ alt:                  [d_h2 0.045][c_h1 0.045 from t=0.165]        end ≈ 0.210
    - 测：cuda_graph_replay_launch 是否下降。
 
 2. **阶段 B（3–5 天）**：实现 P2（combine 上 alt_stream + chunked expert）。
-   - **B.1**（1 天）：在 `CrossReplicaStandardDispatcher` 添加 `combine_a/combine_b` 接口，先用 alt stream 但不切 chunk，验证 alt stream 上 graph-safe NCCL 行为。
+   - **B.1**（1 天）✅ Implemented (2026-05-28)：在 `CrossReplicaStandardDispatcher` 把 lane reduce-scatter（含 route A composite）forking 到一条单例 alt CUDA stream 上跑，验证 alt-stream NCCL 在 fixed_padded CUDA graph capture 内 graph-safe 且数值等价。
+     - 落地点：
+       - `kunserve_pynccl.py`：新增 module 级 `get_kunserve_combine_alt_stream(device)` 单例工厂；`preheat_for_graph_capture` 在 env on 时多预热一遍 alt-stream 上的 `reduce_scatter` + `all_reduce`，日志加 `alt_stream_preheated` 标记。
+       - `kunserve_standard.py`：加 module 级 `_alt_stream_fork_join(alt_stream)` context manager（参考 `apply_qk_norm` 的 fork/join 模式）；`__init__` 读 env `KUNSERVE_COMBINE_ALT_STREAM`；`_combine_static` 在 capturing + env on 时用 fork/join 包住 NCCL 调用，slice 在 join 之后做。
+       - `CLAUDE.md`：env vars 表新增 `KUNSERVE_COMBINE_ALT_STREAM`。
+     - 行为：env off（默认）→ 零行为变化；env on + capturing → NCCL 在 alt stream 上 issue，main stream 等 alt 完成再做 slice。
+     - 注意：B.1 主路径上 expert kernel 之后没有 main stream 上的别的活，所以**实际上没有 overlap**——只是验证基础设施。期望 timing 跟 baseline 接近，正确性必须一致。
    - **B.2**（1 天）：在 `FusedMoE` / `qwen3_moe.py` 上添加"分两次调用 expert kernel"的代码路径。env-gate `KUNSERVE_OVERLAP_EXPERT_COMBINE=1`。
    - **B.3**（1 天）：把 B.1 和 B.2 拼起来，调好 event 握手。
    - **B.4**（1 天）：preheat 钩子、正确性 dump 对照、性能测量。

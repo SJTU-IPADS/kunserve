@@ -22,6 +22,33 @@ from sglang.srt.utils.common import get_current_device_stream_fast
 logger = logging.getLogger(__name__)
 
 
+_kunserve_combine_alt_stream: Optional[torch.cuda.Stream] = None
+
+
+def _alt_stream_combine_env_enabled() -> bool:
+    return os.environ.get("KUNSERVE_COMBINE_ALT_STREAM", "0") in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "on",
+    )
+
+
+def get_kunserve_combine_alt_stream(device) -> torch.cuda.Stream:
+    """Singleton alt CUDA stream used by KunServe combine overlap (Phase B).
+
+    Phase B.1 issues the lane combine NCCL collective on this stream so that
+    Phase B.2's chunked-expert work on the main stream can overlap with the
+    combine NCCL.  The stream is process-wide and lazily created on first
+    request so that ranks that don't enable the env-gate never allocate it.
+    """
+    global _kunserve_combine_alt_stream
+    if _kunserve_combine_alt_stream is None:
+        _kunserve_combine_alt_stream = torch.cuda.Stream(device=device)
+    return _kunserve_combine_alt_stream
+
+
 class KunServePyNcclGroup:
     """Graph-safe KunServe collective group backed by SGLang PyNccl.
 
@@ -352,11 +379,33 @@ class KunServePyNcclGroup:
             pynccl_comm.all_gather(grp_out_b, grp_in_b)
             pynccl_comm.all_gather(grp_out_c, grp_in_c)
             pynccl_comm.group_end()
+        # Phase B.1: alt-stream NCCL preheat for combine overlap.
+        # Issuing NCCL collectives on a fresh stream inside a CUDA graph
+        # capture context can trigger lazy NCCL setup; warming the alt
+        # stream here (outside any capture) avoids that hazard.  Gated by
+        # env so that runs that don't enable the overlap don't pay the
+        # extra preheat cost.
+        alt_stream_preheated = False
+        if _alt_stream_combine_env_enabled():
+            alt_stream = get_kunserve_combine_alt_stream(self.device)
+            default_stream = get_current_device_stream_fast()
+            alt_stream.wait_stream(default_stream)
+            with torch.cuda.device(self.device), torch.cuda.stream(alt_stream):
+                with pynccl_comm.change_state(enable=True, stream=alt_stream):
+                    rs_in_alt = torch.zeros(
+                        self.world_size, 1, device=self.device
+                    )
+                    rs_out_alt = torch.zeros(1, device=self.device)
+                    pynccl_comm.reduce_scatter(rs_out_alt, rs_in_alt)
+                    ar_buf_alt = torch.zeros(1, device=self.device)
+                    pynccl_comm.all_reduce(ar_buf_alt)
+            default_stream.wait_stream(alt_stream)
+            alt_stream_preheated = True
         torch.cuda.synchronize()
         self._diag_log(
             f"graph_comm_preheated name={self.name} unique={self.unique_name} "
             f"rank={self.rank}/{self.world_size} device={self.device} "
-            f"grouped_all_gather=True"
+            f"grouped_all_gather=True alt_stream_preheated={alt_stream_preheated}"
         )
 
     def reduce_scatter_tensor(
