@@ -19,6 +19,9 @@ from sglang.srt.kunserve_forward_timing import (
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.kunserve_remap import (
+    fused_remap_topk_ids,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
@@ -341,6 +344,44 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "KUNSERVE_COMBINE_ALT_STREAM", "0"
         ) in ("1", "true", "True", "yes", "on")
         self._combine_alt_stream_logged: bool = False
+        # Phase G P2: fused dispatch topk_ids remap kernel.  Replaces a
+        # 5–7 op chain (cmp + clamp + cast + gather + cast + where +
+        # copy_) with one Triton kernel.  Pure local compute, baseline
+        # never does it (no cross-replica union), so this is a
+        # KunServe-specific overhead reduction.  Default on; set to 0 to
+        # fall back to the original torch-ops chain for A/B comparison.
+        self._remap_fused_enabled: bool = _os.environ.get(
+            "KUNSERVE_REMAP_FUSED", "1"
+        ) in ("1", "true", "True", "yes", "on")
+        self._remap_fused_logged: bool = False
+        # Phase G P3: skip the pad zero/fill in _dispatch_static when
+        # local_m == capture_max_m (the bs==M_capture graph).  The
+        # subsequent ``[:local_m].copy_(...)`` fully overwrites the
+        # buffer, so the leading ``zero_()`` / ``fill_(-1)`` is wasted
+        # — ~1 MB write + extra kernel launch per layer per replay for
+        # the full-bs graph.  For partial batches (bs < M_capture) the
+        # zero/fill remains: the padding region [local_m:M_capture]
+        # must be defined (hidden=0, topk_ids=-1) so the expert kernel
+        # treats those rows as no-ops.  KunServe-specific because the
+        # baseline (2x TP=2) has no pre-dispatch staging buffer.
+        # Default on; set to 0 to keep the always-zero behavior.
+        self._pad_skip_when_full_enabled: bool = _os.environ.get(
+            "KUNSERVE_PAD_SKIP_WHEN_FULL", "1"
+        ) in ("1", "true", "True", "yes", "on")
+        self._pad_skip_when_full_logged: bool = False
+        # Phase B.2: chunked expert + chunked combine on alt stream.
+        # When on, _combine_static is bypassed in favour of
+        # ``combine_with_chunked_expert`` driven from FusedMoE.forward_impl,
+        # which: (a) chunks dispatch_output along the union dim 0 into
+        # per-replica halves, (b) runs run_moe_core on each chunk in
+        # sequence on the main stream, (c) issues chunk-0 ncclReduce on
+        # alt stream so it overlaps with chunk-1 expert kernel.  Requires
+        # KUNSERVE_COMBINE_ALT_STREAM=1 to be meaningful (alt stream + its
+        # preheat must be in place).  Default off until verified.
+        self._combine_chunked_enabled: bool = _os.environ.get(
+            "KUNSERVE_COMBINE_CHUNKED", "0"
+        ) in ("1", "true", "True", "yes", "on")
+        self._combine_chunked_logged: bool = False
         # One-shot init diagnostic so we can confirm env-var propagation
         # to the scheduler subprocess from the file content.
         self._probe_log(
@@ -349,7 +390,10 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             f"rank={self.global_rank} replica={self.replica_rank} "
             f"lane={self.lane_rank} phase_f={self.phase_f_enabled} "
             f"dispatch_ncclgroup={self._dispatch_ncclgroup_enabled} "
-            f"combine_alt_stream={self._combine_alt_stream_enabled}"
+            f"combine_alt_stream={self._combine_alt_stream_enabled} "
+            f"combine_chunked={self._combine_chunked_enabled} "
+            f"remap_fused={self._remap_fused_enabled} "
+            f"pad_skip_when_full={self._pad_skip_when_full_enabled}"
         )
 
         # Static buffers for the fixed-padded capture path.  We pre-allocate
@@ -496,6 +540,31 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         # Move the expert mapping to device now so the static path never
         # reassigns self.local_expert_mapping during capture.
         self._mapping_on(device)
+
+        # Phase G P2: preheat the fused remap Triton kernel.  Triton
+        # JIT-compiles on first call for each unique (constexpr, dtype,
+        # arch) tuple, which can take 1–2 s and would race with CUDA
+        # graph capture if it happens later.  Calling it once here on
+        # the actual static buffers forces the compile + warmup outside
+        # any capture context.  The dummy write into
+        # ``_buf_union_topk_ids_remapped`` is benign — the next real
+        # dispatch overwrites it.
+        if self._remap_fused_enabled:
+            try:
+                fused_remap_topk_ids(
+                    self._buf_union_topk_ids,
+                    self.local_expert_mapping,
+                    self.num_experts,
+                    self._buf_union_topk_ids_remapped,
+                )
+                torch.cuda.synchronize()
+            except Exception as exc:
+                logger.warning(
+                    "KunServe fused remap preheat failed (%r); falling back "
+                    "to the legacy torch-op chain.",
+                    exc,
+                )
+                self._remap_fused_enabled = False
 
         self._static_buffers_ready = True
         self._probe_log(
@@ -1031,14 +1100,35 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         # 1) Pad source buffers.  Zero/fill everything first so any
         #    local_m <= M is well-defined: padding rows produce zero
         #    contribution and topk_ids=-1 makes the runner skip them.
+        #
+        # Phase G P3: when local_m == M (the full-bs graph at
+        # capture_max_m) the subsequent ``[:local_m].copy_(...)`` fully
+        # overwrites every row, so the leading zero/fill is wasted —
+        # save ~1 MB write + the kernel launch for the hidden buffer
+        # per layer per replay.  The branch is decided at capture time
+        # (each (variant, bs) graph captures one local_m), so each
+        # captured graph either has the zero ops baked in or doesn't.
+        skip_pad_zero = (
+            self._pad_skip_when_full_enabled and local_m == M
+        )
+        if skip_pad_zero and not self._pad_skip_when_full_logged:
+            self._probe_log(
+                f"pad_skip_when_full_active rank={self.global_rank} "
+                f"replica={self.replica_rank} lane={self.lane_rank} "
+                f"local_m={local_m} capture_max_m={M}"
+            )
+            self._pad_skip_when_full_logged = True
         with _detail_scope(detail_timing, "kunserve_dispatch_static_pad", **timing_fields):
-            self._buf_padded_hidden.zero_()
+            if not skip_pad_zero:
+                self._buf_padded_hidden.zero_()
             self._buf_padded_hidden[:local_m].copy_(hidden_states)
-            self._buf_padded_topk_ids.fill_(-1)
+            if not skip_pad_zero:
+                self._buf_padded_topk_ids.fill_(-1)
             self._buf_padded_topk_ids[:local_m].copy_(
                 topk_ids.to(self._buf_padded_topk_ids.dtype)
             )
-            self._buf_padded_topk_weights.zero_()
+            if not skip_pad_zero:
+                self._buf_padded_topk_weights.zero_()
             self._buf_padded_topk_weights[:local_m].copy_(
                 topk_weights.to(self._buf_padded_topk_weights.dtype)
             )
@@ -1175,14 +1265,32 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 f"{int(mapping.numel())} vs num_experts={self.num_experts}."
             )
         with _detail_scope(detail_timing, "kunserve_dispatch_static_remap", **timing_fields):
-            valid = (union_ids >= 0) & (union_ids < self.num_experts)
-            safe_ids = torch.clamp(
-                union_ids, min=0, max=self.num_experts - 1
-            ).to(dtype=torch.long)
-            looked = mapping[safe_ids].to(union_ids.dtype)
-            self._buf_union_topk_ids_remapped.copy_(
-                torch.where(valid, looked, self._neg_one_int32)
-            )
+            if self._remap_fused_enabled:
+                if not self._remap_fused_logged:
+                    self._probe_log(
+                        f"remap_fused_active rank={self.global_rank} "
+                        f"replica={self.replica_rank} lane={self.lane_rank} "
+                        f"phase_f={self.phase_f_enabled} "
+                        f"union_ids={_tensor_meta(union_ids)} "
+                        f"mapping={_tensor_meta(mapping)} "
+                        f"out={_tensor_meta(self._buf_union_topk_ids_remapped)}"
+                    )
+                    self._remap_fused_logged = True
+                fused_remap_topk_ids(
+                    union_ids,
+                    mapping,
+                    self.num_experts,
+                    self._buf_union_topk_ids_remapped,
+                )
+            else:
+                valid = (union_ids >= 0) & (union_ids < self.num_experts)
+                safe_ids = torch.clamp(
+                    union_ids, min=0, max=self.num_experts - 1
+                ).to(dtype=torch.long)
+                looked = mapping[safe_ids].to(union_ids.dtype)
+                self._buf_union_topk_ids_remapped.copy_(
+                    torch.where(valid, looked, self._neg_one_int32)
+                )
 
         self._last_local_m = local_m
         self._last_max_m = M
@@ -1383,6 +1491,229 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         end = start + int(self._last_local_m)
         with _detail_scope(detail_timing, "kunserve_combine_static_slice", **timing_fields):
             return hidden_states[start:end].contiguous()
+
+    # ------------------------------------------------------------------
+    # Phase B.2 helpers: chunked combine with overlap
+    # ------------------------------------------------------------------
+
+    def _slice_static_dispatch_output(
+        self,
+        dispatch_output: StandardDispatchOutput,
+        start: int,
+        length: int,
+    ) -> StandardDispatchOutput:
+        """Return a view-only slice of ``dispatch_output`` along token dim 0.
+
+        Used by Phase B.2 chunked combine.  hidden_states / topk_ids /
+        topk_weights are sliced; router_logits stays as-is because the
+        expert kernel does not consume it.  All slices are contiguous
+        views (no copy) because the underlying union buffers are
+        contiguous and we're slicing dim 0 only.
+        """
+        hs = dispatch_output.hidden_states
+        topk = dispatch_output.topk_output
+        sliced_topk = topk._replace(
+            topk_weights=topk.topk_weights.narrow(0, start, length),
+            topk_ids=topk.topk_ids.narrow(0, start, length),
+        )
+        return StandardDispatchOutput(
+            hidden_states=hs.narrow(0, start, length),
+            hidden_states_scale=dispatch_output.hidden_states_scale,
+            topk_output=sliced_topk,
+        )
+
+    def supports_chunked_combine_overlap(self) -> bool:
+        """FusedMoE asks this to decide if chunked path is available.
+
+        All preconditions:
+          - env ``KUNSERVE_COMBINE_CHUNKED=1``
+          - env ``KUNSERVE_COMBINE_ALT_STREAM=1`` (alt stream + its NCCL
+            preheat must be in place)
+          - Phase F is active (chunked only supports the lane-subgroup
+            reduce_scatter layout, not the Phase D global all_reduce)
+          - num_replicas == 2 (chunk_count is hard-pinned to 2 for now;
+            adding more chunks requires re-laying-out the union)
+          - static combine mode is plain reduce_scatter; chunked path
+            ignores the route-A composite (we re-do TP all-reduce outside)
+          - the current CUDA stream is actually being captured AND the
+            static buffers are ready.  ``FusedMoE.forward_impl`` is also
+            invoked by warmup / extend forwards in eager mode where the
+            chunked path's static buffers + alt-stream NCCL aren't safe;
+            ``_use_static_path()`` covers both checks.
+        """
+        if not self._combine_chunked_enabled:
+            return False
+        if not self._combine_alt_stream_enabled:
+            return False
+        if not self.phase_f_enabled:
+            return False
+        if int(self.num_replicas) != 2:
+            return False
+        if self._static_combine_mode not in (
+            "reduce_scatter",
+            "reduce_scatter_tp_all_reduce",
+        ):
+            return False
+        if not self._use_static_path():
+            return False
+        return True
+
+    def combine_with_chunked_expert(
+        self,
+        dispatch_output: StandardDispatchOutput,
+        run_moe_core,
+    ) -> torch.Tensor:
+        """Phase B.2: chunked expert + chunked lane reduce.
+
+        Splits ``dispatch_output`` along dim 0 into ``num_replicas`` chunks
+        (one per replica's tokens) and pipelines:
+
+          - Main stream: expert(chunk_0) → expert(chunk_1) → ncclReduce(chunk_1)
+          - Alt  stream: wait_event(expert_0 done) → ncclReduce(chunk_0)
+          - Main stream: wait_event(alt's ncclReduce done) at the end
+
+        Each ncclReduce targets the lane position whose rank lives in the
+        replica that owns that chunk (chunk_idx == lane_pos because lane
+        group is constructed as ``[replica_0_lane_X, replica_1_lane_X]``).
+        The recv buffer ``_buf_combine_local_slice`` is written exactly
+        once by the chunk where THIS rank is root; the other ncclReduce
+        is a no-op on recv per NCCL convention.
+
+        TP all-reduce (the intra-replica lane↔lane sum) is NOT done here.
+        ``Qwen3MoeSparseMoeBlock.forward_normal`` does it after experts()
+        on the returned ``[M, H]`` slice, exactly like the non-chunked
+        path; the chunked dispatcher never sets
+        ``_kunserve_tp_allreduce_done`` so route A composite stays off.
+        """
+        if not self._use_static_path():
+            raise RuntimeError(
+                "combine_with_chunked_expert requires the static path "
+                "(fixed_padded capture)."
+            )
+        if not self.phase_f_enabled:
+            raise RuntimeError(
+                "combine_with_chunked_expert requires Phase F lane group."
+            )
+        num_replicas = int(self.num_replicas)
+        if num_replicas != 2:
+            raise RuntimeError(
+                f"combine_with_chunked_expert currently requires num_replicas=2, "
+                f"got {num_replicas}."
+            )
+        M = int(self._capture_max_m)
+        if int(dispatch_output.hidden_states.shape[0]) != num_replicas * M:
+            raise RuntimeError(
+                "combine_with_chunked_expert dispatch_output shape mismatch: "
+                f"hidden_states[0]={int(dispatch_output.hidden_states.shape[0])} "
+                f"vs num_replicas*M={num_replicas*M}."
+            )
+        self._require_static_graph_collective_group(
+            self.lane_group, "_reduce_into_tensor"
+        )
+        local_slice = self._buf_combine_local_slice
+        if (
+            local_slice is None
+            or tuple(local_slice.shape)
+            != (M, int(dispatch_output.hidden_states.shape[1]))
+            or local_slice.dtype != dispatch_output.hidden_states.dtype
+            or local_slice.device != dispatch_output.hidden_states.device
+        ):
+            raise RuntimeError(
+                "KunServe chunked combine buffer mismatch: "
+                f"slice={_tensor_meta(local_slice)} "
+                f"input={_tensor_meta(dispatch_output.hidden_states)} M={M}."
+            )
+
+        detail_timing = kunserve_detailed_timing_enabled()
+        timing_fields = {
+            "dispatcher": "kunserve_standard",
+            "path": "static_chunked",
+            "rank": int(self.global_rank),
+            "replica_rank": int(self.replica_rank),
+            "lane_rank": int(self.lane_rank),
+            "local_m": int(self._last_local_m or 0),
+            "max_m": M,
+            "phase_f": True,
+        }
+
+        if not self._combine_chunked_logged:
+            self._probe_log(
+                f"combine_chunked_active rank={self.global_rank} "
+                f"replica={self.replica_rank} lane={self.lane_rank} "
+                f"phase_f={self.phase_f_enabled} num_replicas={num_replicas} "
+                f"capture_max_m={M} "
+                f"local_slice={_tensor_meta(local_slice)} "
+                f"union_hidden={_tensor_meta(dispatch_output.hidden_states)}"
+            )
+            self._combine_chunked_logged = True
+
+        # Slice into per-replica chunks.
+        chunks = [
+            self._slice_static_dispatch_output(dispatch_output, r * M, M)
+            for r in range(num_replicas)
+        ]
+        main_stream = get_current_device_stream_fast()
+        alt_stream = get_kunserve_combine_alt_stream(
+            dispatch_output.hidden_states.device
+        )
+
+        # Chunk 0: expert on main, then ncclReduce on alt (parallel with
+        # main's chunk-1 expert kernel below).
+        with _detail_scope(
+            detail_timing,
+            "kunserve_combine_static_chunked_expert",
+            chunk_idx=0,
+            **timing_fields,
+        ):
+            combine_in_0 = run_moe_core(chunks[0])
+        partial_0 = combine_in_0.hidden_states.contiguous()
+
+        # Fork to alt stream for chunk-0 ncclReduce.
+        alt_stream.wait_stream(main_stream)
+        with torch.cuda.stream(alt_stream):
+            with _detail_scope(
+                detail_timing,
+                "kunserve_combine_static_chunked_reduce",
+                chunk_idx=0,
+                **timing_fields,
+            ):
+                # root = lane position whose rank is in replica 0.  Lane
+                # group is constructed as ``[replica_0_lane_X,
+                # replica_1_lane_X]`` so lane position == replica_idx.
+                self.lane_group._reduce_into_tensor(partial_0, local_slice, root=0)
+
+        # Main: chunk-1 expert kernel (concurrent with alt's reduce_0).
+        with _detail_scope(
+            detail_timing,
+            "kunserve_combine_static_chunked_expert",
+            chunk_idx=1,
+            **timing_fields,
+        ):
+            combine_in_1 = run_moe_core(chunks[1])
+        partial_1 = combine_in_1.hidden_states.contiguous()
+
+        # Main: chunk-1 ncclReduce.
+        with _detail_scope(
+            detail_timing,
+            "kunserve_combine_static_chunked_reduce",
+            chunk_idx=1,
+            **timing_fields,
+        ):
+            self.lane_group._reduce_into_tensor(partial_1, local_slice, root=1)
+
+        # Join: main stream waits for alt's chunk-0 reduce to finish
+        # before reading local_slice.  In the common case alt finishes
+        # well before main reaches this line, so this is a no-op
+        # observation; it's required for correctness when chunk-0 reduce
+        # is slower than chunk-1 expert + reduce.
+        main_stream.wait_stream(alt_stream)
+
+        with _detail_scope(
+            detail_timing,
+            "kunserve_combine_static_chunked_slice",
+            **timing_fields,
+        ):
+            return local_slice[: int(self._last_local_m)].contiguous()
 
     # ------------------------------------------------------------------
     # public BaseDispatcher API

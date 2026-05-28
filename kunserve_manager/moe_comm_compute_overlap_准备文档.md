@@ -172,6 +172,58 @@ post-layer (residual + norm)                   ── 几十 us
 
 ## 四、Overlap 候选方案（按工程量/收益排序）
 
+### 4.-1 候选 P3：dispatch pad skip zero/fill when `local_m == M_capture` ✅ Implemented (2026-05-28)
+
+KunServe **独有**的 overhead（baseline 2x TP=2 没有跨 replica 的 pre-dispatch staging buffer）。
+
+`_dispatch_static` 在 all_gather 前要把 `[local_m, H]` 的 hidden_states 拷贝到 `[M_capture, H]` 的 padded buffer 里，所以原代码先 `zero_()` 整个 buffer 再 `[:local_m].copy_(hidden_states)`。但当 `local_m == M_capture`（满 batch graph）时，copy 全量覆盖，zero 是浪费。
+
+**改动**：env-gated `KUNSERVE_PAD_SKIP_WHEN_FULL=1` 默认开。`local_m == M_capture` 时跳过三个 zero/fill 调用（hidden / topk_ids / topk_weights）。`local_m < M_capture` 时保留原 zero/fill（padding 区域必须是 0 / -1，kernel 才会跳过那些行）。
+
+**安全性**：每个 (variant, bs) 各自有独立 graph，`if local_m == M:` 这个 Python 分支在 capture 时定值，不同 bs 的 graph 走不同分支，重放时按各自记录的分支走。
+
+**预期收益**：满 batch graph（bs == capture_max_m）单层省 ~1 MB GPU 写 + 1 个 kernel launch ≈ 8–10 us。× 48 层 = **~0.4–0.5 ms / replay**。
+
+**为什么不做 P4 (combine RS + TP_AR 用 ncclGroup 包)**：在 CUDA graph capture 模式下，ncclGroup 的主要收益是 host-side launch overhead 削减；但 graph capture 已经把 host launch overhead 摊到 0。对不同 communicator 的不同 collective（lane reduce_scatter 和 TP all_reduce），NCCL 不会在 device 上 fuse 成一个 kernel——还是 2 个 kernel node。所以 P4 在 graph 模式下零收益，**跳过**。
+
+### 4.0 候选 P2：dispatch topk_ids remap 单 Triton kernel ✅ Implemented (2026-05-28)
+
+KunServe **独有**的 overhead（baseline 2x TP=2 没有跨 replica union 所以根本不需要 remap）。
+原 5–7 个 torch op：
+
+```python
+valid = (union_ids >= 0) & (union_ids < num_experts)
+safe = torch.clamp(union_ids, 0, num_experts-1).long()
+looked = mapping[safe].to(union_ids.dtype)
+out.copy_(torch.where(valid, looked, -1))
+```
+
+替换为一个 Triton kernel：
+```python
+@triton.jit
+def _kunserve_remap_topk_ids_kernel(ids_ptr, mapping_ptr, out_ptr, n_elements, num_experts, BLOCK_SIZE):
+    ...
+    ids = tl.load(ids_ptr + offsets, mask)
+    valid = (ids >= 0) & (ids < num_experts)
+    safe = tl.where(valid, ids, 0)
+    looked = tl.load(mapping_ptr + safe, mask)
+    tl.store(out_ptr + offsets, tl.where(valid, looked, -1), mask)
+```
+
+**落地点**：
+- 新文件 `python/sglang/srt/layers/moe/token_dispatcher/kunserve_remap.py`（Triton kernel + `fused_remap_topk_ids` wrapper）
+- `kunserve_standard.py`:
+  - `__init__` 读 env `KUNSERVE_REMAP_FUSED`（默认 `1`）
+  - `_allocate_static_buffers` 末尾用真实 buffer 预热一次 Triton kernel（强制 JIT 编译发生在 capture 外）
+  - `_dispatch_static` remap 段调 `fused_remap_topk_ids`，fallback 完整保留
+
+**预期收益**：
+- GPU: 1.17 ms → ~0.3 ms / replay
+- host: 240+ 个 kernel launch 收成 48 个 → 省 ~0.6 ms host
+- **合计 ~1.4 ms / replay (~4%)**
+
+**数值正确性**：用 4096 元素 + 混合 valid / -1 padding / out-of-range 输入对照 reference torch chain，bit-equivalent (mismatch=0)。
+
 ### 4.1 候选 P1：dispatch 的 3 条 all_gather 合并为 1 个 ncclGroup（trivial）✅ Implemented (2026-05-28)
 
 - **做法**：在 `_dispatch_static` 的 3 条 `_all_gather_into_tensor` 前后包 `pynccl_comm.group_start()` / `group_end()`。
@@ -295,7 +347,17 @@ alt:                  [d_h2 0.045][c_h1 0.045 from t=0.165]        end ≈ 0.210
    - 测：cuda_graph_replay_launch 是否下降。
 
 2. **阶段 B（3–5 天）**：实现 P2（combine 上 alt_stream + chunked expert）。
-   - **B.1**（1 天）✅ Implemented (2026-05-28)：在 `CrossReplicaStandardDispatcher` 把 lane reduce-scatter（含 route A composite）forking 到一条单例 alt CUDA stream 上跑，验证 alt-stream NCCL 在 fixed_padded CUDA graph capture 内 graph-safe 且数值等价。
+   - **B.1**（1 天）✅ Implemented (2026-05-28) commit landed：在 `CrossReplicaStandardDispatcher` 把 lane reduce-scatter（含 route A composite）forking 到一条单例 alt CUDA stream 上跑，验证 alt-stream NCCL 在 fixed_padded CUDA graph capture 内 graph-safe 且数值等价。
+   - **B.2**（2026-05-28 实现，待验证）：按 replica 切两 chunk + ncclReduce per-chunk + alt-stream overlap。
+     - **决策（从上游讨论锁定）**：chunk-by-replica（chunk_count=2）；NCCL primitive 用 ncclReduce（每 chunk root=lane_pos）；alt_stream 复用 B.1 的单例；TP all-reduce 留给 `Qwen3MoeSparseMoeBlock.forward_normal` 在 experts() 之后做。
+     - **落地点**：
+       - `kunserve_pynccl.py`：导入 `buffer_type/cudaStream_t/ncclDataTypeEnum/ncclRedOpTypeEnum` 与 `ReduceOp`；加 `KunServePyNcclGroup._reduce_into_tensor(send, recv, root, op=SUM)`，直接走 `pynccl_comm.nccl.ncclReduce` 不经 `register_custom_op`；`preheat_for_graph_capture` 加 ncclReduce 预热（默认 stream + alt stream），日志新增 `nccl_reduce_preheated` / `alt_stream_reduce_preheated` 标记。
+       - `kunserve_standard.py`：加 `_slice_static_dispatch_output(dispatch_output, start, length)`，对 `hidden_states/topk_ids/topk_weights` 沿 dim 0 做 `narrow` 视图；加 `supports_chunked_combine_overlap()` 检查所有前置条件；加 `combine_with_chunked_expert(dispatch_output, run_moe_core)` 编排器：fork alt → 等 expert_0 → ncclReduce(chunk_0, root=0) → main 跑 expert_1 + ncclReduce(chunk_1, root=1) → join alt → slice 返回 `_buf_combine_local_slice[:local_m]`。
+       - `fused_moe_triton/layer.py`：`FusedMoE.forward_impl` 检测 `supports_chunked_combine_overlap()`，命中时跳过常规 `run_moe_core + combine`，调 `combine_with_chunked_expert`；fallback 路径完全保留。
+       - `CLAUDE.md`：env 表新增 `KUNSERVE_COMBINE_CHUNKED`。
+     - **预期收益（修正后）**：~3–5%（实际取决于 Triton kernel 在 M=256 vs M=512 的线性度——这是主要风险点）。
+     - **数值正确性**：chunked 路径只重排了 expert 调用和 reduce 拓扑；expert 对每个 chunk 计算的 partial 与全 union 计算 partial 后切片应该 bit-equivalent（chunk 之间没有任何信息流）。ncclReduce per chunk 在数学上跟 lane reduce_scatter 等价（per-chunk 等价于 reduce_scatter 把 input 切成 [recv_count, ...] 块，每块独立 reduce 到对应 root）。
+     - **红线遵守**：没有新增 `_buf_*`；alt stream 上的 ncclReduce 在 preheat 阶段已预热；chunked 路径不设置 `_kunserve_tp_allreduce_done`（route A composite 强制 off）；env off / Phase D / num_replicas≠2 时 `supports_chunked_combine_overlap()` 返回 False，自动 fallback。
      - 落地点：
        - `kunserve_pynccl.py`：新增 module 级 `get_kunserve_combine_alt_stream(device)` 单例工厂；`preheat_for_graph_capture` 在 env on 时多预热一遍 alt-stream 上的 `reduce_scatter` + `all_reduce`，日志加 `alt_stream_preheated` 标记。
        - `kunserve_standard.py`：加 module 级 `_alt_stream_fork_join(alt_stream)` context manager（参考 `apply_qk_norm` 的 fork/join 模式）；`__init__` 读 env `KUNSERVE_COMBINE_ALT_STREAM`；`_combine_static` 在 capturing + env on 时用 fork/join 包住 NCCL 调用，slice 在 join 之后做。

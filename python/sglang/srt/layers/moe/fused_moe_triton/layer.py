@@ -1396,41 +1396,84 @@ class FusedMoE(torch.nn.Module):
                 .to(device="cuda")
             )
 
-        if detail_timing:
-            with kunserve_timing_scope("fused_moe_core", **timing_fields):
+        # Phase B.2: detect KunServe chunked combine + expert overlap.
+        # When the dispatcher offers it and capture is in progress, we
+        # bypass the usual ``run_moe_core → combine`` pair: the dispatcher
+        # itself orchestrates two chunked expert calls and two chunked
+        # ncclReduces with the first chunk's reduce overlapped onto an
+        # alt CUDA stream.  Capability is gated by env inside the
+        # dispatcher's ``supports_chunked_combine_overlap`` so this
+        # branch is a no-op for non-KunServe dispatchers and for runs
+        # that don't opt in.
+        kunserve_chunked = False
+        chunked_check = getattr(
+            self.dispatcher, "supports_chunked_combine_overlap", None
+        )
+        if callable(chunked_check):
+            try:
+                kunserve_chunked = bool(chunked_check())
+            except Exception:
+                kunserve_chunked = False
+        if kunserve_chunked:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                if detail_timing:
+                    with kunserve_timing_scope(
+                        "fused_moe_chunked_overlap", **timing_fields
+                    ):
+                        final_hidden_states = (
+                            self.dispatcher.combine_with_chunked_expert(
+                                dispatch_output=dispatch_output,
+                                run_moe_core=self.run_moe_core,
+                            )
+                        )
+                else:
+                    final_hidden_states = (
+                        self.dispatcher.combine_with_chunked_expert(
+                            dispatch_output=dispatch_output,
+                            run_moe_core=self.run_moe_core,
+                        )
+                    )
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
+        else:
+            if detail_timing:
+                with kunserve_timing_scope("fused_moe_core", **timing_fields):
+                    combine_input = self.run_moe_core(
+                        dispatch_output=dispatch_output,
+                    )
+            else:
                 combine_input = self.run_moe_core(
                     dispatch_output=dispatch_output,
                 )
-        else:
-            combine_input = self.run_moe_core(
-                dispatch_output=dispatch_output,
-            )
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            if detail_timing:
-                with kunserve_timing_scope("fused_moe_combine", **timing_fields):
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                if detail_timing:
+                    with kunserve_timing_scope("fused_moe_combine", **timing_fields):
+                        final_hidden_states = self.dispatcher.combine(
+                            combine_input=combine_input
+                        )
+                else:
                     final_hidden_states = self.dispatcher.combine(
                         combine_input=combine_input
                     )
-            else:
-                final_hidden_states = self.dispatcher.combine(
-                    combine_input=combine_input
-                )
 
-            # TODO: should we add some conditions here?
-            kunserve_tp_allreduce_done = bool(
-                getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
-            )
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
-            if kunserve_tp_allreduce_done:
-                try:
-                    final_hidden_states._kunserve_tp_allreduce_done = True
-                except Exception:
-                    pass
+                # TODO: should we add some conditions here?
+                kunserve_tp_allreduce_done = bool(
+                    getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
+                )
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
+                if kunserve_tp_allreduce_done:
+                    try:
+                        final_hidden_states._kunserve_tp_allreduce_done = True
+                    except Exception:
+                        pass
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             if detail_timing:

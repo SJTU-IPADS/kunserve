@@ -9,7 +9,15 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
+from torch.distributed import ReduceOp
+
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+    buffer_type,
+    cudaStream_t,
+    ncclDataTypeEnum,
+    ncclRedOpTypeEnum,
+)
 from sglang.srt.distributed.parallel_state import (
     _register_group,
     inplace_all_reduce,
@@ -324,6 +332,66 @@ class KunServePyNcclGroup:
                 pynccl_comm.all_gather(output, input_)
             pynccl_comm.group_end()
 
+    def _reduce_into_tensor(
+        self,
+        send: torch.Tensor,
+        recv: torch.Tensor,
+        root: int,
+        op: ReduceOp = ReduceOp.SUM,
+    ) -> None:
+        """Phase B.2: ncclReduce on this group.
+
+        All ranks call this; only ``root`` (the local lane position to land
+        on) receives the sum into ``recv``.  Non-root ranks still pass a
+        valid ``recv`` pointer per NCCL convention; their buffer is not
+        written.  Used by chunked combine to land each replica's chunk on
+        the lane rank that owns it, equivalent in semantics to a
+        lane reduce-scatter split into per-chunk ncclReduce calls so the
+        first chunk can run on the alt stream concurrently with the
+        second chunk's expert compute.
+        """
+        if self.world_size == 1:
+            # Single rank: just copy; ``root`` must be 0.
+            if root != 0:
+                raise ValueError(
+                    f"_reduce_into_tensor on world_size=1 requires root=0; got {root}."
+                )
+            recv.copy_(send.reshape(recv.shape))
+            return
+        if int(root) < 0 or int(root) >= int(self.world_size):
+            raise ValueError(
+                f"root={root} out of range for world_size={self.world_size}."
+            )
+        if send.device != self.device:
+            raise RuntimeError(
+                f"_reduce_into_tensor send tensor on wrong device: "
+                f"{send.device} vs comm device {self.device}."
+            )
+        if recv.device != self.device:
+            raise RuntimeError(
+                f"_reduce_into_tensor recv tensor on wrong device: "
+                f"{recv.device} vs comm device {self.device}."
+            )
+        self._diag_collective(
+            "_reduce_into_tensor", send, recv, registered=False
+        )
+        pynccl_comm = self._require_pynccl()
+        with pynccl_comm.change_state(
+            enable=True, stream=get_current_device_stream_fast()
+        ):
+            if pynccl_comm.disabled:
+                return
+            pynccl_comm.nccl.ncclReduce(
+                buffer_type(send.data_ptr()),
+                buffer_type(recv.data_ptr()),
+                send.numel(),
+                ncclDataTypeEnum.from_torch(send.dtype),
+                ncclRedOpTypeEnum.from_torch(op),
+                int(root),
+                pynccl_comm.comm,
+                cudaStream_t(pynccl_comm.stream.cuda_stream),
+            )
+
     def _reduce_scatter_tensor(
         self, output: torch.Tensor, input: torch.Tensor
     ) -> torch.Tensor:
@@ -379,6 +447,32 @@ class KunServePyNcclGroup:
             pynccl_comm.all_gather(grp_out_b, grp_in_b)
             pynccl_comm.all_gather(grp_out_c, grp_in_c)
             pynccl_comm.group_end()
+        # Phase B.2: ncclReduce preheat on default stream — even when the
+        # alt-stream overlap is disabled, the chunked combine path may use
+        # ncclReduce on the main stream once enabled, so warm the pattern
+        # here so its first call inside CUDA graph capture doesn't trigger
+        # lazy init.
+        nccl_reduce_preheated = False
+        try:
+            red_send = torch.zeros(1, device=self.device)
+            red_recv = torch.zeros(1, device=self.device)
+            pynccl_comm.nccl.ncclReduce(
+                buffer_type(red_send.data_ptr()),
+                buffer_type(red_recv.data_ptr()),
+                red_send.numel(),
+                ncclDataTypeEnum.from_torch(red_send.dtype),
+                ncclRedOpTypeEnum.from_torch(ReduceOp.SUM),
+                0,  # root=0 — semantics don't matter for preheat
+                pynccl_comm.comm,
+                cudaStream_t(get_current_device_stream_fast().cuda_stream),
+            )
+            nccl_reduce_preheated = True
+        except Exception as exc:
+            logger.warning(
+                "KunServe ncclReduce preheat failed on %s: %r",
+                self.name,
+                exc,
+            )
         # Phase B.1: alt-stream NCCL preheat for combine overlap.
         # Issuing NCCL collectives on a fresh stream inside a CUDA graph
         # capture context can trigger lazy NCCL setup; warming the alt
@@ -386,6 +480,7 @@ class KunServePyNcclGroup:
         # env so that runs that don't enable the overlap don't pay the
         # extra preheat cost.
         alt_stream_preheated = False
+        alt_stream_reduce_preheated = False
         if _alt_stream_combine_env_enabled():
             alt_stream = get_kunserve_combine_alt_stream(self.device)
             default_stream = get_current_device_stream_fast()
@@ -399,13 +494,39 @@ class KunServePyNcclGroup:
                     pynccl_comm.reduce_scatter(rs_out_alt, rs_in_alt)
                     ar_buf_alt = torch.zeros(1, device=self.device)
                     pynccl_comm.all_reduce(ar_buf_alt)
+                # Phase B.2: also preheat ncclReduce on alt stream — the
+                # chunked combine path issues ncclReduce on alt stream
+                # for the first chunk while expert kernel runs on main
+                # stream for the second chunk.
+                try:
+                    red_send_alt = torch.zeros(1, device=self.device)
+                    red_recv_alt = torch.zeros(1, device=self.device)
+                    pynccl_comm.nccl.ncclReduce(
+                        buffer_type(red_send_alt.data_ptr()),
+                        buffer_type(red_recv_alt.data_ptr()),
+                        red_send_alt.numel(),
+                        ncclDataTypeEnum.from_torch(red_send_alt.dtype),
+                        ncclRedOpTypeEnum.from_torch(ReduceOp.SUM),
+                        0,
+                        pynccl_comm.comm,
+                        cudaStream_t(alt_stream.cuda_stream),
+                    )
+                    alt_stream_reduce_preheated = True
+                except Exception as exc:
+                    logger.warning(
+                        "KunServe ncclReduce alt-stream preheat failed on %s: %r",
+                        self.name,
+                        exc,
+                    )
             default_stream.wait_stream(alt_stream)
             alt_stream_preheated = True
         torch.cuda.synchronize()
         self._diag_log(
             f"graph_comm_preheated name={self.name} unique={self.unique_name} "
             f"rank={self.rank}/{self.world_size} device={self.device} "
-            f"grouped_all_gather=True alt_stream_preheated={alt_stream_preheated}"
+            f"grouped_all_gather=True nccl_reduce_preheated={nccl_reduce_preheated} "
+            f"alt_stream_preheated={alt_stream_preheated} "
+            f"alt_stream_reduce_preheated={alt_stream_reduce_preheated}"
         )
 
     def reduce_scatter_tensor(
