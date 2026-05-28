@@ -285,13 +285,23 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             static_combine_mode = "reduce_scatter"
         self._static_combine_mode = static_combine_mode
         self._allow_static_tp_allreduce_fusion: bool = False
+        # Phase G P1: dispatch ncclGroup batching.  When enabled, the 3
+        # all-gather calls (hidden / topk_ids / topk_weights) are fused
+        # into a single ncclGroupStart/End bracket, saving 2 NCCL kernel
+        # launches per layer.  Default on; set to 0 to fall back to the
+        # 3-separate-launches path for A/B comparison.
+        self._dispatch_ncclgroup_enabled: bool = _os.environ.get(
+            "KUNSERVE_DISPATCH_NCCL_GROUP", "1"
+        ) in ("1", "true", "True", "yes", "on")
+        self._dispatch_ncclgroup_logged: bool = False
         # One-shot init diagnostic so we can confirm env-var propagation
         # to the scheduler subprocess from the file content.
         self._probe_log(
             f"probe_init enabled={self._probe_enabled} "
             f"detail_log={self._probe_detail_log_path!r} "
             f"rank={self.global_rank} replica={self.replica_rank} "
-            f"lane={self.lane_rank} phase_f={self.phase_f_enabled}"
+            f"lane={self.lane_rank} phase_f={self.phase_f_enabled} "
+            f"dispatch_ncclgroup={self._dispatch_ncclgroup_enabled}"
         )
 
         # Static buffers for the fixed-padded capture path.  We pre-allocate
@@ -1001,24 +1011,49 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._require_static_graph_collective_group(
             gather_group, "all_gather_into_tensor"
         )
+        use_grouped = (
+            self._dispatch_ncclgroup_enabled
+            and hasattr(gather_group, "grouped_all_gather_into_tensor")
+        )
+        if use_grouped and not self._dispatch_ncclgroup_logged:
+            self._probe_log(
+                f"dispatch_ncclgroup_active rank={self.global_rank} "
+                f"replica={self.replica_rank} lane={self.lane_rank} "
+                f"phase_f={self.phase_f_enabled} "
+                f"gather_group={_group_name(gather_group)}"
+            )
+            self._dispatch_ncclgroup_logged = True
         with _detail_scope(
             detail_timing, "kunserve_dispatch_static_all_gather", **timing_fields
         ):
-            _all_gather_into_tensor(
-                gather_group,
-                self._buf_gathered_hidden,
-                self._buf_padded_hidden,
-            )
-            _all_gather_into_tensor(
-                gather_group,
-                self._buf_gathered_topk_ids,
-                self._buf_padded_topk_ids,
-            )
-            _all_gather_into_tensor(
-                gather_group,
-                self._buf_gathered_topk_weights,
-                self._buf_padded_topk_weights,
-            )
+            if use_grouped:
+                # Phase G P1: 3 all-gathers fused into one ncclGroup.
+                gather_group.grouped_all_gather_into_tensor(
+                    [
+                        (self._buf_gathered_hidden, self._buf_padded_hidden),
+                        (self._buf_gathered_topk_ids, self._buf_padded_topk_ids),
+                        (
+                            self._buf_gathered_topk_weights,
+                            self._buf_padded_topk_weights,
+                        ),
+                    ]
+                )
+            else:
+                _all_gather_into_tensor(
+                    gather_group,
+                    self._buf_gathered_hidden,
+                    self._buf_padded_hidden,
+                )
+                _all_gather_into_tensor(
+                    gather_group,
+                    self._buf_gathered_topk_ids,
+                    self._buf_padded_topk_ids,
+                )
+                _all_gather_into_tensor(
+                    gather_group,
+                    self._buf_gathered_topk_weights,
+                    self._buf_padded_topk_weights,
+                )
 
         # 3) Lane select.  Skipped in Phase F because the lane-subgroup
         #    gather already produced the union directly into

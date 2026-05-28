@@ -259,6 +259,44 @@ class KunServePyNcclGroup:
         )
         reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
+    def grouped_all_gather_into_tensor(
+        self,
+        pairs: "list[tuple[torch.Tensor, torch.Tensor]]",
+    ) -> None:
+        """Phase G P1: batch multiple all-gather collectives into one ncclGroup.
+
+        NCCL fuses same-communicator collectives within a
+        ``ncclGroupStart/End`` bracket into a single kernel launch,
+        saving ``len(pairs) - 1`` launch overheads per call site.  The
+        graph-safe path bypasses the ``register_custom_op`` wrapper (which
+        exists only for torch.compile visibility) and submits NCCL ops
+        directly on the captured stream.
+
+        ``pairs`` is a list of ``(output_tensor, input_tensor)`` tuples.
+        Each pair is functionally equivalent to one
+        ``all_gather_into_tensor`` call.
+        """
+        if not pairs:
+            return
+        if self.world_size == 1:
+            for output, input_ in pairs:
+                output.copy_(input_.reshape(output.shape))
+            return
+        self._diag_collective(
+            "grouped_all_gather_into_tensor",
+            pairs[0][1],
+            pairs[0][0],
+            registered=False,
+        )
+        pynccl_comm = self._require_pynccl()
+        with pynccl_comm.change_state(
+            enable=True, stream=get_current_device_stream_fast()
+        ):
+            pynccl_comm.group_start()
+            for output, input_ in pairs:
+                pynccl_comm.all_gather(output, input_)
+            pynccl_comm.group_end()
+
     def _reduce_scatter_tensor(
         self, output: torch.Tensor, input: torch.Tensor
     ) -> torch.Tensor:
@@ -297,10 +335,28 @@ class KunServePyNcclGroup:
             rs_in = torch.zeros(self.world_size, 1, device=self.device)
             rs_out = torch.zeros(1, device=self.device)
             pynccl_comm.reduce_scatter(rs_out, rs_in)
+            # Phase G P1: preheat ncclGroupStart/End bracket pattern for
+            # dispatch all-gather batching.  NCCL group calls have no new
+            # collectives themselves but the fused-kernel codepath is a
+            # different submission shape from the eager preheats above;
+            # warming it here avoids any lazy init inside CUDA graph
+            # capture if the static path uses grouped_all_gather_into_tensor.
+            grp_in_a = torch.zeros(1, device=self.device)
+            grp_out_a = torch.zeros(self.world_size, device=self.device)
+            grp_in_b = torch.zeros(1, device=self.device)
+            grp_out_b = torch.zeros(self.world_size, device=self.device)
+            grp_in_c = torch.zeros(1, device=self.device)
+            grp_out_c = torch.zeros(self.world_size, device=self.device)
+            pynccl_comm.group_start()
+            pynccl_comm.all_gather(grp_out_a, grp_in_a)
+            pynccl_comm.all_gather(grp_out_b, grp_in_b)
+            pynccl_comm.all_gather(grp_out_c, grp_in_c)
+            pynccl_comm.group_end()
         torch.cuda.synchronize()
         self._diag_log(
             f"graph_comm_preheated name={self.name} unique={self.unique_name} "
-            f"rank={self.rank}/{self.world_size} device={self.device}"
+            f"rank={self.rank}/{self.world_size} device={self.device} "
+            f"grouped_all_gather=True"
         )
 
     def reduce_scatter_tensor(
