@@ -1414,6 +1414,7 @@ class FusedMoE(torch.nn.Module):
                 kunserve_chunked = bool(chunked_check())
             except Exception:
                 kunserve_chunked = False
+        kunserve_tp_allreduce_done = False
         if kunserve_chunked:
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1462,7 +1463,6 @@ class FusedMoE(torch.nn.Module):
                         combine_input=combine_input
                     )
 
-                # TODO: should we add some conditions here?
                 kunserve_tp_allreduce_done = bool(
                     getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
                 )
@@ -1475,7 +1475,11 @@ class FusedMoE(torch.nn.Module):
                     except Exception:
                         pass
 
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+        if (
+            self.reduce_results
+            and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
+            and not kunserve_tp_allreduce_done
+        ):
             if detail_timing:
                 with kunserve_timing_scope("fused_moe_all_reduce", **timing_fields):
                     final_hidden_states = tensor_model_parallel_all_reduce(

@@ -11,8 +11,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.kunserve_forward_timing import (
+    kunserve_accumulate_cuda_graph_stage_events,
     kunserve_detailed_timing_enabled,
     kunserve_log_cuda_graph_stage_events,
+    kunserve_stage_profile_enabled,
     kunserve_timing_log,
 )
 from sglang.srt.managers.io_struct import (
@@ -455,6 +457,11 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         detail_timing = kunserve_detailed_timing_enabled()
+        # stage_profile activates the timing scopes (detail_timing=True) but
+        # routes the readout through the cheap accumulator and suppresses all
+        # per-step host logging.  host_log = "really want per-step host lines".
+        stage_profile = kunserve_stage_profile_enabled()
+        host_log = detail_timing and not stage_profile
         total_start_ns = time.perf_counter_ns() if detail_timing else 0
         timing_fields = {
             "mode": str(batch.forward_mode),
@@ -465,7 +472,7 @@ class SchedulerOutputProcessorMixin:
         }
 
         def log_decode_stage(stage: str, start_ns: int, **fields):
-            if not detail_timing:
+            if not host_log:
                 return
             payload = dict(timing_fields)
             payload.update(fields)
@@ -490,40 +497,60 @@ class SchedulerOutputProcessorMixin:
                 }
                 graph_start_event = graph_meta.get("graph_start_event")
                 graph_end_event = graph_meta.get("graph_end_event")
+                graph_key = str(graph_meta.get("graph_key", ""))
+                replay_total_ms = None
                 if graph_start_event is not None and graph_end_event is not None:
                     try:
+                        replay_total_ms = float(
+                            graph_start_event.elapsed_time(graph_end_event)
+                        )
+                    except Exception:
+                        replay_total_ms = None
+
+                if stage_profile:
+                    # Clean path: accumulate per-stage means, periodic summary.
+                    variant = (
+                        "global"
+                        if "global" in graph_key
+                        else "local"
+                        if "local" in graph_key
+                        else "baseline"
+                    )
+                    kunserve_accumulate_cuda_graph_stage_events(
+                        graph_key,
+                        variant=variant,
+                        replay_total_ms=replay_total_ms,
+                        batch_size=int(batch.batch_size()),
+                    )
+                else:
+                    # Legacy per-event logging (heavy; only under explicit DETAIL).
+                    if replay_total_ms is not None:
                         kunserve_timing_log(
                             "graph_cuda_replay_total_end",
-                            elapsed_ms=round(
-                                float(
-                                    graph_start_event.elapsed_time(graph_end_event)
-                                ),
-                                3,
-                            ),
+                            elapsed_ms=round(replay_total_ms, 3),
                             **timing_fields,
                             **graph_fields,
                         )
-                    except Exception:
-                        pass
-                stage_ns = time.perf_counter_ns()
-                logged_events = kunserve_log_cuda_graph_stage_events(
-                    str(graph_meta.get("graph_key", "")),
-                    **timing_fields,
-                    **graph_fields,
-                )
-                log_decode_stage(
-                    "graph_internal_event_log",
-                    stage_ns,
-                    logged_events=int(logged_events),
-                    graph_key=str(graph_meta.get("graph_key", "")),
-                )
+                    stage_ns = time.perf_counter_ns()
+                    logged_events = kunserve_log_cuda_graph_stage_events(
+                        graph_key,
+                        **timing_fields,
+                        **graph_fields,
+                    )
+                    log_decode_stage(
+                        "graph_internal_event_log",
+                        stage_ns,
+                        logged_events=int(logged_events),
+                        graph_key=graph_key,
+                    )
             except Exception as exc:
-                kunserve_timing_log(
-                    "scheduler_decode_result_graph_internal_event_log_error",
-                    graph_key=str(graph_meta.get("graph_key", "")),
-                    error=repr(exc),
-                    **timing_fields,
-                )
+                if not stage_profile:
+                    kunserve_timing_log(
+                        "scheduler_decode_result_graph_internal_event_log_error",
+                        graph_key=str(graph_meta.get("graph_key", "")),
+                        error=repr(exc),
+                        **timing_fields,
+                    )
 
         stage_ns = time.perf_counter_ns() if detail_timing else 0
         logits_output, next_token_ids, can_run_cuda_graph = (

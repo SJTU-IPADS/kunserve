@@ -281,7 +281,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        expert_location_dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if get_global_server_args().ep_dispatch_algorithm is not None
+            else None
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
@@ -329,7 +338,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not use_reduce_scatter
+            and not bool(
+                getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
+            )
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
