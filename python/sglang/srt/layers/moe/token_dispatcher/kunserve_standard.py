@@ -299,8 +299,11 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._combine_call_count: int = 0
         self._static_dispatch_logged: bool = False
         self._static_after_gather_logged: bool = False
+        self._static_dispatch_m_logged = set()
+        self._static_after_gather_m_logged = set()
         self._static_combine_logged: bool = False
         self._static_combine_mode_logged: bool = False
+        self._static_combine_m_logged = set()
         self._static_mapping_mismatch_logged: bool = False
         self._probe_milestones = {1, 5, 20, 100, 500, 2000}
         static_combine_mode = str(
@@ -1062,7 +1065,8 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        M = self._capture_max_m
+        capacity_m = int(self._capture_max_m or 0)
+        M = int(local_m)
         detail_timing = kunserve_detailed_timing_enabled()
         timing_fields = {
             "dispatcher": "kunserve_standard",
@@ -1072,13 +1076,15 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "lane_rank": int(self.lane_rank),
             "local_m": int(local_m),
             "max_m": int(M),
+            "capacity_m": int(capacity_m),
             "phase_f": bool(self.phase_f_enabled),
         }
-        if not self._static_dispatch_logged:
+        if M not in self._static_dispatch_m_logged:
             self._probe_log(
                 f"static_dispatch_enter rank={self.global_rank} replica={self.replica_rank} "
                 f"lane={self.lane_rank} state={_capture_state_text()} "
-                f"local_m={local_m} capture_max_m={M} phase_f={self.phase_f_enabled} "
+                f"local_m={local_m} graph_bucket_m={M} capture_max_m={capacity_m} "
+                f"phase_f={self.phase_f_enabled} "
                 f"hidden_in={_tensor_meta(hidden_states)} "
                 f"topk_ids_in={_tensor_meta(topk_ids)} "
                 f"topk_weights_in={_tensor_meta(topk_weights)} "
@@ -1089,25 +1095,39 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 f"remap_buf={_tensor_meta(self._buf_union_topk_ids_remapped)} "
                 f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
             )
+            self._static_dispatch_m_logged.add(M)
             self._static_dispatch_logged = True
-        if local_m > M:
+        if M <= 0 or local_m > capacity_m:
             raise RuntimeError(
                 "CrossReplicaStandardDispatcher static path requires "
-                f"local_m={local_m} <= capture_max_m={M}; ensure the captured "
+                f"0 < local_m={local_m} <= capture_max_m={capacity_m}; ensure the captured "
                 "batch size set spans all decode shapes."
             )
 
-        # 1) Pad source buffers.  Zero/fill everything first so any
-        #    local_m <= M is well-defined: padding rows produce zero
-        #    contribution and topk_ids=-1 makes the runner skip them.
-        #
-        # Phase G P3: when local_m == M (the full-bs graph at
-        # capture_max_m) the subsequent ``[:local_m].copy_(...)`` fully
-        # overwrites every row, so the leading zero/fill is wasted —
-        # save ~1 MB write + the kernel launch for the hidden buffer
-        # per layer per replay.  The branch is decided at capture time
-        # (each (variant, bs) graph captures one local_m), so each
-        # captured graph either has the zero ops baked in or doesn't.
+        padded_hidden = self._buf_padded_hidden[:M]
+        padded_topk_ids = self._buf_padded_topk_ids[:M]
+        padded_topk_weights = self._buf_padded_topk_weights[:M]
+        gather_world = int(self.num_replicas if self.phase_f_enabled else self.world_size)
+        gathered_hidden = self._buf_gathered_hidden[: gather_world * M]
+        gathered_topk_ids = self._buf_gathered_topk_ids[: gather_world * M]
+        gathered_topk_weights = self._buf_gathered_topk_weights[: gather_world * M]
+        if self.phase_f_enabled:
+            union_hidden = gathered_hidden
+            union_topk_ids = gathered_topk_ids
+            union_topk_weights = gathered_topk_weights
+        else:
+            union_hidden = self._buf_union_hidden[: self.num_replicas * M]
+            union_topk_ids = self._buf_union_topk_ids[: self.num_replicas * M]
+            union_topk_weights = self._buf_union_topk_weights[: self.num_replicas * M]
+        union_topk_ids_remapped = self._buf_union_topk_ids_remapped[
+            : self.num_replicas * M
+        ]
+
+        # 1) Stage source buffers for the current graph bucket.  The backing
+        #    buffers are allocated at max capture capacity, but the tensor
+        #    views passed to NCCL are only M rows, where M is the graph bucket
+        #    being captured.  This avoids sending max_capture_m padding for
+        #    smaller buckets while keeping stable storage addresses.
         skip_pad_zero = (
             self._pad_skip_when_full_enabled and local_m == M
         )
@@ -1115,22 +1135,22 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             self._probe_log(
                 f"pad_skip_when_full_active rank={self.global_rank} "
                 f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"local_m={local_m} capture_max_m={M}"
+                f"local_m={local_m} graph_bucket_m={M} capture_max_m={capacity_m}"
             )
             self._pad_skip_when_full_logged = True
         with _detail_scope(detail_timing, "kunserve_dispatch_static_pad", **timing_fields):
             if not skip_pad_zero:
-                self._buf_padded_hidden.zero_()
-            self._buf_padded_hidden[:local_m].copy_(hidden_states)
+                padded_hidden.zero_()
+            padded_hidden[:local_m].copy_(hidden_states)
             if not skip_pad_zero:
-                self._buf_padded_topk_ids.fill_(-1)
-            self._buf_padded_topk_ids[:local_m].copy_(
-                topk_ids.to(self._buf_padded_topk_ids.dtype)
+                padded_topk_ids.fill_(-1)
+            padded_topk_ids[:local_m].copy_(
+                topk_ids.to(padded_topk_ids.dtype)
             )
             if not skip_pad_zero:
-                self._buf_padded_topk_weights.zero_()
-            self._buf_padded_topk_weights[:local_m].copy_(
-                topk_weights.to(self._buf_padded_topk_weights.dtype)
+                padded_topk_weights.zero_()
+            padded_topk_weights[:local_m].copy_(
+                topk_weights.to(padded_topk_weights.dtype)
             )
 
         # 2) Cross-replica all-gather.
@@ -1168,29 +1188,29 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 # Phase G P1: 3 all-gathers fused into one ncclGroup.
                 gather_group.grouped_all_gather_into_tensor(
                     [
-                        (self._buf_gathered_hidden, self._buf_padded_hidden),
-                        (self._buf_gathered_topk_ids, self._buf_padded_topk_ids),
+                        (gathered_hidden, padded_hidden),
+                        (gathered_topk_ids, padded_topk_ids),
                         (
-                            self._buf_gathered_topk_weights,
-                            self._buf_padded_topk_weights,
+                            gathered_topk_weights,
+                            padded_topk_weights,
                         ),
                     ]
                 )
             else:
                 _all_gather_into_tensor(
                     gather_group,
-                    self._buf_gathered_hidden,
-                    self._buf_padded_hidden,
+                    gathered_hidden,
+                    padded_hidden,
                 )
                 _all_gather_into_tensor(
                     gather_group,
-                    self._buf_gathered_topk_ids,
-                    self._buf_padded_topk_ids,
+                    gathered_topk_ids,
+                    padded_topk_ids,
                 )
                 _all_gather_into_tensor(
                     gather_group,
-                    self._buf_gathered_topk_weights,
-                    self._buf_padded_topk_weights,
+                    gathered_topk_weights,
+                    padded_topk_weights,
                 )
 
         # 3) Lane select.  Skipped in Phase F because the lane-subgroup
@@ -1205,26 +1225,28 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                         replica_idx * self.local_ep_size + self.lane_rank
                     ) * M
                     dst_base = replica_idx * M
-                    self._buf_union_hidden[dst_base : dst_base + M].copy_(
-                        self._buf_gathered_hidden[src_base : src_base + M]
+                    union_hidden[dst_base : dst_base + M].copy_(
+                        gathered_hidden[src_base : src_base + M]
                     )
-                    self._buf_union_topk_ids[dst_base : dst_base + M].copy_(
-                        self._buf_gathered_topk_ids[src_base : src_base + M]
+                    union_topk_ids[dst_base : dst_base + M].copy_(
+                        gathered_topk_ids[src_base : src_base + M]
                     )
-                    self._buf_union_topk_weights[dst_base : dst_base + M].copy_(
-                        self._buf_gathered_topk_weights[src_base : src_base + M]
+                    union_topk_weights[dst_base : dst_base + M].copy_(
+                        gathered_topk_weights[src_base : src_base + M]
                     )
 
-        if not self._static_after_gather_logged:
+        if M not in self._static_after_gather_m_logged:
             self._probe_log(
                 f"static_dispatch_after_gather rank={self.global_rank} replica={self.replica_rank} "
                 f"lane={self.lane_rank} state={_capture_state_text()} "
                 f"phase_f={self.phase_f_enabled} gather_group="
-                f"{_group_name(gather_group)} gathered_hidden={_tensor_meta(self._buf_gathered_hidden)} "
-                f"gathered_topk_ids={_tensor_meta(self._buf_gathered_topk_ids)} "
-                f"union_hidden={_tensor_meta(self._buf_union_hidden)} "
-                f"union_topk_ids={_tensor_meta(self._buf_union_topk_ids)}"
+                f"{_group_name(gather_group)} gathered_hidden={_tensor_meta(gathered_hidden)} "
+                f"gathered_topk_ids={_tensor_meta(gathered_topk_ids)} "
+                f"union_hidden={_tensor_meta(union_hidden)} "
+                f"union_topk_ids={_tensor_meta(union_topk_ids)} "
+                f"capacity_m={capacity_m}"
             )
+            self._static_after_gather_m_logged.add(M)
             self._static_after_gather_logged = True
 
         # 4) Branch-free expert id remap.  Out-of-range or negative ids
@@ -1236,7 +1258,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         #    attribute to a graph-private tensor and corrupts later
         #    captures.
         mapping = self.local_expert_mapping  # already on device
-        union_ids = self._buf_union_topk_ids
+        union_ids = union_topk_ids
         if mapping.device != union_ids.device or mapping.dtype != torch.int32:
             if not self._static_mapping_mismatch_logged:
                 self._probe_log(
@@ -1273,14 +1295,14 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                         f"phase_f={self.phase_f_enabled} "
                         f"union_ids={_tensor_meta(union_ids)} "
                         f"mapping={_tensor_meta(mapping)} "
-                        f"out={_tensor_meta(self._buf_union_topk_ids_remapped)}"
+                        f"out={_tensor_meta(union_topk_ids_remapped)}"
                     )
                     self._remap_fused_logged = True
                 fused_remap_topk_ids(
                     union_ids,
                     mapping,
                     self.num_experts,
-                    self._buf_union_topk_ids_remapped,
+                    union_topk_ids_remapped,
                 )
             else:
                 valid = (union_ids >= 0) & (union_ids < self.num_experts)
@@ -1288,7 +1310,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     union_ids, min=0, max=self.num_experts - 1
                 ).to(dtype=torch.long)
                 looked = mapping[safe_ids].to(union_ids.dtype)
-                self._buf_union_topk_ids_remapped.copy_(
+                union_topk_ids_remapped.copy_(
                     torch.where(valid, looked, self._neg_one_int32)
                 )
 
@@ -1297,11 +1319,11 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._last_slice_start = self.replica_rank * M
 
         return StandardDispatchOutput(
-            hidden_states=self._buf_union_hidden,
+            hidden_states=union_hidden,
             hidden_states_scale=None,
             topk_output=StandardTopKOutput(
-                topk_weights=self._buf_union_topk_weights,
-                topk_ids=self._buf_union_topk_ids_remapped,
+                topk_weights=union_topk_weights,
+                topk_ids=union_topk_ids_remapped,
                 # router_logits is informational at this layer; expert
                 # compute only consumes topk_weights/topk_ids.  Pass through
                 # the original local-shape tensor; downstream code that
@@ -1356,32 +1378,44 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             # calls tensor_model_parallel_all_reduce after experts().
             # Doing it here too would double-reduce every layer and overflow
             # after many MoE layers.
-            M = int(self._capture_max_m)
+            M = int(self._last_max_m or 0)
+            if M <= 0:
+                raise RuntimeError(
+                    "KunServe static combine called before static dispatch "
+                    f"set _last_max_m; last_max_m={self._last_max_m}."
+                )
             timing_fields["combine_mode"] = self._static_combine_mode
-            if not self._static_combine_mode_logged:
+            timing_fields["max_m"] = M
+            timing_fields["capacity_m"] = int(self._capture_max_m or 0)
+            if M not in self._static_combine_m_logged:
                 self._probe_log(
                     f"static_combine_mode rank={self.global_rank} "
                     f"replica={self.replica_rank} lane={self.lane_rank} "
                     f"mode={self._static_combine_mode} phase_f={self.phase_f_enabled} "
+                    f"graph_bucket_m={M} capture_max_m={int(self._capture_max_m or 0)} "
                     f"lane_group={_group_name(self.lane_group)} "
                     f"slice_buf={_tensor_meta(getattr(self, '_buf_combine_local_slice', None))}"
                 )
+                self._static_combine_m_logged.add(M)
                 self._static_combine_mode_logged = True
             if self._static_combine_mode in (
                 "reduce_scatter",
                 "reduce_scatter_tp_all_reduce",
             ):
-                local_slice = self._buf_combine_local_slice
+                base_local_slice = self._buf_combine_local_slice
+                local_slice = base_local_slice[:M] if base_local_slice is not None else None
                 if (
                     local_slice is None
                     or tuple(local_slice.shape) != (M, int(hidden_states.shape[1]))
                     or local_slice.dtype != hidden_states.dtype
                     or local_slice.device != hidden_states.device
+                    or int(hidden_states.shape[0]) != int(self.num_replicas) * M
                 ):
                     raise RuntimeError(
                         "KunServe static reduce_scatter combine buffer mismatch: "
-                        f"slice={_tensor_meta(local_slice)} "
-                        f"input={_tensor_meta(hidden_states)} M={M}."
+                        f"slice={_tensor_meta(local_slice)} base_slice={_tensor_meta(base_local_slice)} "
+                        f"input={_tensor_meta(hidden_states)} M={M} "
+                        f"num_replicas={self.num_replicas}."
                     )
                 self._require_static_graph_collective_group(
                     self.lane_group, "reduce_scatter_tensor"
@@ -1487,7 +1521,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             self._require_static_graph_collective_group(self.group, "all_reduce")
             _all_reduce(self.group, hidden_states)
 
-        start = self.replica_rank * self._capture_max_m
+        start = self.replica_rank * int(self._last_max_m)
         end = start + int(self._last_local_m)
         with _detail_scope(detail_timing, "kunserve_combine_static_slice", **timing_fields):
             return hidden_states[start:end].contiguous()
@@ -1600,7 +1634,12 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 f"combine_with_chunked_expert currently requires num_replicas=2, "
                 f"got {num_replicas}."
             )
-        M = int(self._capture_max_m)
+        M = int(self._last_max_m or 0)
+        if M <= 0:
+            raise RuntimeError(
+                "combine_with_chunked_expert called before static dispatch "
+                f"set _last_max_m; last_max_m={self._last_max_m}."
+            )
         if int(dispatch_output.hidden_states.shape[0]) != num_replicas * M:
             raise RuntimeError(
                 "combine_with_chunked_expert dispatch_output shape mismatch: "
@@ -1610,7 +1649,8 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._require_static_graph_collective_group(
             self.lane_group, "_reduce_into_tensor"
         )
-        local_slice = self._buf_combine_local_slice
+        base_local_slice = self._buf_combine_local_slice
+        local_slice = base_local_slice[:M] if base_local_slice is not None else None
         if (
             local_slice is None
             or tuple(local_slice.shape)
@@ -1620,7 +1660,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         ):
             raise RuntimeError(
                 "KunServe chunked combine buffer mismatch: "
-                f"slice={_tensor_meta(local_slice)} "
+                f"slice={_tensor_meta(local_slice)} base_slice={_tensor_meta(base_local_slice)} "
                 f"input={_tensor_meta(dispatch_output.hidden_states)} M={M}."
             )
 
