@@ -13,7 +13,9 @@ from __future__ import annotations
 import pytest
 
 from sglang.srt.model_executor.kunserve_precision import (
+    ENV_DISPATCH_DTYPE,
     KunServePrecisionPolicy,
+    dispatch_dtype_from_env,
     resolve_kunserve_precision_policy,
 )
 
@@ -98,6 +100,31 @@ def test_backward_compatible_default_is_fp8_deep_gemm():
     assert (p.dispatch_dtype, p.expert_runner) == ("fp8", "deep_gemm")
 
 
+def test_dispatch_dtype_from_env_unset_is_none():
+    assert dispatch_dtype_from_env({}) is None
+    assert dispatch_dtype_from_env({ENV_DISPATCH_DTYPE: ""}) is None
+
+
+def test_dispatch_dtype_from_env_values():
+    assert dispatch_dtype_from_env({ENV_DISPATCH_DTYPE: "fp8"}) == "fp8"
+    assert dispatch_dtype_from_env({ENV_DISPATCH_DTYPE: "bf16"}) == "bf16"
+    assert dispatch_dtype_from_env({ENV_DISPATCH_DTYPE: "  BF16 "}) == "bf16"
+
+
+def test_dispatch_dtype_from_env_invalid_raises():
+    with pytest.raises(ValueError, match="KUNSERVE_DISPATCH_DTYPE"):
+        dispatch_dtype_from_env({ENV_DISPATCH_DTYPE: "int8"})
+
+
+def test_env_override_threads_into_policy():
+    # bf16 override + triton runner -> coherent bf16 policy
+    p = resolve_kunserve_precision_policy(
+        moe_runner_backend="triton",
+        dispatch_dtype=dispatch_dtype_from_env({ENV_DISPATCH_DTYPE: "bf16"}),
+    )
+    assert (p.dispatch_dtype, p.expert_runner) == ("bf16", "triton")
+
+
 if __name__ == "__main__":
     test_deep_gemm_defaults_to_fp8()
     test_triton_defaults_to_bf16()
@@ -107,4 +134,8 @@ if __name__ == "__main__":
     test_mooncake_disallows_bf16_triton()
     test_case_and_whitespace_insensitive()
     test_backward_compatible_default_is_fp8_deep_gemm()
+    test_dispatch_dtype_from_env_unset_is_none()
+    test_dispatch_dtype_from_env_values()
+    test_dispatch_dtype_from_env_invalid_raises()
+    test_env_override_threads_into_policy()
     print("KunServe precision-policy tests: ALL PASSED")

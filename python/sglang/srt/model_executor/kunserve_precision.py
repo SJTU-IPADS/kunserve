@@ -21,8 +21,9 @@ without a GPU or a cross-replica process group.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 # (dispatch_dtype, expert_runner) -> human description of the path.
 _VALID_COMBINATIONS = {
@@ -35,6 +36,35 @@ _RUNNER_TO_DISPATCH = {
     "deep_gemm": "fp8",
     "triton": "bf16",
 }
+
+_VALID_DISPATCH_DTYPES = ("fp8", "bf16")
+
+# Env knob names. Note there is intentionally NO ``KUNSERVE_EXPERT_RUNNER``:
+# the expert runner is ``server_args.moe_runner_backend`` (threaded by the
+# launch scripts as ``KUNSERVE_MOE_RUNNER_BACKEND``). Adding a second name for
+# it would create two sources of truth. ``KUNSERVE_DISPATCH_DTYPE`` is the only
+# new knob — an optional override of the dispatch payload precision; when unset
+# the policy derives it from the runner (deep_gemm->fp8, triton->bf16).
+ENV_DISPATCH_DTYPE = "KUNSERVE_DISPATCH_DTYPE"
+
+
+def dispatch_dtype_from_env(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """Read + validate the optional ``KUNSERVE_DISPATCH_DTYPE`` override.
+
+    Returns normalized ``"fp8"``/``"bf16"``, or ``None`` when unset (the policy
+    then derives the dtype from the expert runner). Raises ``ValueError`` on an
+    unrecognized value so a typo fails fast instead of silently picking fp8.
+    """
+    environ = os.environ if environ is None else environ
+    raw = environ.get(ENV_DISPATCH_DTYPE)
+    norm = _norm(raw)
+    if norm is None:
+        return None
+    if norm not in _VALID_DISPATCH_DTYPES:
+        raise ValueError(
+            f"{ENV_DISPATCH_DTYPE} must be one of {_VALID_DISPATCH_DTYPES}, got {raw!r}."
+        )
+    return norm
 
 
 @dataclass(frozen=True)

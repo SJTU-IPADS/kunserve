@@ -1405,6 +1405,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # grouped FP8 runner (native), bf16 dispatch pairs with the triton
                 # runner (M4 adapter). Mooncake is only validated for fp8/deep_gemm.
                 from sglang.srt.model_executor.kunserve_precision import (
+                    dispatch_dtype_from_env,
                     resolve_kunserve_precision_policy,
                 )
 
@@ -1412,7 +1413,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     moe_runner_backend=getattr(
                         self.server_args, "moe_runner_backend", None
                     ),
-                    dispatch_dtype=os.environ.get("KUNSERVE_DISPATCH_DTYPE") or None,
+                    dispatch_dtype=dispatch_dtype_from_env(),
                     a2a_backend_value=moe_a2a_backend.value,
                     allow_bf16_triton=moe_a2a_backend.is_deepep(),
                 )
