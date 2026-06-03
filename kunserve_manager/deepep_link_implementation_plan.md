@@ -167,12 +167,12 @@ graph 化要点：
 - **expert runner 不另设 env**：它就是 `server_args.moe_runner_backend`（启动脚本里的 `KUNSERVE_MOE_RUNNER_BACKEND`）。**故意不引入 `KUNSERVE_EXPERT_RUNNER`**——避免两个真源不一致。deep_gemm 与 triton 是 FP8/​bf16 一一对应，dispatch_dtype 与 runner 不是任意组合（策略会拒绝 deep_gemm+bf16 等不一致项）。
 - 默认行为**完全向后兼容**：不设任何新 env + `moe_runner_backend=deep_gemm` → 策略恰好 = (fp8, deep_gemm)，与重构前一致。
 
-### 11.2 verl 透传 TODO（必须建立在 NCCL-forward 修复之上,勿单独分叉）
-`model_runner` 在 **SGLang scheduler 子进程**里读 `os.environ`。Ray worker 不继承 driver shell env，所以 `KUNSERVE_DISPATCH_DTYPE` 要真正到达 scheduler，需要沿用本会话给 NCCL 变量建的同一条透传链，**加这一个变量名**即可：
+### 11.2 verl 透传（✅已做,见 verl `feat/deepep-comm` commit `c1a38530`）
+`model_runner` 在 **SGLang scheduler 子进程**里读 `os.environ`。Ray worker 不继承 driver shell env，所以 `KUNSERVE_DISPATCH_DTYPE` 要真正到达 scheduler，沿用本会话给 NCCL 变量建的同一条透传链，**加这一个变量名**（已实现 + 验证 set→转发 / unset→不转发）：
 
 1. `verl/data/train/run_smoke_test_kunserve_tp2_dual_replica.sh`：`: "${KUNSERVE_DISPATCH_DTYPE:=}"` + 加入 export 列表。
 2. `verl/data/compare_kunserve_vs_baseline.sh`：同样 default + export。
 3. `verl/verl/trainer/constants_ppo.py` `get_ppo_ray_runtime_env()`：把 `KUNSERVE_DISPATCH_DTYPE` 加进 passthrough 转发列表（job runtime_env.env_vars）。
 4. `verl/verl/workers/rollout/sglang_rollout/async_sglang_server.py`：把 `KUNSERVE_DISPATCH_DTYPE` 加进 SGLang server actor 的 `runtime_env.env_vars` 转发集（scheduler 子进程随 actor 继承）。
 
-> ⚠️ 暂未在本分支动 verl：verl 的 NCCL-forward 修复目前是 main 上的**未提交改动**（且 codex 可能在动 verl 做 H20 perf）。`KUNSERVE_DISPATCH_DTYPE` 透传应在那批修复**提交后**叠加，否则会和未提交内容分叉、合并困难。M1 之前默认 `unset→fp8` 已是想要的行为,不阻塞。
+> ⚠️ verl `feat/deepep-comm` **缺 main 上未提交的 NCCL-forward** 作底。待那批 NCCL 修复在 main 提交后,把 `KUNSERVE_DISPATCH_DTYPE` 合并进同一组 forward 列表(constants_ppo 的 passthrough 元组、async_sglang_server 的 actor env_vars 推导式——代码结构已刻意与 NCCL 版对齐,合并就是并列表)。M1 之前默认 `unset→fp8` 已是想要的行为,不阻塞。
