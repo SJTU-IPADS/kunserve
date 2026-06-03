@@ -1399,22 +1399,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), so this flag only "
                     "affects the GLOBAL bundle's default."
                 )
-            if (
-                moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake()
-            ) and str(getattr(self.server_args, "moe_runner_backend", None)) != (
-                "deep_gemm"
-            ):
-                raise ValueError(
-                    "Balloon GLOBAL bundle with kunserve_comm_backend='deepep' and "
-                    "moe_a2a_backend="
-                    f"{moe_a2a_backend.value!r} requires "
-                    "server_args.moe_runner_backend='deep_gemm'. This sglang build "
-                    "only registers DeepEP/Mooncake MoE pre/post permutation paths "
-                    "for the deep_gemm runner; leaving the runner as 'auto' or "
-                    "'triton' can crash the scheduler during warmup/cuda-graph "
-                    "capture. Pass engine_kwargs.sglang.moe_runner_backend=deep_gemm. "
-                    f"Current value: {getattr(self.server_args, 'moe_runner_backend', None)!r}."
+            if moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake():
+                # Refactor of the old hard "deepep => deep_gemm" assert into an
+                # explicit precision policy: fp8 dispatch pairs with the deep_gemm
+                # grouped FP8 runner (native), bf16 dispatch pairs with the triton
+                # runner (M4 adapter). Mooncake is only validated for fp8/deep_gemm.
+                from sglang.srt.model_executor.kunserve_precision import (
+                    resolve_kunserve_precision_policy,
                 )
+
+                self._kunserve_precision_policy = resolve_kunserve_precision_policy(
+                    moe_runner_backend=getattr(
+                        self.server_args, "moe_runner_backend", None
+                    ),
+                    dispatch_dtype=os.environ.get("KUNSERVE_DISPATCH_DTYPE") or None,
+                    a2a_backend_value=moe_a2a_backend.value,
+                    allow_bf16_triton=moe_a2a_backend.is_deepep(),
+                )
+                _kunserve_ms(
+                    "[KUNSERVE-MS] DeepEP precision policy: dispatch=%s runner=%s "
+                    "(%s) tp_rank=%s",
+                    self._kunserve_precision_policy.dispatch_dtype,
+                    self._kunserve_precision_policy.expert_runner,
+                    self._kunserve_precision_policy.describe(),
+                    self.tp_rank,
+                )
+                if self._kunserve_precision_policy.dispatch_dtype == "bf16":
+                    # The bf16/triton GLOBAL dispatcher+runner adapter is the M4
+                    # milestone (see kunserve_manager/deepep_link_implementation_plan.md);
+                    # the policy is recognized here but the runtime path is not wired
+                    # yet, so fail loudly instead of crashing deeper in capture.
+                    raise NotImplementedError(
+                        "KunServe DeepEP bf16/triton path (dispatch_dtype=bf16, "
+                        "expert_runner=triton) is planned for M4 and not yet wired "
+                        "into the GLOBAL dispatcher/runner. Use "
+                        "moe_runner_backend=deep_gemm (fp8) for now."
+                    )
 
         active_mappings = self._normalize_balloon_active_mappings(
             retained_local_experts=retained_local_experts,
