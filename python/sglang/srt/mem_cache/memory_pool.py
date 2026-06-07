@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -68,6 +69,7 @@ from sglang.srt.utils.cuda_vmm import (
     DonorSegment,
     ExpandableVmmTensor,
     cuda_vmm_available,
+    emit_vmm_timing,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -821,6 +823,7 @@ class MHATokenToKVPool(KVCache):
             and torch.device(self.device).type == "cuda"
         )
         if use_vmm and cuda_vmm_available():
+            create_t0 = time.perf_counter()
             reserve_slots = max(
                 0, int(envs.SGLANG_EXPERIMENTAL_VMM_KV_RESERVE_SLOTS.get() or 0)
             )
@@ -836,6 +839,28 @@ class MHATokenToKVPool(KVCache):
                 )
                 reserve_slots = aligned_reserve_slots
             self._kv_reserve_rows = self._kv_active_rows + reserve_slots
+            kv_bytes_per_row = (
+                self.layer_num
+                * (self.head_num * self.head_dim + self.head_num * self.v_head_dim)
+                * torch.empty((), dtype=self.store_dtype).element_size()
+            )
+            emit_vmm_timing(
+                "kv_vmm_pool_create_start",
+                pool_type=type(self).__name__,
+                size=self.size,
+                page_size=self.page_size,
+                active_rows=self._kv_active_rows,
+                reserve_rows=self._kv_reserve_rows,
+                reserve_slots=reserve_slots,
+                layer_num=self.layer_num,
+                head_num=self.head_num,
+                head_dim=self.head_dim,
+                v_head_dim=self.v_head_dim,
+                dtype=str(self.store_dtype),
+                kv_bytes_per_row=kv_bytes_per_row,
+                active_bytes=self._kv_active_rows * kv_bytes_per_row,
+                reserve_bytes=self._kv_reserve_rows * kv_bytes_per_row,
+            )
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 for layer_idx in range(self.layer_num):
                     self._k_vmm_allocations.append(
@@ -865,6 +890,20 @@ class MHATokenToKVPool(KVCache):
             self._kv_vmm_enabled = True
             self._refresh_vmm_active_buffers()
             self._refresh_buffer_metadata()
+            emit_vmm_timing(
+                "kv_vmm_pool_create_end",
+                pool_type=type(self).__name__,
+                size=self.size,
+                page_size=self.page_size,
+                active_rows=self._kv_active_rows,
+                reserve_rows=self._kv_reserve_rows,
+                reserve_slots=reserve_slots,
+                allocation_count=len(self._k_vmm_allocations)
+                + len(self._v_vmm_allocations),
+                active_bytes=self._kv_active_rows * kv_bytes_per_row,
+                reserve_bytes=self._kv_reserve_rows * kv_bytes_per_row,
+                elapsed_s=time.perf_counter() - create_t0,
+            )
             return
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):

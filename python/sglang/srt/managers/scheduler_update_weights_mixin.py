@@ -165,22 +165,43 @@ class SchedulerUpdateWeightsMixin:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        active_tags = []
+        missing_tags = []
         for tag in tags:
-            self.offload_tags.remove(tag)
+            if tag in self.offload_tags:
+                self.offload_tags.remove(tag)
+                active_tags.append(tag)
+            else:
+                missing_tags.append(tag)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+        if missing_tags:
+            logger.warning(
+                "resume_memory_occupation received non-offloaded tags=%s; "
+                "active_tags=%s remaining_offload_tags=%s. Treating as idempotent.",
+                missing_tags,
+                active_tags,
+                sorted(self.offload_tags),
+            )
+
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in active_tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+        if GPU_MEMORY_TYPE_WEIGHTS in active_tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
-            _import_static_state(
-                self.tp_worker.model_runner.model,
-                self.stashed_model_static_state,
-            )
-            del self.stashed_model_static_state
+            if hasattr(self, "stashed_model_static_state"):
+                _import_static_state(
+                    self.tp_worker.model_runner.model,
+                    self.stashed_model_static_state,
+                )
+                del self.stashed_model_static_state
+            else:
+                logger.warning(
+                    "resume_memory_occupation(weights) had no stashed_model_static_state; "
+                    "continuing because resume is idempotent."
+                )
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+        if GPU_MEMORY_TYPE_KV_CACHE in active_tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
 
         return ResumeMemoryOccupationReqOutput()

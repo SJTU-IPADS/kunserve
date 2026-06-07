@@ -3634,7 +3634,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
                 msg += f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
+                enable_tp_memory_check = (
+                    envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get()
+                    and not envs.SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK.get()
+                )
+                if enable_tp_memory_check:
                     raise RuntimeError(msg)
                 else:
                     logger.warning(msg)
