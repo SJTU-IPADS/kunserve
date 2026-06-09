@@ -279,7 +279,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                forward_batch=forward_batch,
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -299,6 +302,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -308,6 +312,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             "num_tokens": int(num_tokens),
             "hidden_dim": int(hidden_dim),
         }
+        if forward_batch is not None:
+            timing_fields.update(
+                {
+                    "mode": str(forward_batch.forward_mode),
+                    "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
+                    "kv_tokens": int(getattr(forward_batch, "seq_lens_sum", 0) or 0),
+                    "global_num_tokens": getattr(
+                        forward_batch, "global_num_tokens_cpu", None
+                    ),
+                }
+            )
 
         # router_logits: (num_tokens, n_experts)
         if detail_timing:
@@ -827,6 +842,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             "mode": str(forward_batch.forward_mode),
             "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
             "num_tokens": int(hidden_states.shape[0]),
+            "kv_tokens": int(getattr(forward_batch, "seq_lens_sum", 0) or 0),
+            "global_num_tokens": getattr(forward_batch, "global_num_tokens_cpu", None),
         }
 
         if detail_timing:
@@ -905,9 +922,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+            if detail_timing:
+                post_fields = dict(timing_fields)
+                post_fields["num_tokens"] = int(hidden_states.shape[0])
+                with kunserve_timing_scope(
+                    "qwen3_moe_layer_postprocess", **post_fields
+                ):
+                    hidden_states, residual = self.layer_communicator.postprocess_layer(
+                        hidden_states, residual, forward_batch
+                    )
+            else:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 

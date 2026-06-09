@@ -288,6 +288,24 @@ def _kunserve_ms(message: str, *args) -> None:
         pass
 
 
+def _kun_wd(message: str) -> None:
+    """[KUNSERVE-WD] lockstep watchdog probe -> KUNSERVE_DETAIL_LOG only.
+
+    No logger.warning (avoids per-step spam). Each line is open/append/closed so
+    it is flushed to disk and survives a hang. TEMPORARY debug instrumentation
+    to locate the cross-replica negotiate/collective lockstep divergence.
+    """
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    if not path:
+        return
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"[{ts} pid={os.getpid()}] {message}\n")
+    except Exception:
+        pass
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -710,6 +728,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # but their local padded buckets differ, every rank must replay the same
         # GLOBAL graph bucket and pad extra rows to dummy KV.
         self._balloon_step_graph_bs_override: Optional[int] = None
+        # Phase E graph replay guard.  Scheduler sets the expected GLOBAL
+        # graph bucket for this step; cuda_graph_runner validates it before
+        # launching captured collectives.
+        self._balloon_step_graph_guard: Optional[Dict[str, Any]] = None
         # Phase E keepalive KV scratch slot.  Allocated once at
         # commit_balloon time so the keepalive batch's out_cache_loc
         # points at a dedicated dummy slot instead of slot 0.  Without
@@ -926,6 +948,117 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             group.all_reduce(tensor)
         else:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+
+    @staticmethod
+    def _kunserve_fingerprint_ints(values) -> int:
+        acc = 1469598103934665603
+        mask = (1 << 63) - 1
+        for value in values:
+            acc ^= int(value) & 0xFFFFFFFF
+            acc = (acc * 1099511628211) & mask
+        return int(acc)
+
+    def negotiate_balloon_step_state(
+        self,
+        local_bs: int,
+        local_force_eager: bool = False,
+        *,
+        local_state_signature: Optional[Tuple[int, ...]] = None,
+    ) -> Tuple[int, int, bool, Optional[int]]:
+        """Phase E cross-replica shape/state negotiation.
+
+        This extends ``negotiate_balloon_step_bs`` with a deterministic
+        fingerprint of the gathered per-rank scheduler signatures.  Cached
+        GLOBAL graph buckets can then be reused only while every rank observes
+        the same control-flow state that produced the cache.
+        """
+        local_payload = [int(local_bs), 1 if local_force_eager else 0]
+        if local_state_signature is not None:
+            local_payload.extend(int(v) for v in local_state_signature)
+        local_fingerprint = self._kunserve_fingerprint_ints(local_payload)
+
+        self._kun_wd_negct = getattr(self, "_kun_wd_negct", 0) + 1
+        _kun_wd(
+            "[KUNSERVE-WD] neg_call n=%d bs=%d fe=%d state=%s backend=%s"
+            % (
+                self._kun_wd_negct,
+                int(local_bs),
+                1 if local_force_eager else 0,
+                str(self._balloon_state),
+                str(self._balloon_kunserve_comm_backend),
+            )
+        )
+
+        if str(self._balloon_state) != "balloon":
+            return (
+                int(local_bs),
+                int(local_bs),
+                bool(local_force_eager),
+                local_fingerprint,
+            )
+        if str(self._balloon_kunserve_comm_backend or "").lower() != "sglang":
+            return (
+                int(local_bs),
+                int(local_bs),
+                bool(local_force_eager),
+                local_fingerprint,
+            )
+        try:
+            runtime_group = self._resolve_balloon_process_group(
+                self._balloon_process_group_name
+            )
+        except Exception:
+            return (
+                int(local_bs),
+                int(local_bs),
+                bool(local_force_eager),
+                local_fingerprint,
+            )
+        if runtime_group is None:
+            return (
+                int(local_bs),
+                int(local_bs),
+                bool(local_force_eager),
+                local_fingerprint,
+            )
+        try:
+            device = torch.device("cuda", torch.cuda.current_device())
+            local_t = torch.tensor(local_payload, dtype=torch.int32, device=device)
+            world = self._kunserve_group_world_size(runtime_group)
+            payload_len = int(local_t.numel())
+            all_t = torch.empty(world * payload_len, dtype=torch.int32, device=device)
+            _kun_wd(
+                "[KUNSERVE-WD] neg_ENTER n=%d world=%d local_bs=%d"
+                % (self._kun_wd_negct, int(world), int(local_bs))
+            )
+            self._kunserve_all_gather_into_tensor(runtime_group, all_t, local_t)
+            _kun_wd("[KUNSERVE-WD] neg_EXIT n=%d" % (self._kun_wd_negct,))
+            all_t = all_t.view(world, payload_len)
+            bs_values = all_t[:, 0]
+            eager_values = all_t[:, 1]
+            state_fingerprint = self._kunserve_fingerprint_ints(
+                all_t.detach().cpu().reshape(-1).tolist()
+            )
+            return (
+                int(bs_values.max().item()),
+                int(bs_values.min().item()),
+                bool(eager_values.max().item()),
+                state_fingerprint,
+            )
+        except Exception as exc:
+            _kunserve_ms(
+                "[KUNSERVE-MS] negotiate_balloon_step_state failed: %r "
+                "(local_bs=%d) -- falling back to local-only sizing",
+                exc,
+                int(local_bs),
+            )
+            return (
+                int(local_bs),
+                int(local_bs),
+                bool(local_force_eager),
+                local_fingerprint,
+            )
+
 
     def negotiate_balloon_step_bs(
         self, local_bs: int, local_force_eager: bool = False
@@ -1203,6 +1336,78 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         self._balloon_step_force_eager = bool(force)
         self._balloon_step_graph_bs_override = None
+        self._balloon_step_graph_guard = None
+
+    def set_balloon_step_graph_guard(
+        self,
+        expected_bs: Optional[int],
+        *,
+        max_bs: int = 0,
+        min_bs: int = 0,
+        state_fingerprint: Optional[int] = None,
+    ) -> None:
+        try:
+            expected = int(expected_bs) if expected_bs is not None else 0
+        except Exception:
+            expected = 0
+        if expected <= 0 or getattr(self, "_balloon_step_force_eager", False):
+            self._balloon_step_graph_guard = None
+            return
+        self._balloon_step_graph_guard = {
+            "expected_bs": expected,
+            "max_bs": int(max_bs),
+            "min_bs": int(min_bs),
+            "state_fingerprint": state_fingerprint,
+        }
+
+    def get_balloon_step_graph_guard(self) -> Optional[Dict[str, Any]]:
+        guard = getattr(self, "_balloon_step_graph_guard", None)
+        if not isinstance(guard, dict):
+            return None
+        return guard
+
+    def validate_balloon_graph_replay_guard(
+        self,
+        *,
+        graph_bs: int,
+        raw_bs: int,
+        graph_key: str,
+        raise_on_error: bool = False,
+    ) -> bool:
+        guard = self.get_balloon_step_graph_guard()
+        if guard is None:
+            return True
+        try:
+            runtime_variant = self.get_cuda_graph_runtime_variant()
+        except Exception:
+            runtime_variant = getattr(self, "_balloon_runtime_variant", "local")
+        if runtime_variant != "global":
+            return True
+        try:
+            expected = int(guard.get("expected_bs", 0) or 0)
+            actual = int(graph_bs)
+        except Exception:
+            return True
+        if expected <= 0 or actual == expected:
+            return True
+        message = (
+            "[KUNSERVE-MS] GLOBAL graph guard mismatch: "
+            f"expected_bs={expected} graph_bs={actual} raw_bs={int(raw_bs)} "
+            f"graph_key={graph_key} guard={guard}"
+        )
+        _kunserve_ms("%s", message)
+        kunserve_timing_log(
+            "phase_e_graph_guard_mismatch",
+            expected_bs=expected,
+            graph_bs=actual,
+            raw_bs=int(raw_bs),
+            graph_key=str(graph_key),
+            state_fingerprint=guard.get("state_fingerprint"),
+        )
+        if raise_on_error:
+            raise RuntimeError(message)
+        return False
+
 
     def _update_live_expert_location_metadata(self, metadata) -> None:
         if self.is_draft_worker or metadata is None:

@@ -264,6 +264,23 @@ def _kunserve_ms(message: str, *args) -> None:
         pass
 
 
+def _kun_wd(message: str) -> None:
+    """[KUNSERVE-WD] lockstep watchdog probe -> KUNSERVE_DETAIL_LOG only (no
+    logger spam). Each line is flushed to disk so it survives a hang. TEMPORARY
+    debug instrumentation for the cross-replica negotiate lockstep divergence."""
+    path = os.environ.get("KUNSERVE_DETAIL_LOG")
+    if not path:
+        return
+    try:
+        import datetime as _dt
+
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"[{ts} pid={os.getpid()}] {message}\n")
+    except Exception:
+        pass
+
+
 _BATCH_TIMING_LOG = os.environ.get("SGLANG_BATCH_TIMING_LOG", "").strip()
 _REPLICA_RANK = os.environ.get("SGLANG_REPLICA_RANK", "")
 _REQ_LIFECYCLE_LOG = os.environ.get("SGLANG_REQ_LIFECYCLE_LOG", "").strip()
@@ -835,11 +852,15 @@ class Scheduler(
         self._phase_e_negotiate_interval: int = max(
             1, get_int_env_var("KUNSERVE_PHASE_E_NEGOTIATE_INTERVAL", 256)
         )
+        self._phase_e_cache_guard_enabled: bool = os.environ.get(
+            "KUNSERVE_PHASE_E_CACHE_GUARD", "1"
+        ) not in ("0", "false", "False", "no", "NO")
         self._phase_e_cache_valid: bool = False
         self._phase_e_cached_max_bs: int = 0
         self._phase_e_cached_min_bs: int = 0
         self._phase_e_cached_any_force_eager: bool = False
         self._phase_e_cached_steps_left: int = 0
+        self._phase_e_cached_state_fingerprint: Optional[int] = None
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1303,6 +1324,7 @@ class Scheduler(
                         negotiated_min_bs,
                         negotiated_any_force_eager,
                         phase_e_from_cache,
+                        phase_e_state_fingerprint,
                     ) = self._phase_e_get_step_decision(
                         batch=batch,
                         local_status=local_status,
@@ -1334,6 +1356,7 @@ class Scheduler(
                         graph_bs_override_hint=(
                             negotiated_max_bs if phase_e_from_cache else None
                         ),
+                        state_fingerprint=phase_e_state_fingerprint,
                     )
                     self._kunserve_scheduler_gap_log(
                         "scheduler_gap_phase_e_apply_decision_end",
@@ -1471,6 +1494,7 @@ class Scheduler(
             phase_e_negotiated_any_force_eager: bool = False
             phase_e_from_cache: bool = False
             phase_e_status: Optional[Dict[str, Any]] = None
+            phase_e_state_fingerprint: Optional[int] = None
             if self._kunserve_phase_e_active():
                 stage_ns = time.perf_counter_ns()
                 phase_e_status = self._local_balloon_status_or_stop()
@@ -1491,6 +1515,7 @@ class Scheduler(
                         phase_e_negotiated_min,
                         phase_e_negotiated_any_force_eager,
                         phase_e_from_cache,
+                        phase_e_state_fingerprint,
                     ) = self._phase_e_get_step_decision(
                         batch=batch,
                         local_status=phase_e_status,
@@ -1566,6 +1591,7 @@ class Scheduler(
                     graph_bs_override_hint=(
                         int(phase_e_negotiated_max) if phase_e_from_cache else None
                     ),
+                    state_fingerprint=phase_e_state_fingerprint,
                 )
                 self._kunserve_scheduler_gap_log(
                     "scheduler_gap_phase_e_apply_decision_end",
@@ -1665,6 +1691,7 @@ class Scheduler(
                                 if phase_e_from_cache
                                 else None
                             ),
+                            state_fingerprint=phase_e_state_fingerprint,
                         )
                         self._kunserve_scheduler_gap_log(
                             "scheduler_gap_phase_e_apply_decision_end",
@@ -3874,12 +3901,14 @@ class Scheduler(
                 cached_max_bs=int(self._phase_e_cached_max_bs),
                 cached_min_bs=int(self._phase_e_cached_min_bs),
                 cached_steps_left=int(self._phase_e_cached_steps_left),
+                cached_state_fingerprint=self._phase_e_cached_state_fingerprint,
             )
         self._phase_e_cache_valid = False
         self._phase_e_cached_max_bs = 0
         self._phase_e_cached_min_bs = 0
         self._phase_e_cached_any_force_eager = False
         self._phase_e_cached_steps_left = 0
+        self._phase_e_cached_state_fingerprint = None
 
     def _phase_e_cache_enabled(self) -> bool:
         return (
@@ -3914,12 +3943,70 @@ class Scheduler(
             return False
         return True
 
+    def _phase_e_batch_mode_code(self, batch: Optional[ScheduleBatch]) -> int:
+        if batch is None:
+            return 0
+        try:
+            if batch.forward_mode.is_idle():
+                return 1
+            if batch.forward_mode.is_decode():
+                return 2
+            if batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                return 3
+        except Exception:
+            pass
+        return 4
+
+    def _phase_e_local_state_signature(
+        self,
+        *,
+        batch: Optional[ScheduleBatch],
+        local_bs: int,
+        local_padded: int,
+        local_force_eager: bool,
+    ) -> Tuple[int, ...]:
+        """Small per-rank state vector used to validate cached Phase E buckets.
+
+        The cached GLOBAL graph bucket is safe only while every rank keeps the
+        same scheduler shape/control state that produced the cache. A local
+        shrink, an arriving waiting request, or a chunked-prefill transition is
+        enough reason to refresh/force eager together on a synchronized step.
+        """
+        result_queue_len = 0
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is not None:
+            try:
+                result_queue_len = len(result_queue)
+            except Exception:
+                result_queue_len = 0
+        last_batch = getattr(self, "last_batch", None)
+        try:
+            last_batch_size = last_batch.batch_size() if last_batch is not None else 0
+        except Exception:
+            last_batch_size = 0
+        running_batch = getattr(self, "running_batch", None)
+        running_reqs = getattr(running_batch, "reqs", []) if running_batch else []
+        batch_is_full = bool(getattr(running_batch, "batch_is_full", False))
+        return (
+            int(local_bs),
+            int(local_padded),
+            1 if local_force_eager else 0,
+            int(self._phase_e_batch_mode_code(batch)),
+            int(len(running_reqs)),
+            int(len(self.waiting_queue)),
+            1 if batch_is_full else 0,
+            1 if self.chunked_req is not None else 0,
+            int(result_queue_len),
+            int(last_batch_size),
+        )
+
     def _phase_e_update_cached_decision(
         self,
         *,
         negotiated_max_bs: int,
         negotiated_min_bs: int,
         negotiated_any_force_eager: bool,
+        state_fingerprint: Optional[int],
     ) -> None:
         if not self._phase_e_cache_enabled():
             self._phase_e_reset_cached_decision("cache disabled")
@@ -3943,6 +4030,7 @@ class Scheduler(
         self._phase_e_cached_steps_left = max(
             0, int(self._phase_e_negotiate_interval) - 1
         )
+        self._phase_e_cached_state_fingerprint = state_fingerprint
         kunserve_timing_log(
             "phase_e_cache_update",
             interval=int(self._phase_e_negotiate_interval),
@@ -3950,6 +4038,7 @@ class Scheduler(
             cached_min_bs=int(self._phase_e_cached_min_bs),
             cached_any_force_eager=bool(self._phase_e_cached_any_force_eager),
             cached_steps_left=int(self._phase_e_cached_steps_left),
+            cached_state_fingerprint=self._phase_e_cached_state_fingerprint,
         )
 
     def _phase_e_try_reuse_cached_decision(
@@ -3957,7 +4046,8 @@ class Scheduler(
         *,
         local_padded: int,
         local_force_eager: bool,
-    ) -> Optional[Tuple[int, int, bool]]:
+        local_signature: Tuple[int, ...],
+    ) -> Optional[Tuple[int, int, bool, bool, Optional[int]]]:
         if not self._phase_e_cache_enabled() or not self._phase_e_cache_valid:
             return None
         if self._phase_e_cached_steps_left <= 0:
@@ -3975,6 +4065,48 @@ class Scheduler(
             self._phase_e_reset_cached_decision("local padded exceeds cache")
             return None
 
+        if (
+            self._phase_e_cache_guard_enabled
+            and self._phase_e_cached_state_fingerprint is not None
+        ):
+            previous_state_fingerprint = self._phase_e_cached_state_fingerprint
+            (
+                guard_max_bs,
+                guard_min_bs,
+                guard_any_force_eager,
+                guard_state_fingerprint,
+            ) = self.negotiate_balloon_step_state(
+                int(local_padded),
+                local_force_eager=bool(local_force_eager),
+                local_state_signature=local_signature,
+            )
+            cache_changed = (
+                guard_state_fingerprint != previous_state_fingerprint
+                or int(guard_max_bs) > int(self._phase_e_cached_max_bs)
+                or bool(guard_any_force_eager)
+            )
+            if cache_changed:
+                self._phase_e_reset_cached_decision("guard state changed")
+                kunserve_timing_log(
+                    "phase_e_cache_guard_event",
+                    local_padded=int(local_padded),
+                    guard_max_bs=int(guard_max_bs),
+                    guard_min_bs=int(guard_min_bs),
+                    guard_any_force_eager=bool(guard_any_force_eager),
+                    previous_state_fingerprint=previous_state_fingerprint,
+                    guard_state_fingerprint=guard_state_fingerprint,
+                )
+                # All ranks observed the same guard event. Run one eager step
+                # instead of replaying a possibly stale GLOBAL graph; the next
+                # loop will negotiate a fresh cacheable bucket.
+                return (
+                    int(guard_max_bs),
+                    int(guard_min_bs),
+                    True,
+                    False,
+                    guard_state_fingerprint,
+                )
+
         self._phase_e_cached_steps_left -= 1
         kunserve_timing_log(
             "phase_e_cache_reuse",
@@ -3985,11 +4117,14 @@ class Scheduler(
             cached_min_bs=int(self._phase_e_cached_min_bs),
             cached_any_force_eager=bool(self._phase_e_cached_any_force_eager),
             cached_steps_left=int(self._phase_e_cached_steps_left),
+            cached_state_fingerprint=self._phase_e_cached_state_fingerprint,
         )
         return (
             int(self._phase_e_cached_max_bs),
             int(self._phase_e_cached_min_bs),
             bool(self._phase_e_cached_any_force_eager),
+            True,
+            self._phase_e_cached_state_fingerprint,
         )
 
     def _phase_e_get_step_decision(
@@ -3998,11 +4133,27 @@ class Scheduler(
         batch: Optional[ScheduleBatch],
         local_status: Dict[str, Any],
         loop: str,
-    ) -> Tuple[int, int, bool, bool]:
+    ) -> Tuple[int, int, bool, bool, Optional[int]]:
         local_bs = batch.batch_size() if batch is not None else 0
         stage_ns = time.perf_counter_ns()
         local_force_eager = self._kunserve_batch_requires_eager_for_phase_e(batch)
         local_padded = self._padded_capture_bs(local_bs)
+        _kun_wd(
+            "[KUNSERVE-WD] phase_e_decide fwd_ct=%d local_bs=%d padded=%d fe=%d loop=%s"
+            % (
+                int(self.forward_ct),
+                int(local_bs),
+                int(local_padded),
+                1 if local_force_eager else 0,
+                str(loop),
+            )
+        )
+        local_signature = self._phase_e_local_state_signature(
+            batch=batch,
+            local_bs=int(local_bs),
+            local_padded=int(local_padded),
+            local_force_eager=bool(local_force_eager),
+        )
         self._kunserve_scheduler_gap_log(
             "scheduler_gap_phase_e_local_shape_end",
             stage_ns,
@@ -4011,17 +4162,25 @@ class Scheduler(
             local_bs=int(local_bs),
             local_padded=int(local_padded),
             local_force_eager=bool(local_force_eager),
+            local_signature=str(local_signature),
         )
 
         cached = self._phase_e_try_reuse_cached_decision(
             local_padded=int(local_padded),
             local_force_eager=bool(local_force_eager),
+            local_signature=local_signature,
         )
         if cached is not None:
-            negotiated_max_bs, negotiated_min_bs, negotiated_any_force_eager = cached
+            (
+                negotiated_max_bs,
+                negotiated_min_bs,
+                negotiated_any_force_eager,
+                phase_e_from_cache,
+                state_fingerprint,
+            ) = cached
             kunserve_timing_log(
                 "phase_e_negotiated",
-                source="cache",
+                source="cache" if phase_e_from_cache else "guard_event",
                 forward_ct=self.forward_ct,
                 mode=str(batch.forward_mode) if batch is not None else "None",
                 local_bs=int(local_bs),
@@ -4033,20 +4192,25 @@ class Scheduler(
                 running=len(self.running_batch.reqs),
                 waiting=len(self.waiting_queue),
                 cached_steps_left=int(self._phase_e_cached_steps_left),
+                state_fingerprint=state_fingerprint,
             )
             return (
                 int(negotiated_max_bs),
                 int(negotiated_min_bs),
                 bool(negotiated_any_force_eager),
-                True,
+                bool(phase_e_from_cache),
+                state_fingerprint,
             )
 
         (
             negotiated_max_bs,
             negotiated_min_bs,
             negotiated_any_force_eager,
-        ) = self.negotiate_balloon_step_bs(
-            local_padded, local_force_eager=local_force_eager
+            state_fingerprint,
+        ) = self.negotiate_balloon_step_state(
+            local_padded,
+            local_force_eager=local_force_eager,
+            local_state_signature=local_signature,
         )
         kunserve_timing_log(
             "phase_e_negotiated",
@@ -4061,17 +4225,20 @@ class Scheduler(
             any_force_eager=bool(negotiated_any_force_eager),
             running=len(self.running_batch.reqs),
             waiting=len(self.waiting_queue),
+            state_fingerprint=state_fingerprint,
         )
         self._phase_e_update_cached_decision(
             negotiated_max_bs=int(negotiated_max_bs),
             negotiated_min_bs=int(negotiated_min_bs),
             negotiated_any_force_eager=bool(negotiated_any_force_eager),
+            state_fingerprint=state_fingerprint,
         )
         return (
             int(negotiated_max_bs),
             int(negotiated_min_bs),
             bool(negotiated_any_force_eager),
             False,
+            state_fingerprint,
         )
 
     def _padded_capture_bs(self, local_bs: int) -> int:
@@ -4141,6 +4308,7 @@ class Scheduler(
         negotiated_min_bs: int,
         negotiated_any_force_eager: bool = False,
         graph_bs_override_hint: Optional[int] = None,
+        state_fingerprint: Optional[int] = None,
     ) -> None:
         """Set ``_balloon_step_force_eager`` based on the negotiation.
 
@@ -4179,10 +4347,24 @@ class Scheduler(
                 graph_bs_override = negotiated_max_bs
             else:
                 force_eager = True
+
+        expected_graph_bs: Optional[int] = None
+        if not force_eager and negotiated_max_bs > 0:
+            expected_graph_bs = (
+                graph_bs_override if graph_bs_override is not None else negotiated_max_bs
+            )
         try:
             model_runner.set_balloon_step_force_eager(force_eager)
             if not force_eager:
                 model_runner.set_balloon_step_graph_bs_override(graph_bs_override)
+            guard_setter = getattr(model_runner, "set_balloon_step_graph_guard", None)
+            if guard_setter is not None:
+                guard_setter(
+                    expected_graph_bs,
+                    max_bs=negotiated_max_bs,
+                    min_bs=negotiated_min_bs,
+                    state_fingerprint=state_fingerprint,
+                )
         except Exception:
             pass
         kunserve_timing_log(
@@ -4194,6 +4376,8 @@ class Scheduler(
             force_eager=bool(force_eager),
             graph_bs_override=graph_bs_override,
             graph_bs_override_hint=graph_bs_override_hint,
+            expected_graph_bs=expected_graph_bs,
+            state_fingerprint=state_fingerprint,
         )
 
     def _local_balloon_status_or_stop(self) -> Optional[Dict[str, Any]]:
@@ -4210,20 +4394,25 @@ class Scheduler(
             return None
         return local_status
 
-    def negotiate_balloon_step_bs(
-        self, local_bs: int, local_force_eager: bool = False
-    ) -> Tuple[int, int, bool]:
-        """Phase E entry point in the scheduler.
+    def negotiate_balloon_step_state(
+        self,
+        local_bs: int,
+        local_force_eager: bool = False,
+        local_state_signature: Optional[Tuple[int, ...]] = None,
+    ) -> Tuple[int, int, bool, Optional[int]]:
+        """Phase E synchronized shape/state negotiation.
 
-        Returns ``(max_bs, min_bs, any_force_eager)`` across the
-        cross-replica runtime group.  Callers use ``max_bs`` for idle
-        keepalive size and the other two fields for the symmetric graph/eager
-        decision.
+        The first three return values are the historical batch-size decision.
+        ``state_fingerprint`` additionally fingerprints the tiny per-rank
+        scheduler signatures gathered in the same collective, so cached GLOBAL
+        graph buckets can be invalidated symmetrically on all ranks.
         """
         stage_ns = time.perf_counter_ns()
-        max_bs, min_bs, any_force_eager = (
-            self.tp_worker.model_runner.negotiate_balloon_step_bs(
-                int(local_bs), bool(local_force_eager)
+        max_bs, min_bs, any_force_eager, state_fingerprint = (
+            self.tp_worker.model_runner.negotiate_balloon_step_state(
+                int(local_bs),
+                bool(local_force_eager),
+                local_state_signature=local_state_signature,
             )
         )
         self._kunserve_scheduler_gap_log(
@@ -4235,6 +4424,27 @@ class Scheduler(
             max_bs=int(max_bs),
             min_bs=int(min_bs),
             any_force_eager=bool(any_force_eager),
+            state_fingerprint=state_fingerprint,
+        )
+        return (
+            int(max_bs),
+            int(min_bs),
+            bool(any_force_eager),
+            state_fingerprint,
+        )
+
+    def negotiate_balloon_step_bs(
+        self, local_bs: int, local_force_eager: bool = False
+    ) -> Tuple[int, int, bool]:
+        """Phase E entry point in the scheduler.
+
+        Returns ``(max_bs, min_bs, any_force_eager)`` across the
+        cross-replica runtime group.  Callers use ``max_bs`` for idle
+        keepalive size and the other two fields for the symmetric graph/eager
+        decision.
+        """
+        max_bs, min_bs, any_force_eager, _ = self.negotiate_balloon_step_state(
+            int(local_bs), bool(local_force_eager)
         )
         return int(max_bs), int(min_bs), bool(any_force_eager)
 

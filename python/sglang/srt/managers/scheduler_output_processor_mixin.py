@@ -10,13 +10,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
-from sglang.srt.kunserve_forward_timing import (
-    kunserve_accumulate_cuda_graph_stage_events,
-    kunserve_detailed_timing_enabled,
-    kunserve_log_cuda_graph_stage_events,
-    kunserve_stage_profile_enabled,
-    kunserve_timing_log,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -456,147 +449,31 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        detail_timing = kunserve_detailed_timing_enabled()
-        # stage_profile activates the timing scopes (detail_timing=True) but
-        # routes the readout through the cheap accumulator and suppresses all
-        # per-step host logging.  host_log = "really want per-step host lines".
-        stage_profile = kunserve_stage_profile_enabled()
-        host_log = detail_timing and not stage_profile
-        total_start_ns = time.perf_counter_ns() if detail_timing else 0
-        timing_fields = {
-            "mode": str(batch.forward_mode),
-            "batch_size": int(batch.batch_size()),
-            "return_logprob": bool(batch.return_logprob),
-            "can_run_cuda_graph": bool(getattr(result, "can_run_cuda_graph", False)),
-            "has_copy_done": result.copy_done is not None,
-        }
-
-        def log_decode_stage(stage: str, start_ns: int, **fields):
-            if not host_log:
-                return
-            payload = dict(timing_fields)
-            payload.update(fields)
-            kunserve_timing_log(
-                f"scheduler_decode_result_{stage}_end",
-                elapsed_ms=round((time.perf_counter_ns() - start_ns) / 1_000_000.0, 3),
-                **payload,
-            )
-
         if result.copy_done is not None:
-            stage_ns = time.perf_counter_ns() if detail_timing else 0
             result.copy_done.synchronize()
-            log_decode_stage("copy_done_sync", stage_ns)
 
-        graph_meta = getattr(result, "kunserve_graph_timing_meta", None)
-        if detail_timing and isinstance(graph_meta, dict):
-            try:
-                graph_fields = {
-                    k: v
-                    for k, v in graph_meta.items()
-                    if k not in ("graph_start_event", "graph_end_event")
-                }
-                graph_start_event = graph_meta.get("graph_start_event")
-                graph_end_event = graph_meta.get("graph_end_event")
-                graph_key = str(graph_meta.get("graph_key", ""))
-                replay_total_ms = None
-                if graph_start_event is not None and graph_end_event is not None:
-                    try:
-                        replay_total_ms = float(
-                            graph_start_event.elapsed_time(graph_end_event)
-                        )
-                    except Exception:
-                        replay_total_ms = None
-
-                if stage_profile:
-                    # Clean path: accumulate per-stage means, periodic summary.
-                    variant = (
-                        "global"
-                        if "global" in graph_key
-                        else "local"
-                        if "local" in graph_key
-                        else "baseline"
-                    )
-                    kunserve_accumulate_cuda_graph_stage_events(
-                        graph_key,
-                        variant=variant,
-                        replay_total_ms=replay_total_ms,
-                        batch_size=int(batch.batch_size()),
-                    )
-                else:
-                    # Legacy per-event logging (heavy; only under explicit DETAIL).
-                    if replay_total_ms is not None:
-                        kunserve_timing_log(
-                            "graph_cuda_replay_total_end",
-                            elapsed_ms=round(replay_total_ms, 3),
-                            **timing_fields,
-                            **graph_fields,
-                        )
-                    stage_ns = time.perf_counter_ns()
-                    logged_events = kunserve_log_cuda_graph_stage_events(
-                        graph_key,
-                        **timing_fields,
-                        **graph_fields,
-                    )
-                    log_decode_stage(
-                        "graph_internal_event_log",
-                        stage_ns,
-                        logged_events=int(logged_events),
-                        graph_key=graph_key,
-                    )
-            except Exception as exc:
-                if not stage_profile:
-                    kunserve_timing_log(
-                        "scheduler_decode_result_graph_internal_event_log_error",
-                        graph_key=str(graph_meta.get("graph_key", "")),
-                        error=repr(exc),
-                        **timing_fields,
-                    )
-
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        log_decode_stage("unpack_result", stage_ns)
 
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
-        log_decode_stage(
-            "token_ids_to_list",
-            stage_ns,
-            spec_v2=bool(batch.is_spec_v2),
-            spec_none=bool(batch.spec_algorithm.is_none()),
-        )
-
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
-        log_decode_stage("metrics_pre", stage_ns)
-
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         self.token_to_kv_pool_allocator.free_group_begin()
-        log_decode_stage("free_group_begin", stage_ns)
-
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
-        loop_start_ns = time.perf_counter_ns() if detail_timing else 0
-        append_check_ns = 0
-        release_ns = 0
-        custom_info_ns = 0
-        logprob_ns = 0
-        hidden_ns = 0
-        grammar_ns = 0
         finished_count = 0
         skipped_count = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -609,7 +486,6 @@ class SchedulerOutputProcessorMixin:
                 skipped_count += 1
                 continue
 
-            sub_ns = time.perf_counter_ns() if detail_timing else 0
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
@@ -622,12 +498,8 @@ class SchedulerOutputProcessorMixin:
             self._mamba_prefix_cache_update(req, batch, result, i)
 
             req.check_finished(new_accepted_len)
-            if detail_timing:
-                append_check_ns += time.perf_counter_ns() - sub_ns
-
             if req.finished():
                 finished_count += 1
-                sub_ns = time.perf_counter_ns() if detail_timing else 0
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -638,16 +510,8 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
-                if detail_timing:
-                    release_ns += time.perf_counter_ns() - sub_ns
-
-            sub_ns = time.perf_counter_ns() if detail_timing else 0
             self.maybe_collect_customized_info(i, req, logits_output)
-            if detail_timing:
-                custom_info_ns += time.perf_counter_ns() - sub_ns
-
             if req.return_logprob and batch.spec_algorithm.is_none():
-                sub_ns = time.perf_counter_ns() if detail_timing else 0
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -665,19 +529,11 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
-                if detail_timing:
-                    logprob_ns += time.perf_counter_ns() - sub_ns
-
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                sub_ns = time.perf_counter_ns() if detail_timing else 0
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
-                if detail_timing:
-                    hidden_ns += time.perf_counter_ns() - sub_ns
-
             if req.grammar is not None:
-                sub_ns = time.perf_counter_ns() if detail_timing else 0
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if batch.spec_algorithm.is_none():
@@ -695,32 +551,8 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-                if detail_timing:
-                    grammar_ns += time.perf_counter_ns() - sub_ns
-
-        if detail_timing:
-            log_decode_stage(
-                "finish_loop",
-                loop_start_ns,
-                finished_count=int(finished_count),
-                skipped_count=int(skipped_count),
-                append_check_ms=round(append_check_ns / 1_000_000.0, 3),
-                release_ms=round(release_ns / 1_000_000.0, 3),
-                custom_info_ms=round(custom_info_ns / 1_000_000.0, 3),
-                logprob_ms=round(logprob_ns / 1_000_000.0, 3),
-                hidden_ms=round(hidden_ns / 1_000_000.0, 3),
-                grammar_ms=round(grammar_ns / 1_000_000.0, 3),
-            )
-
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         self.stream_output(batch.reqs, batch.return_logprob)
-        log_decode_stage("stream_output", stage_ns)
-
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         self.token_to_kv_pool_allocator.free_group_end()
-        log_decode_stage("free_group_end", stage_ns)
-
-        stage_ns = time.perf_counter_ns() if detail_timing else 0
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if self.current_scheduler_metrics_enabled:
             if self.forward_ct_decode % self.server_args.decode_log_interval == 0:
@@ -728,8 +560,6 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
             )
-        log_decode_stage("decode_stats", stage_ns)
-        log_decode_stage("total", total_start_ns)
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
