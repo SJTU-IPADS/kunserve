@@ -74,7 +74,7 @@ def deepep_grouped_to_triton_sorted(
     """
     raise NotImplementedError(
         "KunServe DeepEP bf16/triton adapter (deepep_grouped_to_triton_sorted) "
-        "is milestone M4; see kunserve_manager/deepep_link_implementation_plan.md."
+        "is milestone M4; see kunserve_manager/deepep_link.md."
     )
 
 
@@ -91,5 +91,5 @@ def triton_sorted_to_deepep_grouped(
     """
     raise NotImplementedError(
         "KunServe DeepEP bf16/triton adapter (triton_sorted_to_deepep_grouped) "
-        "is milestone M4; see kunserve_manager/deepep_link_implementation_plan.md."
+        "is milestone M4; see kunserve_manager/deepep_link.md."
     )

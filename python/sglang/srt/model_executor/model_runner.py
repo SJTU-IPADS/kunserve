@@ -1427,7 +1427,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 if self._kunserve_precision_policy.dispatch_dtype == "bf16":
                     # The bf16/triton GLOBAL dispatcher+runner adapter is the M4
-                    # milestone (see kunserve_manager/deepep_link_implementation_plan.md);
+                    # milestone (see kunserve_manager/deepep_link.md);
                     # the policy is recognized here but the runtime path is not wired
                     # yet, so fail loudly instead of crashing deeper in capture.
                     raise NotImplementedError(
