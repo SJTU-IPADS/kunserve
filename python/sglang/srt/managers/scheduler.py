@@ -858,6 +858,8 @@ class Scheduler(
         self._phase_e_cache_valid: bool = False
         self._phase_e_cached_max_bs: int = 0
         self._phase_e_cached_min_bs: int = 0
+        self._phase_e_cached_raw_max_bs: int = 0
+        self._phase_e_cached_raw_min_bs: int = 0
         self._phase_e_cached_any_force_eager: bool = False
         self._phase_e_cached_steps_left: int = 0
         self._phase_e_cached_state_fingerprint: Optional[int] = None
@@ -1325,6 +1327,8 @@ class Scheduler(
                         negotiated_any_force_eager,
                         phase_e_from_cache,
                         phase_e_state_fingerprint,
+                        negotiated_raw_max_bs,
+                        negotiated_raw_min_bs,
                     ) = self._phase_e_get_step_decision(
                         batch=batch,
                         local_status=local_status,
@@ -1352,6 +1356,8 @@ class Scheduler(
                     self._phase_e_apply_step_decision(
                         negotiated_max_bs=negotiated_max_bs,
                         negotiated_min_bs=negotiated_min_bs,
+                        negotiated_raw_max_bs=negotiated_raw_max_bs,
+                        negotiated_raw_min_bs=negotiated_raw_min_bs,
                         negotiated_any_force_eager=negotiated_any_force_eager,
                         graph_bs_override_hint=(
                             negotiated_max_bs if phase_e_from_cache else None
@@ -1365,6 +1371,8 @@ class Scheduler(
                         loop="normal",
                         max_bs=int(negotiated_max_bs),
                         min_bs=int(negotiated_min_bs),
+                        raw_max_bs=int(negotiated_raw_max_bs),
+                        raw_min_bs=int(negotiated_raw_min_bs),
                         any_force_eager=bool(negotiated_any_force_eager),
                     )
                     phase_e_force_eager_set = True
@@ -1492,6 +1500,8 @@ class Scheduler(
             phase_e_negotiated_max: Optional[int] = None
             phase_e_negotiated_min: Optional[int] = None
             phase_e_negotiated_any_force_eager: bool = False
+            phase_e_negotiated_raw_max: int = 0
+            phase_e_negotiated_raw_min: int = 0
             phase_e_from_cache: bool = False
             phase_e_status: Optional[Dict[str, Any]] = None
             phase_e_state_fingerprint: Optional[int] = None
@@ -1516,6 +1526,8 @@ class Scheduler(
                         phase_e_negotiated_any_force_eager,
                         phase_e_from_cache,
                         phase_e_state_fingerprint,
+                        phase_e_negotiated_raw_max,
+                        phase_e_negotiated_raw_min,
                     ) = self._phase_e_get_step_decision(
                         batch=batch,
                         local_status=phase_e_status,
@@ -1587,6 +1599,8 @@ class Scheduler(
                 self._phase_e_apply_step_decision(
                     negotiated_max_bs=int(phase_e_negotiated_max),
                     negotiated_min_bs=int(phase_e_negotiated_min),
+                    negotiated_raw_max_bs=int(phase_e_negotiated_raw_max),
+                    negotiated_raw_min_bs=int(phase_e_negotiated_raw_min),
                     negotiated_any_force_eager=phase_e_negotiated_any_force_eager,
                     graph_bs_override_hint=(
                         int(phase_e_negotiated_max) if phase_e_from_cache else None
@@ -1600,6 +1614,8 @@ class Scheduler(
                     loop="overlap",
                     max_bs=int(phase_e_negotiated_max),
                     min_bs=int(phase_e_negotiated_min),
+                    raw_max_bs=int(phase_e_negotiated_raw_max),
+                    raw_min_bs=int(phase_e_negotiated_raw_min),
                     any_force_eager=bool(phase_e_negotiated_any_force_eager),
                 )
                 phase_e_force_eager_set = True
@@ -1685,6 +1701,8 @@ class Scheduler(
                         self._phase_e_apply_step_decision(
                             negotiated_max_bs=int(phase_e_negotiated_max),
                             negotiated_min_bs=int(phase_e_negotiated_min),
+                            negotiated_raw_max_bs=int(phase_e_negotiated_raw_max),
+                            negotiated_raw_min_bs=int(phase_e_negotiated_raw_min),
                             negotiated_any_force_eager=phase_e_negotiated_any_force_eager,
                             graph_bs_override_hint=(
                                 int(phase_e_negotiated_max)
@@ -1700,6 +1718,8 @@ class Scheduler(
                             loop="overlap_keepalive",
                             max_bs=int(phase_e_negotiated_max),
                             min_bs=int(phase_e_negotiated_min),
+                            raw_max_bs=int(phase_e_negotiated_raw_max),
+                            raw_min_bs=int(phase_e_negotiated_raw_min),
                             any_force_eager=bool(phase_e_negotiated_any_force_eager),
                         )
                         phase_e_force_eager_set = True
@@ -3900,19 +3920,28 @@ class Scheduler(
                 reason=str(reason),
                 cached_max_bs=int(self._phase_e_cached_max_bs),
                 cached_min_bs=int(self._phase_e_cached_min_bs),
+                cached_raw_max_bs=int(self._phase_e_cached_raw_max_bs),
+                cached_raw_min_bs=int(self._phase_e_cached_raw_min_bs),
                 cached_steps_left=int(self._phase_e_cached_steps_left),
                 cached_state_fingerprint=self._phase_e_cached_state_fingerprint,
             )
         self._phase_e_cache_valid = False
         self._phase_e_cached_max_bs = 0
         self._phase_e_cached_min_bs = 0
+        self._phase_e_cached_raw_max_bs = 0
+        self._phase_e_cached_raw_min_bs = 0
         self._phase_e_cached_any_force_eager = False
         self._phase_e_cached_steps_left = 0
         self._phase_e_cached_state_fingerprint = None
 
     def _phase_e_cache_enabled(self) -> bool:
+        # Reusing a cached graph bucket without the guard collective cannot
+        # observe peer raw-batch shrink/growth inside the cache window.  Keep
+        # cache disabled when the guard is disabled so Phase E falls back to
+        # lockstep negotiation every step instead of risking stale graph replay.
         return (
             self._phase_e_negotiate_interval > 1
+            and self._phase_e_cache_guard_enabled
             and self._kunserve_global_graph_replay_active()
         )
 
@@ -4005,6 +4034,8 @@ class Scheduler(
         *,
         negotiated_max_bs: int,
         negotiated_min_bs: int,
+        negotiated_raw_max_bs: int,
+        negotiated_raw_min_bs: int,
         negotiated_any_force_eager: bool,
         state_fingerprint: Optional[int],
     ) -> None:
@@ -4014,9 +4045,16 @@ class Scheduler(
 
         negotiated_max_bs = int(negotiated_max_bs)
         negotiated_min_bs = int(negotiated_min_bs)
+        negotiated_raw_max_bs = int(negotiated_raw_max_bs)
+        negotiated_raw_min_bs = int(negotiated_raw_min_bs)
+        raw_busy_mismatch = (
+            negotiated_raw_min_bs > 0
+            and negotiated_raw_min_bs != negotiated_raw_max_bs
+        )
         cacheable = (
             negotiated_max_bs > 0
             and not bool(negotiated_any_force_eager)
+            and not raw_busy_mismatch
             and self._capture_bs_supported(negotiated_max_bs)
         )
         if not cacheable:
@@ -4026,6 +4064,8 @@ class Scheduler(
         self._phase_e_cache_valid = True
         self._phase_e_cached_max_bs = negotiated_max_bs
         self._phase_e_cached_min_bs = negotiated_min_bs
+        self._phase_e_cached_raw_max_bs = negotiated_raw_max_bs
+        self._phase_e_cached_raw_min_bs = negotiated_raw_min_bs
         self._phase_e_cached_any_force_eager = bool(negotiated_any_force_eager)
         self._phase_e_cached_steps_left = max(
             0, int(self._phase_e_negotiate_interval) - 1
@@ -4036,6 +4076,8 @@ class Scheduler(
             interval=int(self._phase_e_negotiate_interval),
             cached_max_bs=int(self._phase_e_cached_max_bs),
             cached_min_bs=int(self._phase_e_cached_min_bs),
+            cached_raw_max_bs=int(self._phase_e_cached_raw_max_bs),
+            cached_raw_min_bs=int(self._phase_e_cached_raw_min_bs),
             cached_any_force_eager=bool(self._phase_e_cached_any_force_eager),
             cached_steps_left=int(self._phase_e_cached_steps_left),
             cached_state_fingerprint=self._phase_e_cached_state_fingerprint,
@@ -4044,10 +4086,11 @@ class Scheduler(
     def _phase_e_try_reuse_cached_decision(
         self,
         *,
+        local_raw_bs: int,
         local_padded: int,
         local_force_eager: bool,
         local_signature: Tuple[int, ...],
-    ) -> Optional[Tuple[int, int, bool, bool, Optional[int]]]:
+    ) -> Optional[Tuple[int, int, bool, bool, Optional[int], int, int]]:
         if not self._phase_e_cache_enabled() or not self._phase_e_cache_valid:
             return None
         if self._phase_e_cached_steps_left <= 0:
@@ -4075,15 +4118,23 @@ class Scheduler(
                 guard_min_bs,
                 guard_any_force_eager,
                 guard_state_fingerprint,
+                guard_raw_max_bs,
+                guard_raw_min_bs,
             ) = self.negotiate_balloon_step_state(
-                int(local_padded),
+                int(local_raw_bs),
                 local_force_eager=bool(local_force_eager),
+                local_padded_bs=int(local_padded),
                 local_state_signature=local_signature,
+            )
+            guard_raw_busy_mismatch = (
+                int(guard_raw_min_bs) > 0
+                and int(guard_raw_min_bs) != int(guard_raw_max_bs)
             )
             cache_changed = (
                 guard_state_fingerprint != previous_state_fingerprint
                 or int(guard_max_bs) > int(self._phase_e_cached_max_bs)
                 or bool(guard_any_force_eager)
+                or bool(guard_raw_busy_mismatch)
             )
             if cache_changed:
                 self._phase_e_reset_cached_decision("guard state changed")
@@ -4093,6 +4144,9 @@ class Scheduler(
                     guard_max_bs=int(guard_max_bs),
                     guard_min_bs=int(guard_min_bs),
                     guard_any_force_eager=bool(guard_any_force_eager),
+                    guard_raw_max_bs=int(guard_raw_max_bs),
+                    guard_raw_min_bs=int(guard_raw_min_bs),
+                    guard_raw_busy_mismatch=bool(guard_raw_busy_mismatch),
                     previous_state_fingerprint=previous_state_fingerprint,
                     guard_state_fingerprint=guard_state_fingerprint,
                 )
@@ -4105,6 +4159,8 @@ class Scheduler(
                     True,
                     False,
                     guard_state_fingerprint,
+                    int(guard_raw_max_bs),
+                    int(guard_raw_min_bs),
                 )
 
         self._phase_e_cached_steps_left -= 1
@@ -4115,6 +4171,8 @@ class Scheduler(
             local_force_eager=bool(local_force_eager),
             cached_max_bs=int(self._phase_e_cached_max_bs),
             cached_min_bs=int(self._phase_e_cached_min_bs),
+            cached_raw_max_bs=int(self._phase_e_cached_raw_max_bs),
+            cached_raw_min_bs=int(self._phase_e_cached_raw_min_bs),
             cached_any_force_eager=bool(self._phase_e_cached_any_force_eager),
             cached_steps_left=int(self._phase_e_cached_steps_left),
             cached_state_fingerprint=self._phase_e_cached_state_fingerprint,
@@ -4125,6 +4183,8 @@ class Scheduler(
             bool(self._phase_e_cached_any_force_eager),
             True,
             self._phase_e_cached_state_fingerprint,
+            int(self._phase_e_cached_raw_max_bs),
+            int(self._phase_e_cached_raw_min_bs),
         )
 
     def _phase_e_get_step_decision(
@@ -4133,7 +4193,7 @@ class Scheduler(
         batch: Optional[ScheduleBatch],
         local_status: Dict[str, Any],
         loop: str,
-    ) -> Tuple[int, int, bool, bool, Optional[int]]:
+    ) -> Tuple[int, int, bool, bool, Optional[int], int, int]:
         local_bs = batch.batch_size() if batch is not None else 0
         stage_ns = time.perf_counter_ns()
         local_force_eager = self._kunserve_batch_requires_eager_for_phase_e(batch)
@@ -4166,6 +4226,7 @@ class Scheduler(
         )
 
         cached = self._phase_e_try_reuse_cached_decision(
+            local_raw_bs=int(local_bs),
             local_padded=int(local_padded),
             local_force_eager=bool(local_force_eager),
             local_signature=local_signature,
@@ -4177,6 +4238,8 @@ class Scheduler(
                 negotiated_any_force_eager,
                 phase_e_from_cache,
                 state_fingerprint,
+                negotiated_raw_max_bs,
+                negotiated_raw_min_bs,
             ) = cached
             kunserve_timing_log(
                 "phase_e_negotiated",
@@ -4188,6 +4251,8 @@ class Scheduler(
                 local_force_eager=bool(local_force_eager),
                 max_bs=int(negotiated_max_bs),
                 min_bs=int(negotiated_min_bs),
+                raw_max_bs=int(negotiated_raw_max_bs),
+                raw_min_bs=int(negotiated_raw_min_bs),
                 any_force_eager=bool(negotiated_any_force_eager),
                 running=len(self.running_batch.reqs),
                 waiting=len(self.waiting_queue),
@@ -4200,6 +4265,8 @@ class Scheduler(
                 bool(negotiated_any_force_eager),
                 bool(phase_e_from_cache),
                 state_fingerprint,
+                int(negotiated_raw_max_bs),
+                int(negotiated_raw_min_bs),
             )
 
         (
@@ -4207,11 +4274,20 @@ class Scheduler(
             negotiated_min_bs,
             negotiated_any_force_eager,
             state_fingerprint,
+            negotiated_raw_max_bs,
+            negotiated_raw_min_bs,
         ) = self.negotiate_balloon_step_state(
-            local_padded,
+            local_bs,
             local_force_eager=local_force_eager,
+            local_padded_bs=local_padded,
             local_state_signature=local_signature,
         )
+        raw_busy_mismatch = (
+            int(negotiated_raw_min_bs) > 0
+            and int(negotiated_raw_min_bs) != int(negotiated_raw_max_bs)
+        )
+        if raw_busy_mismatch:
+            negotiated_any_force_eager = True
         kunserve_timing_log(
             "phase_e_negotiated",
             source="collective",
@@ -4222,6 +4298,9 @@ class Scheduler(
             local_force_eager=bool(local_force_eager),
             max_bs=int(negotiated_max_bs),
             min_bs=int(negotiated_min_bs),
+            raw_max_bs=int(negotiated_raw_max_bs),
+            raw_min_bs=int(negotiated_raw_min_bs),
+            raw_busy_mismatch=bool(raw_busy_mismatch),
             any_force_eager=bool(negotiated_any_force_eager),
             running=len(self.running_batch.reqs),
             waiting=len(self.waiting_queue),
@@ -4230,6 +4309,8 @@ class Scheduler(
         self._phase_e_update_cached_decision(
             negotiated_max_bs=int(negotiated_max_bs),
             negotiated_min_bs=int(negotiated_min_bs),
+            negotiated_raw_max_bs=int(negotiated_raw_max_bs),
+            negotiated_raw_min_bs=int(negotiated_raw_min_bs),
             negotiated_any_force_eager=bool(negotiated_any_force_eager),
             state_fingerprint=state_fingerprint,
         )
@@ -4239,6 +4320,8 @@ class Scheduler(
             bool(negotiated_any_force_eager),
             False,
             state_fingerprint,
+            int(negotiated_raw_max_bs),
+            int(negotiated_raw_min_bs),
         )
 
     def _padded_capture_bs(self, local_bs: int) -> int:
@@ -4306,6 +4389,8 @@ class Scheduler(
         *,
         negotiated_max_bs: int,
         negotiated_min_bs: int,
+        negotiated_raw_max_bs: int = 0,
+        negotiated_raw_min_bs: int = 0,
         negotiated_any_force_eager: bool = False,
         graph_bs_override_hint: Optional[int] = None,
         state_fingerprint: Optional[int] = None,
@@ -4321,18 +4406,29 @@ class Scheduler(
         * ``min_bs == 0 and max_bs > 0`` -- idle/busy decode split.  Idle
           replicas build a keepalive batch of size ``max_bs`` and graph replay
           is safe only when ``any_force_eager`` is false.
+        * ``raw_min_bs > 0 and raw_min_bs != raw_max_bs`` -- busy/busy raw
+          mismatch.  This is not represented safely by the current graph
+          contract, so all ranks force eager and the dynamic dispatcher pads
+          to the runtime max_m.
         * ``min_bs > 0 and min_bs != max_bs`` -- busy/busy with mismatched
-          padded bs.  All ranks replay the ``max_bs`` GLOBAL graph bucket and
-          smaller local batches pad extra rows to dummy KV.
-        * ``min_bs == max_bs`` -- uniform decode shape, graph replay safe.
+          padded bs but equal raw bs.  All ranks replay the ``max_bs`` GLOBAL
+          graph bucket and smaller local batches pad extra rows to dummy KV.
+        * ``min_bs == max_bs`` -- uniform decode graph bucket, graph replay safe
+          when the raw guard also matches.
         """
         model_runner = getattr(self.tp_worker, "model_runner", None)
         if model_runner is None:
             return
         negotiated_max_bs = int(negotiated_max_bs)
         negotiated_min_bs = int(negotiated_min_bs)
+        negotiated_raw_max_bs = int(negotiated_raw_max_bs)
+        negotiated_raw_min_bs = int(negotiated_raw_min_bs)
+        raw_busy_mismatch = (
+            negotiated_raw_min_bs > 0
+            and negotiated_raw_min_bs != negotiated_raw_max_bs
+        )
         graph_bs_override: Optional[int] = None
-        force_eager = bool(negotiated_any_force_eager)
+        force_eager = bool(negotiated_any_force_eager) or bool(raw_busy_mismatch)
         mismatch_decode = (
             negotiated_min_bs > 0 and negotiated_min_bs != negotiated_max_bs
         )
@@ -4363,6 +4459,8 @@ class Scheduler(
                     expected_graph_bs,
                     max_bs=negotiated_max_bs,
                     min_bs=negotiated_min_bs,
+                    raw_max_bs=negotiated_raw_max_bs,
+                    raw_min_bs=negotiated_raw_min_bs,
                     state_fingerprint=state_fingerprint,
                 )
         except Exception:
@@ -4371,6 +4469,9 @@ class Scheduler(
             "phase_e_step_decision",
             max_bs=int(negotiated_max_bs),
             min_bs=int(negotiated_min_bs),
+            raw_max_bs=int(negotiated_raw_max_bs),
+            raw_min_bs=int(negotiated_raw_min_bs),
+            raw_busy_mismatch=bool(raw_busy_mismatch),
             any_force_eager=bool(negotiated_any_force_eager),
             mismatch_decode=bool(mismatch_decode),
             force_eager=bool(force_eager),
@@ -4399,7 +4500,8 @@ class Scheduler(
         local_bs: int,
         local_force_eager: bool = False,
         local_state_signature: Optional[Tuple[int, ...]] = None,
-    ) -> Tuple[int, int, bool, Optional[int]]:
+        local_padded_bs: Optional[int] = None,
+    ) -> Tuple[int, int, bool, Optional[int], int, int]:
         """Phase E synchronized shape/state negotiation.
 
         The first three return values are the historical batch-size decision.
@@ -4408,10 +4510,11 @@ class Scheduler(
         graph buckets can be invalidated symmetrically on all ranks.
         """
         stage_ns = time.perf_counter_ns()
-        max_bs, min_bs, any_force_eager, state_fingerprint = (
+        max_bs, min_bs, any_force_eager, state_fingerprint, raw_max_bs, raw_min_bs = (
             self.tp_worker.model_runner.negotiate_balloon_step_state(
                 int(local_bs),
                 bool(local_force_eager),
+                local_padded_bs=local_padded_bs,
                 local_state_signature=local_state_signature,
             )
         )
@@ -4420,9 +4523,14 @@ class Scheduler(
             stage_ns,
             loop="phase_e",
             local_bs=int(local_bs),
+            local_padded_bs=(
+                int(local_padded_bs) if local_padded_bs is not None else int(local_bs)
+            ),
             local_force_eager=bool(local_force_eager),
             max_bs=int(max_bs),
             min_bs=int(min_bs),
+            raw_max_bs=int(raw_max_bs),
+            raw_min_bs=int(raw_min_bs),
             any_force_eager=bool(any_force_eager),
             state_fingerprint=state_fingerprint,
         )
@@ -4431,6 +4539,8 @@ class Scheduler(
             int(min_bs),
             bool(any_force_eager),
             state_fingerprint,
+            int(raw_max_bs),
+            int(raw_min_bs),
         )
 
     def negotiate_balloon_step_bs(
@@ -4443,7 +4553,7 @@ class Scheduler(
         keepalive size and the other two fields for the symmetric graph/eager
         decision.
         """
-        max_bs, min_bs, any_force_eager, _ = self.negotiate_balloon_step_state(
+        max_bs, min_bs, any_force_eager, _, _, _ = self.negotiate_balloon_step_state(
             int(local_bs), bool(local_force_eager)
         )
         return int(max_bs), int(min_bs), bool(any_force_eager)
@@ -4630,8 +4740,23 @@ class Scheduler(
             _, token_usage, _, _ = self._get_token_info()
         except Exception:
             token_usage = getattr(self.stats, "token_usage", 0.0)
+        cur_batch = getattr(self, "cur_batch", None)
+        last_batch = getattr(self, "last_batch", None)
+
+        def _batch_mode(batch):
+            return str(batch.forward_mode) if batch is not None else "None"
+
+        def _batch_size(batch):
+            return int(batch.batch_size()) if batch is not None else 0
+
         status.update(
             {
+                "scheduler_status_ts": float(time.time()),
+                "scheduler_forward_ct": int(getattr(self, "forward_ct", 0)),
+                "scheduler_cur_batch_mode": _batch_mode(cur_batch),
+                "scheduler_cur_batch_size": _batch_size(cur_batch),
+                "scheduler_last_batch_mode": _batch_mode(last_batch),
+                "scheduler_last_batch_size": _batch_size(last_batch),
                 "expand_requested": bool(self.expand_requested),
                 "expand_request_reason": self.expand_request_reason,
                 "num_waiting_requests": len(self.waiting_queue),
@@ -4666,6 +4791,8 @@ class Scheduler(
                 ),
                 "phase_e_cache_valid": bool(self._phase_e_cache_valid),
                 "phase_e_cached_max_bs": int(self._phase_e_cached_max_bs),
+                "phase_e_cached_raw_max_bs": int(self._phase_e_cached_raw_max_bs),
+                "phase_e_cached_raw_min_bs": int(self._phase_e_cached_raw_min_bs),
                 "phase_e_cached_steps_left": int(
                     self._phase_e_cached_steps_left
                 ),

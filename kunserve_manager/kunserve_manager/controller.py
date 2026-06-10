@@ -127,6 +127,10 @@ class KunServeController:
         ] = None
         self._tick_count = 0
         self._last_decision: Optional[str] = None
+        self._stale_decode_warn_seconds = float(
+            os.environ.get("KUNSERVE_STALE_DECODE_WARN_SECONDS", "30")
+        )
+        self._decode_progress_state: dict[int, tuple[int, float, float]] = {}
 
     def _emit(self, message: str) -> None:
         print(f"[KunServeController] {message}", flush=True)
@@ -136,7 +140,8 @@ class KunServeController:
         parts = []
         for idx, status in enumerate(statuses):
             parts.append(
-                "r%d(state=%s variant=%s expand=%s running=%s waiting=%s offloaded=%s slots=%s)"
+                "r%d(state=%s variant=%s expand=%s running=%s waiting=%s "
+                "offloaded=%s slots=%s fwd=%s cur=%s/%s last=%s/%s)"
                 % (
                     idx,
                     status.get("state"),
@@ -146,6 +151,11 @@ class KunServeController:
                     status.get("num_waiting_requests"),
                     status.get("offloaded_local_experts"),
                     status.get("added_kv_slots"),
+                    status.get("scheduler_forward_ct"),
+                    status.get("scheduler_cur_batch_mode"),
+                    status.get("scheduler_cur_batch_size"),
+                    status.get("scheduler_last_batch_mode"),
+                    status.get("scheduler_last_batch_size"),
                 )
             )
         return " ".join(parts)
@@ -338,6 +348,7 @@ class KunServeController:
     async def tick(self) -> list[dict[str, Any]]:
         statuses = await self._fetch_statuses()
         self._tick_count += 1
+        self._check_stale_decode_statuses(statuses)
         self._write_bw_status_sample(statuses)
         status_summary = self._summarize_statuses(statuses)
         if self._tick_count <= 5 or self._tick_count % 30 == 0:
@@ -418,10 +429,75 @@ class KunServeController:
                 )
                 row[f"state_{suffix}"] = status.get("state")
                 row[f"variant_{suffix}"] = status.get("runtime_variant")
+                row[f"forward_ct_{suffix}"] = status.get("scheduler_forward_ct")
+                row[f"cur_batch_{suffix}"] = status.get("scheduler_cur_batch_mode")
+                row[f"last_batch_{suffix}"] = status.get(
+                    "scheduler_last_batch_mode"
+                )
+                row[f"health_code_{suffix}"] = status.get("kunserve_health_code")
             with self._bw_log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         except Exception:
             logger.debug("failed to write bw status sample", exc_info=True)
+
+    def _check_stale_decode_statuses(self, statuses: Sequence[dict[str, Any]]) -> None:
+        if self._stale_decode_warn_seconds <= 0:
+            return
+
+        now = time.time()
+        active_indices = set()
+        for idx, status in enumerate(statuses):
+            try:
+                running = int(status.get("num_running_requests", 0) or 0)
+                forward_ct = int(status.get("scheduler_forward_ct"))
+            except (TypeError, ValueError):
+                self._decode_progress_state.pop(idx, None)
+                continue
+
+            is_active_decode = status.get("state") == "balloon" and running > 0
+            if not is_active_decode:
+                self._decode_progress_state.pop(idx, None)
+                continue
+
+            active_indices.add(idx)
+            prev = self._decode_progress_state.get(idx)
+            if prev is None or prev[0] != forward_ct:
+                self._decode_progress_state[idx] = (forward_ct, now, 0.0)
+                status["kunserve_health_code"] = "OK"
+                continue
+
+            _, unchanged_since, last_emit = prev
+            unchanged_for = now - unchanged_since
+            if unchanged_for < self._stale_decode_warn_seconds:
+                status["kunserve_health_code"] = "OK"
+                continue
+
+            status["kunserve_health_code"] = "KUNSERVE_STALE_DECODE"
+            status["kunserve_stale_decode_seconds"] = round(unchanged_for, 3)
+            if last_emit <= 0 or now - last_emit >= self._stale_decode_warn_seconds:
+                self._decode_progress_state[idx] = (forward_ct, unchanged_since, now)
+                self._emit(
+                    "KUNSERVE_STALE_DECODE replica=%d unchanged_for=%.1fs "
+                    "forward_ct=%d running=%s waiting=%s state=%s variant=%s "
+                    "cur=%s/%s last=%s/%s"
+                    % (
+                        idx,
+                        unchanged_for,
+                        forward_ct,
+                        status.get("num_running_requests"),
+                        status.get("num_waiting_requests"),
+                        status.get("state"),
+                        status.get("runtime_variant"),
+                        status.get("scheduler_cur_batch_mode"),
+                        status.get("scheduler_cur_batch_size"),
+                        status.get("scheduler_last_batch_mode"),
+                        status.get("scheduler_last_batch_size"),
+                    )
+                )
+
+        for idx in list(self._decode_progress_state.keys()):
+            if idx not in active_indices:
+                self._decode_progress_state.pop(idx, None)
 
     def _log_asymmetric_balloon_risk(self, statuses: Sequence[dict[str, Any]]) -> None:
         if not self._balloon_active:

@@ -963,26 +963,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         local_bs: int,
         local_force_eager: bool = False,
         *,
+        local_padded_bs: Optional[int] = None,
         local_state_signature: Optional[Tuple[int, ...]] = None,
-    ) -> Tuple[int, int, bool, Optional[int]]:
+    ) -> Tuple[int, int, bool, Optional[int], int, int]:
         """Phase E cross-replica shape/state negotiation.
 
-        This extends ``negotiate_balloon_step_bs`` with a deterministic
-        fingerprint of the gathered per-rank scheduler signatures.  Cached
-        GLOBAL graph buckets can then be reused only while every rank observes
-        the same control-flow state that produced the cache.
+        The decision used by CUDA graph replay needs both the semantic batch
+        size (``raw_bs``) and the selected fixed-padded graph bucket.  The first
+        two return values remain the negotiated padded max/min for keepalive and
+        graph-bucket selection; the final two return values are raw max/min so
+        the scheduler can force eager for busy/busy raw mismatches.
         """
-        local_payload = [int(local_bs), 1 if local_force_eager else 0]
+        local_raw_bs = int(local_bs)
+        local_padded = (
+            int(local_padded_bs)
+            if local_padded_bs is not None
+            else int(local_raw_bs)
+        )
+        local_payload = [
+            int(local_raw_bs),
+            int(local_padded),
+            1 if local_force_eager else 0,
+        ]
         if local_state_signature is not None:
             local_payload.extend(int(v) for v in local_state_signature)
         local_fingerprint = self._kunserve_fingerprint_ints(local_payload)
 
+        def local_result() -> Tuple[int, int, bool, Optional[int], int, int]:
+            return (
+                int(local_padded),
+                int(local_padded),
+                bool(local_force_eager),
+                local_fingerprint,
+                int(local_raw_bs),
+                int(local_raw_bs),
+            )
+
         self._kun_wd_negct = getattr(self, "_kun_wd_negct", 0) + 1
         _kun_wd(
-            "[KUNSERVE-WD] neg_call n=%d bs=%d fe=%d state=%s backend=%s"
+            "[KUNSERVE-WD] neg_call n=%d raw_bs=%d padded_bs=%d fe=%d "
+            "state=%s backend=%s"
             % (
                 self._kun_wd_negct,
-                int(local_bs),
+                int(local_raw_bs),
+                int(local_padded),
                 1 if local_force_eager else 0,
                 str(self._balloon_state),
                 str(self._balloon_kunserve_comm_backend),
@@ -990,37 +1014,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if str(self._balloon_state) != "balloon":
-            return (
-                int(local_bs),
-                int(local_bs),
-                bool(local_force_eager),
-                local_fingerprint,
-            )
+            return local_result()
         if str(self._balloon_kunserve_comm_backend or "").lower() != "sglang":
-            return (
-                int(local_bs),
-                int(local_bs),
-                bool(local_force_eager),
-                local_fingerprint,
-            )
+            return local_result()
         try:
             runtime_group = self._resolve_balloon_process_group(
                 self._balloon_process_group_name
             )
         except Exception:
-            return (
-                int(local_bs),
-                int(local_bs),
-                bool(local_force_eager),
-                local_fingerprint,
-            )
+            return local_result()
         if runtime_group is None:
-            return (
-                int(local_bs),
-                int(local_bs),
-                bool(local_force_eager),
-                local_fingerprint,
-            )
+            return local_result()
         try:
             device = torch.device("cuda", torch.cuda.current_device())
             local_t = torch.tensor(local_payload, dtype=torch.int32, device=device)
@@ -1028,114 +1032,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             payload_len = int(local_t.numel())
             all_t = torch.empty(world * payload_len, dtype=torch.int32, device=device)
             _kun_wd(
-                "[KUNSERVE-WD] neg_ENTER n=%d world=%d local_bs=%d"
-                % (self._kun_wd_negct, int(world), int(local_bs))
+                "[KUNSERVE-WD] neg_ENTER n=%d world=%d raw_bs=%d padded_bs=%d"
+                % (
+                    self._kun_wd_negct,
+                    int(world),
+                    int(local_raw_bs),
+                    int(local_padded),
+                )
             )
             self._kunserve_all_gather_into_tensor(runtime_group, all_t, local_t)
             _kun_wd("[KUNSERVE-WD] neg_EXIT n=%d" % (self._kun_wd_negct,))
             all_t = all_t.view(world, payload_len)
-            bs_values = all_t[:, 0]
-            eager_values = all_t[:, 1]
+            raw_values = all_t[:, 0]
+            padded_values = all_t[:, 1]
+            eager_values = all_t[:, 2]
             state_fingerprint = self._kunserve_fingerprint_ints(
                 all_t.detach().cpu().reshape(-1).tolist()
             )
+            _kun_wd(
+                "[KUNSERVE-WD] neg_RESULT_READY n=%d raw_min=%d raw_max=%d "
+                "padded_min=%d padded_max=%d any_fe=%d"
+                % (
+                    self._kun_wd_negct,
+                    int(raw_values.min().item()),
+                    int(raw_values.max().item()),
+                    int(padded_values.min().item()),
+                    int(padded_values.max().item()),
+                    int(eager_values.max().item()),
+                )
+            )
             return (
-                int(bs_values.max().item()),
-                int(bs_values.min().item()),
+                int(padded_values.max().item()),
+                int(padded_values.min().item()),
                 bool(eager_values.max().item()),
                 state_fingerprint,
+                int(raw_values.max().item()),
+                int(raw_values.min().item()),
             )
         except Exception as exc:
             _kunserve_ms(
                 "[KUNSERVE-MS] negotiate_balloon_step_state failed: %r "
-                "(local_bs=%d) -- falling back to local-only sizing",
+                "(raw_bs=%d padded_bs=%d) -- falling back to local-only sizing",
                 exc,
-                int(local_bs),
+                int(local_raw_bs),
+                int(local_padded),
             )
-            return (
-                int(local_bs),
-                int(local_bs),
-                bool(local_force_eager),
-                local_fingerprint,
-            )
+            return local_result()
 
 
     def negotiate_balloon_step_bs(
         self, local_bs: int, local_force_eager: bool = False
     ) -> Tuple[int, int, bool]:
-        """Phase E: cross-replica per-step batch-size negotiation.
+        """Compatibility wrapper for the Phase E state negotiation.
 
-        Every rank in the cross-replica runtime_group must call this in
-        lockstep at the same scheduler step.  Returns
-        ``(max_bs, min_bs, any_force_eager)`` from the gathered per-rank values --
-        callers use them to derive:
-
-        * ``negotiated_bs = max_bs`` -- the size every idle replica
-          should pad its keepalive batch to so the captured GLOBAL
-          graph can replay in lockstep on all 4 ranks.
-        * ``lockstep_safe = (min_bs == 0) or (min_bs == max_bs)`` -- if
-          False the world is split into busy-but-different-bs and graph
-          replay would mismatch across ranks; the scheduler must force
-          eager forward on this step.  Returning shared values (instead of
-          just ``max``) is what makes the decision symmetric: every
-          rank sees the same ``(max, min, any_force_eager)`` tuple and reaches the same
-          force-eager conclusion.
-
-        Idle replicas pass ``local_bs=0``; if ``max_bs > 0`` they must
-        build a keepalive batch of that size.
-
-        Returns ``(local_bs, local_bs, local_force_eager)`` (i.e. skips the collective)
-        when:
-
-        - balloon state is not ``balloon`` (LOCAL forward needs no sync),
-        - the runtime_group has not been resolved on this rank yet,
-        - or the kunserve backend is something that does its own per-step
-          sync (DeepEP path - keepalive there is handled by the existing
-          DeepEP normal mode buffer setup).
+        The full protocol now exchanges raw and padded batch sizes.  Legacy
+        callers only consume the negotiated padded max/min and eager bit.
         """
-        if str(self._balloon_state) != "balloon":
-            return int(local_bs), int(local_bs), bool(local_force_eager)
-        if str(self._balloon_kunserve_comm_backend or "").lower() != "sglang":
-            return int(local_bs), int(local_bs), bool(local_force_eager)
-        try:
-            runtime_group = self._resolve_balloon_process_group(
-                self._balloon_process_group_name
-            )
-        except Exception:
-            return int(local_bs), int(local_bs), bool(local_force_eager)
-        if runtime_group is None:
-            return int(local_bs), int(local_bs), bool(local_force_eager)
-        try:
-            device = torch.device("cuda", torch.cuda.current_device())
-            local_t = torch.tensor(
-                [int(local_bs), 1 if local_force_eager else 0],
-                dtype=torch.int32,
-                device=device,
-            )
-            world = self._kunserve_group_world_size(runtime_group)
-            all_t = torch.empty(world * 2, dtype=torch.int32, device=device)
-            self._kunserve_all_gather_into_tensor(runtime_group, all_t, local_t)
-            all_t = all_t.view(world, 2)
-            bs_values = all_t[:, 0]
-            eager_values = all_t[:, 1]
-            # Pull max/min/any in one device->host sync region so every
-            # rank reaches the same graph/eager decision below.
-            return (
-                int(bs_values.max().item()),
-                int(bs_values.min().item()),
-                bool(eager_values.max().item()),
-            )
-        except Exception as exc:
-            # If the collective fails (e.g. group destroyed mid-shutdown),
-            # fall back to the local bs.  The dispatcher's dynamic eager
-            # path can still handle whatever shape arrives.
-            _kunserve_ms(
-                "[KUNSERVE-MS] negotiate_balloon_step_bs failed: %r (local_bs=%d) "
-                "-- falling back to local-only sizing",
-                exc,
-                int(local_bs),
-            )
-            return int(local_bs), int(local_bs), bool(local_force_eager)
+        max_bs, min_bs, any_force_eager, _, _, _ = self.negotiate_balloon_step_state(
+            int(local_bs), bool(local_force_eager)
+        )
+        return int(max_bs), int(min_bs), bool(any_force_eager)
 
     def _default_balloon_physical_to_logical_map(self):
         metadata = (
@@ -1330,9 +1286,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def set_balloon_step_force_eager(self, force: bool) -> None:
         """Phase E hook for steps that cannot safely replay GLOBAL graphs.
 
-        EXTEND/mixed prefill still has dynamic token counts and must run eager.
-        Busy/busy decode bucket mismatches are handled separately by
-        ``_balloon_step_graph_bs_override``.
+        EXTEND/mixed prefill and busy/busy raw-batch mismatches must run eager.
+        Equal-raw decode steps with mismatched padded buckets are handled
+        separately by ``_balloon_step_graph_bs_override``.
         """
         self._balloon_step_force_eager = bool(force)
         self._balloon_step_graph_bs_override = None
@@ -1344,6 +1300,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         *,
         max_bs: int = 0,
         min_bs: int = 0,
+        raw_max_bs: int = 0,
+        raw_min_bs: int = 0,
         state_fingerprint: Optional[int] = None,
     ) -> None:
         try:
@@ -1357,6 +1315,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "expected_bs": expected,
             "max_bs": int(max_bs),
             "min_bs": int(min_bs),
+            "raw_max_bs": int(raw_max_bs),
+            "raw_min_bs": int(raw_min_bs),
             "state_fingerprint": state_fingerprint,
         }
 
@@ -1388,6 +1348,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             actual = int(graph_bs)
         except Exception:
             return True
+        try:
+            raw_max = int(guard.get("raw_max_bs", 0) or 0)
+            raw_min = int(guard.get("raw_min_bs", 0) or 0)
+        except Exception:
+            raw_max = raw_min = 0
+        if raw_min > 0 and raw_max != raw_min:
+            message = (
+                "[KUNSERVE-MS] GLOBAL graph guard raw busy/busy mismatch: "
+                f"raw_min_bs={raw_min} raw_max_bs={raw_max} "
+                f"graph_bs={actual} raw_bs={int(raw_bs)} graph_key={graph_key} "
+                f"guard={guard}"
+            )
+            _kunserve_ms("%s", message)
+            kunserve_timing_log(
+                "phase_e_graph_guard_raw_mismatch",
+                raw_min_bs=raw_min,
+                raw_max_bs=raw_max,
+                graph_bs=actual,
+                raw_bs=int(raw_bs),
+                graph_key=str(graph_key),
+                state_fingerprint=guard.get("state_fingerprint"),
+            )
+            if raise_on_error:
+                raise RuntimeError(message)
+            return False
+        if raw_min > 0 and int(raw_bs) != raw_min:
+            message = (
+                "[KUNSERVE-MS] GLOBAL graph guard local raw mismatch: "
+                f"expected_raw_bs={raw_min} raw_bs={int(raw_bs)} "
+                f"graph_bs={actual} graph_key={graph_key} guard={guard}"
+            )
+            _kunserve_ms("%s", message)
+            kunserve_timing_log(
+                "phase_e_graph_guard_local_raw_mismatch",
+                expected_raw_bs=raw_min,
+                raw_bs=int(raw_bs),
+                graph_bs=actual,
+                graph_key=str(graph_key),
+                state_fingerprint=guard.get("state_fingerprint"),
+            )
+            if raise_on_error:
+                raise RuntimeError(message)
+            return False
         if expected <= 0 or actual == expected:
             return True
         message = (
