@@ -19,13 +19,13 @@
 | PrecisionPolicy | ✅ | `kunserve_precision.py`;model_runner 把 `deepep⇒deep_gemm` 硬 assert 换成策略;bf16 暂 `NotImplementedError` |
 | `KUNSERVE_DISPATCH_DTYPE` env + verl 透传 | ✅ | verl `c1a38530` |
 | M4 适配骨架 | ✅ | `kunserve_runner_adapter.py`,签名+契约,实现 `raise NotImplementedError` |
-| M1 探针 | ✅ | sglang `54370fef1`:`layer.py` 加 `[M1]` 逐段标(dispatch/expert/combine),env-gated,定位 hang |
-| **M1 端到端跑通** | 🔧 进行中 | **deepep GLOBAL 路径(4-rank a2a)从没 green 过**;下一步在 H20 上跑 NORMAL/eager/fp8,逐段 bisect(见 §7) |
-| M2 LL + CUDA graph | ⏳ | 未写;环境已验证可行 |
+| M1 探针 | ✅ | sglang `54370fef1`→`bf6e7f95a`:`layer.py` 加 `[M1]` 逐段标(dispatch/expert/combine),改为采样式覆盖全程 |
+| **M1 端到端跑通(NORMAL/eager/fp8)** | ✅ **正确性 green** 2026-06-10 | 跑见 `deepep_normal_fp8_20260610_145355`:rollout 完整跑完、temp=0 答案正确 → static remap + DeepEP dispatch/combine + deep_gemm 链路数值全对。**慢是预期**(全程 eager NORMAL,含 LOCAL,~8.8 tok/s);**末尾 idle-keepalive 崩溃见风险④,未污染答案** |
+| **M2 LL + CUDA graph** | 🔧 进行中 | 脚本 `verl/data/run_deepep_ll_graph_fp8_smoke.sh`(`SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0` + `KUNSERVE_DEEPEP_MODE=auto`)。目标:LOCAL 回 Standard+graph、GLOBAL 走 LL + 捕图,恢复速度。环境已验证 LL 可行;LL graph/keepalive 是未知点 |
 | M3 量收益 | ⏳ | — |
 | M4 bf16 | ⏳ | 仅骨架 |
 
-**一句话状态**:周边脚手架(M0/Precision/env/M4 骨架)都齐了,**真正的传输链路还没跑通**——一跑 `deepep` 执行的仍是 legacy `MaybeTboDeepEPDispatcher`(NORMAL),它从未端到端 green。M1 = 把它修通。
+**一句话状态**:**M1 正确性已 green**(DeepEP 跨实例链路首次端到端跑通、答案正确),但全程 eager NORMAL 极慢(~8.8 tok/s)。M2 切 LL + CUDA graph 是当前主线——既恢复速度、又是生产目标。
 
 **三条出发原则**
 
@@ -229,40 +229,39 @@ PYTHONPATH=$PWD python3 -m pytest sglang/test/kunserve/ -q   # 19 passed, 1 xfai
 
 ---
 
-## 7. 怎么在 H20 上跑 M1(当前下一步)
+## 7. 怎么在 H20 上跑(M1 已 green / M2 当前)
 
 `/workspace` 即 H20 盘,worktree 改动已在 H20 上。sglang 是 PEP660 editable 指向主 checkout,需临时重指到 worktree(只动 sglang,verl 留主 checkout 保住 NCCL forward)。
 
 ```bash
-# ① sglang 切到 worktree(带 M1 探针 + PrecisionPolicy)
+# 切到 worktree(带 M1 探针 + PrecisionPolicy);全容器生效,挑 codex 不起新 sglang 进程时做
 pip install -e /workspace/sglang-deepep/python
-python3 -c "import sglang,os; print('sglang =', os.path.dirname(sglang.__file__))"  # 期望 .../sglang-deepep/...
-#  ⚠️ 全容器生效,挑 codex 不起新 sglang 进程时做
-
-# ② 跑 deepep NORMAL/eager/fp8 端到端(挑 4 张空闲卡)
-CUDA_VISIBLE_DEVICES=2,3,4,7 N_GPUS_PER_NODE=4 \
-  bash /workspace/verl/data/run_deepep_normal_eager_fp8_smoke.sh
-
-# ③ 看探针定位卡在哪段(最后一条 [M1] 的 stage = 卡死/崩溃处)
-RUN=$(ls -dt /workspace/verl/outputs/deepep_normal_fp8_* | head -1)/kunserve
-grep -aE '\[M1\]' "$RUN/kunserve_sglang_detail.log" | tail -15
-grep -anE 'Traceback|Error|Assertion|illegal|NVSHMEM|deep_gemm' "$RUN/verl_training.log" | tail -20
-
-# ④ 测完还原
-pip install -e /workspace/sglang/python
+python3 -c "import sglang,os; print(os.path.dirname(sglang.__file__))"   # 应含 sglang-deepep
+# 测完还原:pip install -e /workspace/sglang/python
 ```
 
-**读探针**:每 GLOBAL forward 在 layer0 打 5 标 `dispatch.enter→dispatch.exit→expert.enter→expert.exit/combine.enter→combine.exit`。某 `.enter` 没对应 `.exit` = 卡在那段(dispatch=跨实例 a2a / expert=deep_gemm / combine)。直接 Traceback = 贴报错定位行。
+**M1(✅ 已 green,留作回归)** —— NORMAL/eager/fp8:
+```bash
+CUDA_VISIBLE_DEVICES=2,3,4,7 N_GPUS_PER_NODE=4 \
+  bash /workspace/verl/data/run_deepep_normal_eager_fp8_smoke.sh
+```
 
-**预期**:M1 第一次大概率会崩或挂(从没 green 过)——那正是要的信息。流程:跑 → 贴探针最后几条 + Traceback → 修那一段 → 再跑,逐段推进。
+**M2(🔧 当前)** —— LL + CUDA graph(改 `SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0` + `KUNSERVE_DEEPEP_MODE=auto`):
+```bash
+CUDA_VISIBLE_DEVICES=2,3,4,7 N_GPUS_PER_NODE=4 \
+  bash /workspace/verl/data/run_deepep_ll_graph_fp8_smoke.sh
+```
+
+**读探针**:每 GLOBAL forward 在 layer0 打 5 标 `dispatch.enter→dispatch.exit→expert.enter→expert.exit/combine.enter→combine.exit`(采样式,覆盖到结尾)。某 `.enter` 没对应 `.exit` = 卡在那段(dispatch=跨实例 a2a / expert=deep_gemm / combine)。直接 Traceback = 贴报错定位行。
+
+**M2 盯三点**:① 图有没有捕获(`GLOBAL cuda graph capture BEGIN/COMPLETE` vs `skip GLOBAL`);② 速度有没有回来(vs M1 ~8.8 tok/s);③ idle-keepalive 崩溃(风险④)会不会重演——采样探针这次能照到结尾。
 
 ---
 
 ## 8. 风险与未决
 
-1. M1 是"修没跑通的现有代码",未知点多(warmup/commit/LL handle/balloon static remap 任一段都可能有 bug)——靠 §7 探针二分。
-2. 数值:fp8 expert(deep_gemm)在 30B temp=0 历史无漂移,仍需重验。
-3. graph capture(M2):DeepEP LL 在 KunServe 自定义 capture 路径下 buffer 固定要确认(从未真正验证)。
-4. M4 L3 布局转换(grouped↔sorted)是 bf16 最大不确定性,单测要足。
-5. Phase E keepalive 在 LL 下要确认 idle replica 不 hang。
-6. 收益预期见 DR-1:4-rank 近稠密,别指望稀疏,主要靠 fp8 payload。
+1. 数值:fp8 expert(deep_gemm)在 30B temp=0 ✅ 已验(M1 答案正确);80B 另案。
+2. graph capture(M2):DeepEP LL 在 KunServe 自定义 capture 路径下 buffer 固定要确认(从未真正验证)。deepep 分支下 GLOBAL 图捕获唯一由 `SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0` 触发(`model_runner.py:2297`),`KUNSERVE_CAPTURE_POLICY` 不参与。
+3. M4 L3 布局转换(grouped↔sorted)是 bf16 最大不确定性,单测要足。
+4. ⚠️ **idle-keepalive 崩溃(M1 实测,M2 大概率重演)**:M1 run 末尾出现 `CUDA illegal memory access`(NCCL watchdog,PG=cross-replica GLOBAL),发生在**一个 replica 干完、另一个还在跑时,干完的那个空跑 GLOBAL keepalive forward**(`batch_size=0 input_tokens=0 global_num_tokens=[2] state=balloon variant=global`)。**未污染答案**(生成早完成)。这是 **Phase E idle-keepalive 不对称**问题,疑似 2026-05 LL deadlock(`ab_20260507_053135`)同源。M2 用 LL 更易撞上——新采样探针已能覆盖到结尾定位。
+5. 收益预期见 DR-1:4-rank 近稠密,别指望稀疏,主要靠 fp8 payload。
