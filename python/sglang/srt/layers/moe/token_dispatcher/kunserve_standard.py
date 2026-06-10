@@ -45,6 +45,7 @@ def _is_capture_mode() -> bool:
     return get_is_capture_mode()
 
 logger = logging.getLogger(__name__)
+_TRUE_VALUES = {"1", "true", "True", "yes", "on"}
 
 
 def _detail_scope(enabled: bool, event: str, **fields: Any):
@@ -159,6 +160,12 @@ def _group_name(group: Any) -> str:
 def _group_unique_name(group: Any) -> Optional[str]:
     value = getattr(group, "unique_name", None)
     return str(value) if value is not None else None
+
+
+def _probe_value(value: Any) -> str:
+    if isinstance(value, torch.Tensor):
+        return _tensor_meta(value)
+    return str(value).replace(" ", "_")
 
 
 class CrossReplicaStandardDispatcher(BaseDispatcher):
@@ -295,6 +302,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._probe_detail_log_path: Optional[str] = _os.environ.get(
             "KUNSERVE_DETAIL_LOG"
         )
+        self._global_forward_probe_enabled: bool = _os.environ.get(
+            "KUNSERVE_GLOBAL_FORWARD_PROBE", "0"
+        ) in _TRUE_VALUES
         self._dispatch_call_count: int = 0
         self._combine_call_count: int = 0
         self._static_dispatch_logged: bool = False
@@ -757,6 +767,30 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         except Exception:
             pass
 
+    def _runtime_probe_enabled(self) -> bool:
+        return bool(self._global_forward_probe_enabled and self._probe_detail_log_path)
+
+    def _runtime_probe_log(self, event: str, **fields: Any) -> None:
+        if not self._runtime_probe_enabled():
+            return
+        base = {
+            "event": event,
+            "forward_id": getattr(self, "_kunserve_current_forward_id", None),
+            "layer_id": getattr(self, "_kunserve_current_layer_id", None),
+            "mode": getattr(self, "_kunserve_current_forward_mode", None),
+            "batch_size": getattr(self, "_kunserve_current_batch_size", None),
+            "rank": int(self.global_rank),
+            "replica": int(self.replica_rank),
+            "lane": int(self.lane_rank),
+            "state": _capture_state_text(),
+            "path_static": int(self._use_static_path()),
+            "phase_f": int(self.phase_f_enabled),
+        }
+        base.update(fields)
+        self._probe_log("global_runtime " + " ".join(
+            f"{key}={_probe_value(value)}" for key, value in base.items()
+        ))
+
     @staticmethod
     def _stats(t: torch.Tensor) -> str:
         """Cheap numerical fingerprint for probe logs.  Includes mean/max/min,
@@ -806,10 +840,26 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "local_m": int(local_m),
             "phase_f": bool(self.phase_f_enabled),
         }
+        self._runtime_probe_log(
+            "dispatch_dynamic_enter",
+            call=call,
+            local_m=int(local_m),
+            hidden=hidden_states,
+            topk_ids=topk_output.topk_ids,
+            topk_weights=topk_output.topk_weights,
+            group=_group_name(self.group),
+            lane_group=_group_name(self.lane_group),
+        )
+        self._runtime_probe_log(
+            "dispatch_dynamic_gather_sizes_enter", call=call, local_m=int(local_m)
+        )
         with _detail_scope(
             detail_timing, "kunserve_dispatch_dynamic_gather_sizes", **timing_fields
         ):
             sizes = self._all_gather_sizes(local_m, hidden_states.device)
+        self._runtime_probe_log(
+            "dispatch_dynamic_gather_sizes_exit", call=call, sizes=sizes
+        )
         max_m = int(sizes.max().item()) if sizes.numel() > 0 else local_m
         timing_fields["max_m"] = int(max_m)
         log_dynamic = self._should_log_dynamic_path(local_m, call)
@@ -843,9 +893,60 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         with _detail_scope(
             detail_timing, "kunserve_dispatch_dynamic_all_gather", **timing_fields
         ):
-            gathered_hidden = self._all_gather_padded(padded_hidden)
-            gathered_topk_ids = self._all_gather_padded(padded_topk_ids)
-            gathered_topk_weights = self._all_gather_padded(padded_topk_weights)
+            with _detail_scope(
+                detail_timing,
+                "kunserve_dispatch_dynamic_all_gather_hidden",
+                **timing_fields,
+            ):
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_hidden_enter",
+                    call=call,
+                    input=padded_hidden,
+                    max_m=int(max_m),
+                )
+                gathered_hidden = self._all_gather_padded(padded_hidden)
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_hidden_exit",
+                    call=call,
+                    output_count=len(gathered_hidden),
+                    first=gathered_hidden[0] if gathered_hidden else None,
+                )
+            with _detail_scope(
+                detail_timing,
+                "kunserve_dispatch_dynamic_all_gather_topk_ids",
+                **timing_fields,
+            ):
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_topk_ids_enter",
+                    call=call,
+                    input=padded_topk_ids,
+                    max_m=int(max_m),
+                )
+                gathered_topk_ids = self._all_gather_padded(padded_topk_ids)
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_topk_ids_exit",
+                    call=call,
+                    output_count=len(gathered_topk_ids),
+                    first=gathered_topk_ids[0] if gathered_topk_ids else None,
+                )
+            with _detail_scope(
+                detail_timing,
+                "kunserve_dispatch_dynamic_all_gather_topk_weights",
+                **timing_fields,
+            ):
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_topk_weights_enter",
+                    call=call,
+                    input=padded_topk_weights,
+                    max_m=int(max_m),
+                )
+                gathered_topk_weights = self._all_gather_padded(padded_topk_weights)
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_topk_weights_exit",
+                    call=call,
+                    output_count=len(gathered_topk_weights),
+                    first=gathered_topk_weights[0] if gathered_topk_weights else None,
+                )
 
         with _detail_scope(
             detail_timing, "kunserve_dispatch_dynamic_lane_select", **timing_fields
@@ -868,9 +969,20 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 padded_router_logits = self._pad_dim0(
                     router_logits, max_m=max_m, pad_value=0
                 )
-                router_logits = self._select_lane_segments(
-                    self._all_gather_padded(padded_router_logits)
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_router_logits_enter",
+                    call=call,
+                    input=padded_router_logits,
+                    max_m=int(max_m),
                 )
+                gathered_router_logits = self._all_gather_padded(padded_router_logits)
+                self._runtime_probe_log(
+                    "dispatch_dynamic_all_gather_router_logits_exit",
+                    call=call,
+                    output_count=len(gathered_router_logits),
+                    first=gathered_router_logits[0] if gathered_router_logits else None,
+                )
+                router_logits = self._select_lane_segments(gathered_router_logits)
 
         self._last_local_m = local_m
         self._last_max_m = max_m
@@ -898,6 +1010,14 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             remapped_topk = self._remap_topk_ids(union_topk_ids)
 
         self._dispatch_call_count = call
+        self._runtime_probe_log(
+            "dispatch_dynamic_exit",
+            call=call,
+            local_m=int(local_m),
+            max_m=int(max_m),
+            union_hidden=union_hidden,
+            remapped_topk=remapped_topk,
+        )
         if log_dynamic:
             self._probe_log(
                 f"dynamic_dispatch_after_gather call={call} rank={self.global_rank} "
@@ -975,6 +1095,15 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "phase_f": bool(self.phase_f_enabled),
         }
         log_dynamic = self._should_log_dynamic_path(int(self._last_local_m), call)
+        self._runtime_probe_log(
+            "combine_dynamic_enter",
+            call=call,
+            last_local_m=int(self._last_local_m or 0),
+            last_max_m=int(self._last_max_m or 0),
+            input=hidden_states,
+            group=_group_name(self.group),
+            lane_group=_group_name(self.lane_group),
+        )
         if log_dynamic:
             self._probe_log(
                 f"dynamic_combine_enter call={call} rank={self.global_rank} "
@@ -1006,15 +1135,32 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 dtype=reduce_dtype,
                 device=hidden_states.device,
             )
+            self._runtime_probe_log(
+                "combine_dynamic_reduce_scatter_enter",
+                call=call,
+                input=hidden_for_reduce,
+                output=local_slice,
+                lane_group=_group_name(self.lane_group),
+            )
             with _detail_scope(
                 detail_timing, "kunserve_combine_dynamic_reduce_scatter", **timing_fields
             ):
                 _reduce_scatter_tensor(self.lane_group, local_slice, hidden_for_reduce)
+            self._runtime_probe_log(
+                "combine_dynamic_reduce_scatter_exit",
+                call=call,
+                output=local_slice,
+            )
             with _detail_scope(
                 detail_timing, "kunserve_combine_dynamic_slice", **timing_fields
             ):
                 result = local_slice[: int(self._last_local_m)].contiguous()
             self._combine_call_count = call
+            self._runtime_probe_log(
+                "combine_dynamic_exit",
+                call=call,
+                result=result,
+            )
             if log_dynamic:
                 self._probe_log(
                     f"dynamic_combine_after_reduce call={call} rank={self.global_rank} "
@@ -1046,14 +1192,26 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         # If Phase D needs to be re-enabled, fix by either (a) migrating
         # to lane groups, or (b) suppressing forward_normal's all_reduce
         # when GLOBAL bundle is active.
+        self._runtime_probe_log(
+            "combine_dynamic_all_reduce_enter",
+            call=call,
+            input=hidden_states,
+            group=_group_name(self.group),
+        )
         with _detail_scope(
             detail_timing, "kunserve_combine_dynamic_all_reduce", **timing_fields
         ):
             _all_reduce(self.group, hidden_states)
+        self._runtime_probe_log(
+            "combine_dynamic_all_reduce_exit", call=call, output=hidden_states
+        )
         start = int(self._last_slice_start)
         end = start + int(self._last_local_m)
         with _detail_scope(detail_timing, "kunserve_combine_dynamic_slice", **timing_fields):
-            return hidden_states[start:end].contiguous()
+            result = hidden_states[start:end].contiguous()
+        self._combine_call_count = call
+        self._runtime_probe_log("combine_dynamic_exit", call=call, result=result)
+        return result
 
     # ------------------------------------------------------------------
     # static (graph-safe) path - the actual Phase D contribution
@@ -1079,6 +1237,19 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "capacity_m": int(capacity_m),
             "phase_f": bool(self.phase_f_enabled),
         }
+        call = self._dispatch_call_count + 1
+        self._runtime_probe_log(
+            "dispatch_static_enter",
+            call=call,
+            local_m=int(local_m),
+            graph_bucket_m=int(M),
+            capacity_m=int(capacity_m),
+            hidden=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            group=_group_name(self.group),
+            lane_group=_group_name(self.lane_group),
+        )
         if M not in self._static_dispatch_m_logged:
             self._probe_log(
                 f"static_dispatch_enter rank={self.global_rank} replica={self.replica_rank} "
@@ -1181,6 +1352,15 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 f"gather_group={_group_name(gather_group)}"
             )
             self._dispatch_ncclgroup_logged = True
+        self._runtime_probe_log(
+            "dispatch_static_all_gather_enter",
+            call=call,
+            grouped=int(use_grouped),
+            graph_bucket_m=int(M),
+            padded_hidden=padded_hidden,
+            gathered_hidden=gathered_hidden,
+            gather_group=_group_name(gather_group),
+        )
         with _detail_scope(
             detail_timing, "kunserve_dispatch_static_all_gather", **timing_fields
         ):
@@ -1197,21 +1377,77 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     ]
                 )
             else:
-                _all_gather_into_tensor(
-                    gather_group,
-                    gathered_hidden,
-                    padded_hidden,
-                )
-                _all_gather_into_tensor(
-                    gather_group,
-                    gathered_topk_ids,
-                    padded_topk_ids,
-                )
-                _all_gather_into_tensor(
-                    gather_group,
-                    gathered_topk_weights,
-                    padded_topk_weights,
-                )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_dispatch_static_all_gather_hidden",
+                    **timing_fields,
+                ):
+                    self._runtime_probe_log(
+                        "dispatch_static_all_gather_hidden_enter",
+                        call=call,
+                        input=padded_hidden,
+                        output=gathered_hidden,
+                    )
+                    _all_gather_into_tensor(
+                        gather_group,
+                        gathered_hidden,
+                        padded_hidden,
+                    )
+                    self._runtime_probe_log(
+                        "dispatch_static_all_gather_hidden_exit",
+                        call=call,
+                        output=gathered_hidden,
+                    )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_dispatch_static_all_gather_topk_ids",
+                    **timing_fields,
+                ):
+                    self._runtime_probe_log(
+                        "dispatch_static_all_gather_topk_ids_enter",
+                        call=call,
+                        input=padded_topk_ids,
+                        output=gathered_topk_ids,
+                    )
+                    _all_gather_into_tensor(
+                        gather_group,
+                        gathered_topk_ids,
+                        padded_topk_ids,
+                    )
+                    self._runtime_probe_log(
+                        "dispatch_static_all_gather_topk_ids_exit",
+                        call=call,
+                        output=gathered_topk_ids,
+                    )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_dispatch_static_all_gather_topk_weights",
+                    **timing_fields,
+                ):
+                    self._runtime_probe_log(
+                        "dispatch_static_all_gather_topk_weights_enter",
+                        call=call,
+                        input=padded_topk_weights,
+                        output=gathered_topk_weights,
+                    )
+                    _all_gather_into_tensor(
+                        gather_group,
+                        gathered_topk_weights,
+                        padded_topk_weights,
+                    )
+                    self._runtime_probe_log(
+                        "dispatch_static_all_gather_topk_weights_exit",
+                        call=call,
+                        output=gathered_topk_weights,
+                    )
+        self._runtime_probe_log(
+            "dispatch_static_all_gather_exit",
+            call=call,
+            grouped=int(use_grouped),
+            gathered_hidden=gathered_hidden,
+            gathered_topk_ids=gathered_topk_ids,
+            gathered_topk_weights=gathered_topk_weights,
+        )
 
         # 3) Lane select.  Skipped in Phase F because the lane-subgroup
         #    gather already produced the union directly into
@@ -1286,6 +1522,14 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 "CrossReplicaStandardDispatcher static mapping has wrong length: "
                 f"{int(mapping.numel())} vs num_experts={self.num_experts}."
             )
+        self._runtime_probe_log(
+            "dispatch_static_remap_enter",
+            call=call,
+            union_ids=union_ids,
+            mapping=mapping,
+            output=union_topk_ids_remapped,
+            fused=int(self._remap_fused_enabled),
+        )
         with _detail_scope(detail_timing, "kunserve_dispatch_static_remap", **timing_fields):
             if self._remap_fused_enabled:
                 if not self._remap_fused_logged:
@@ -1314,9 +1558,24 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     torch.where(valid, looked, self._neg_one_int32)
                 )
 
+        self._runtime_probe_log(
+            "dispatch_static_remap_exit",
+            call=call,
+            remapped=union_topk_ids_remapped,
+        )
+
         self._last_local_m = local_m
         self._last_max_m = M
         self._last_slice_start = self.replica_rank * M
+        self._dispatch_call_count = call
+        self._runtime_probe_log(
+            "dispatch_static_exit",
+            call=call,
+            local_m=int(local_m),
+            graph_bucket_m=int(M),
+            union_hidden=union_hidden,
+            remapped_topk=union_topk_ids_remapped,
+        )
 
         return StandardDispatchOutput(
             hidden_states=union_hidden,
@@ -1346,6 +1605,16 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "max_m": int(self._last_max_m or 0),
             "phase_f": bool(self.phase_f_enabled),
         }
+        call = self._combine_call_count + 1
+        self._runtime_probe_log(
+            "combine_static_enter",
+            call=call,
+            last_local_m=int(self._last_local_m or 0),
+            last_max_m=int(self._last_max_m or 0),
+            input=hidden_states,
+            group=_group_name(self.group),
+            lane_group=_group_name(self.lane_group),
+        )
 
         if not self._static_combine_logged:
             self._probe_log(
@@ -1459,6 +1728,14 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                             "KunServe static TP all-reduce fusion requires the "
                             "SGLang TP GroupCoordinator, not a raw ProcessGroup."
                         )
+                    self._runtime_probe_log(
+                        "combine_static_lane_reduce_scatter_tp_all_reduce_enter",
+                        call=call,
+                        input=hidden_states,
+                        output=local_slice,
+                        lane_group=lane_group_name,
+                        tp_group=tp_group_name,
+                    )
                     with _detail_scope(
                         detail_timing,
                         "kunserve_combine_static_lane_reduce_scatter_tp_all_reduce",
@@ -1471,6 +1748,11 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                                 lane_group_name,
                                 tp_group_name,
                             )
+                    self._runtime_probe_log(
+                        "combine_static_lane_reduce_scatter_tp_all_reduce_exit",
+                        call=call,
+                        output=local_slice,
+                    )
                     with _detail_scope(
                         detail_timing, "kunserve_combine_static_slice", **timing_fields
                     ):
@@ -1479,8 +1761,19 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                         result._kunserve_tp_allreduce_done = True
                     except Exception:
                         pass
+                    self._combine_call_count = call
+                    self._runtime_probe_log(
+                        "combine_static_exit", call=call, result=result
+                    )
                     return result
 
+                self._runtime_probe_log(
+                    "combine_static_lane_reduce_scatter_enter",
+                    call=call,
+                    input=hidden_states,
+                    output=local_slice,
+                    lane_group=_group_name(self.lane_group),
+                )
                 with _detail_scope(
                     detail_timing,
                     "kunserve_combine_static_lane_reduce_scatter",
@@ -1490,24 +1783,44 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                         _reduce_scatter_tensor(
                             self.lane_group, local_slice, hidden_states
                         )
+                self._runtime_probe_log(
+                    "combine_static_lane_reduce_scatter_exit",
+                    call=call,
+                    output=local_slice,
+                )
                 with _detail_scope(
                     detail_timing, "kunserve_combine_static_slice", **timing_fields
                 ):
-                    return local_slice[: int(self._last_local_m)].contiguous()
+                    result = local_slice[: int(self._last_local_m)].contiguous()
+                self._combine_call_count = call
+                self._runtime_probe_log("combine_static_exit", call=call, result=result)
+                return result
 
             self._require_static_graph_collective_group(self.lane_group, "all_reduce")
+            self._runtime_probe_log(
+                "combine_static_lane_all_reduce_enter",
+                call=call,
+                input=hidden_states,
+                lane_group=_group_name(self.lane_group),
+            )
             with _detail_scope(
                 detail_timing,
                 "kunserve_combine_static_lane_all_reduce",
                 **timing_fields,
             ):
                 _all_reduce(self.lane_group, hidden_states)
+            self._runtime_probe_log(
+                "combine_static_lane_all_reduce_exit", call=call, output=hidden_states
+            )
             start = int(self.replica_rank) * M
             end = start + int(self._last_local_m)
             with _detail_scope(
                 detail_timing, "kunserve_combine_static_slice", **timing_fields
             ):
-                return hidden_states[start:end].contiguous()
+                result = hidden_states[start:end].contiguous()
+            self._combine_call_count = call
+            self._runtime_probe_log("combine_static_exit", call=call, result=result)
+            return result
 
         # Phase D fallback: global all_reduce + slice.  Each (variant,
         # bs) graph allocates its own partial-output tensor in the
@@ -1515,16 +1828,28 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         # address per graph.
         # WARNING: same double-TP-all_reduce hazard as _combine_dynamic
         # Phase D; see note there.  Not triggered when Phase F is active.
+        self._runtime_probe_log(
+            "combine_static_global_all_reduce_enter",
+            call=call,
+            input=hidden_states,
+            group=_group_name(self.group),
+        )
         with _detail_scope(
             detail_timing, "kunserve_combine_static_global_all_reduce", **timing_fields
         ):
             self._require_static_graph_collective_group(self.group, "all_reduce")
             _all_reduce(self.group, hidden_states)
+        self._runtime_probe_log(
+            "combine_static_global_all_reduce_exit", call=call, output=hidden_states
+        )
 
         start = self.replica_rank * int(self._last_max_m)
         end = start + int(self._last_local_m)
         with _detail_scope(detail_timing, "kunserve_combine_static_slice", **timing_fields):
-            return hidden_states[start:end].contiguous()
+            result = hidden_states[start:end].contiguous()
+        self._combine_call_count = call
+        self._runtime_probe_log("combine_static_exit", call=call, result=result)
+        return result
 
     # ------------------------------------------------------------------
     # Phase B.2 helpers: chunked combine with overlap

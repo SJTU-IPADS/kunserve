@@ -1373,6 +1373,19 @@ class FusedMoE(torch.nn.Module):
             "moe_tp_size": int(self.moe_tp_size),
             "moe_ep_size": int(self.moe_ep_size),
         }
+        try:
+            self.dispatcher._kunserve_current_layer_id = int(self.layer_id)
+        except Exception:
+            pass
+        probe_log = getattr(self.dispatcher, "_runtime_probe_log", None)
+        if callable(probe_log):
+            probe_log(
+                "fused_moe_forward_enter",
+                input=hidden_states,
+                topk_ids=getattr(topk_output, "topk_ids", None),
+                topk_weights=getattr(topk_output, "topk_weights", None),
+            )
+            probe_log("fused_moe_dispatch_enter", input=hidden_states)
 
         if detail_timing:
             with kunserve_timing_scope("fused_moe_dispatch", **timing_fields):
@@ -1382,6 +1395,11 @@ class FusedMoE(torch.nn.Module):
         else:
             dispatch_output = self.dispatcher.dispatch(
                 hidden_states=hidden_states, topk_output=topk_output
+            )
+        if callable(probe_log):
+            probe_log(
+                "fused_moe_dispatch_exit",
+                output=getattr(dispatch_output, "hidden_states", None),
             )
         local_expert_mapping = getattr(
             self.dispatcher, "local_expert_mapping", self.active_local_expert_mapping
@@ -1440,6 +1458,11 @@ class FusedMoE(torch.nn.Module):
                     ..., :origin_hidden_states_dim
                 ].contiguous()
         else:
+            if callable(probe_log):
+                probe_log(
+                    "fused_moe_core_enter",
+                    input=getattr(dispatch_output, "hidden_states", None),
+                )
             if detail_timing:
                 with kunserve_timing_scope("fused_moe_core", **timing_fields):
                     combine_input = self.run_moe_core(
@@ -1449,10 +1472,18 @@ class FusedMoE(torch.nn.Module):
                 combine_input = self.run_moe_core(
                     dispatch_output=dispatch_output,
                 )
+            if callable(probe_log):
+                try:
+                    core_output = combine_input[0]
+                except Exception:
+                    core_output = None
+                probe_log("fused_moe_core_exit", output=core_output)
 
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
+                if callable(probe_log):
+                    probe_log("fused_moe_combine_enter")
                 if detail_timing:
                     with kunserve_timing_scope("fused_moe_combine", **timing_fields):
                         final_hidden_states = self.dispatcher.combine(
@@ -1462,6 +1493,8 @@ class FusedMoE(torch.nn.Module):
                     final_hidden_states = self.dispatcher.combine(
                         combine_input=combine_input
                     )
+                if callable(probe_log):
+                    probe_log("fused_moe_combine_exit", output=final_hidden_states)
 
                 kunserve_tp_allreduce_done = bool(
                     getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
@@ -1480,6 +1513,8 @@ class FusedMoE(torch.nn.Module):
             and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
             and not kunserve_tp_allreduce_done
         ):
+            if callable(probe_log):
+                probe_log("fused_moe_all_reduce_enter", input=final_hidden_states)
             if detail_timing:
                 with kunserve_timing_scope("fused_moe_all_reduce", **timing_fields):
                     final_hidden_states = tensor_model_parallel_all_reduce(
@@ -1487,7 +1522,11 @@ class FusedMoE(torch.nn.Module):
                     )
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if callable(probe_log):
+                probe_log("fused_moe_all_reduce_exit", output=final_hidden_states)
 
+        if callable(probe_log):
+            probe_log("fused_moe_forward_exit", output=final_hidden_states)
         return final_hidden_states
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:

@@ -254,6 +254,11 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+_KUNSERVE_TRUE_VALUES = {"1", "true", "True", "yes", "on"}
+
+
+def _kunserve_global_forward_probe_enabled() -> bool:
+    return os.environ.get("KUNSERVE_GLOBAL_FORWARD_PROBE", "0") in _KUNSERVE_TRUE_VALUES
 
 
 def _kunserve_ms(message: str, *args) -> None:
@@ -882,6 +887,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if isinstance(module, FusedMoE)
             ]
         return self._balloon_fused_moe_layers
+
+    def _kunserve_set_forward_probe_context(
+        self, forward_batch: ForwardBatch, forward_select_count: int
+    ) -> None:
+        if not _kunserve_global_forward_probe_enabled():
+            return
+        try:
+            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+        except Exception:
+            batch_size = -1
+        mode = str(getattr(forward_batch, "forward_mode", "unknown"))
+        for layer in self._iter_fused_moe_layers():
+            dispatcher = getattr(layer, "dispatcher", None)
+            if dispatcher is None:
+                continue
+            try:
+                dispatcher._kunserve_current_forward_id = int(forward_select_count)
+                dispatcher._kunserve_current_forward_pass_id = int(self.forward_pass_id)
+                dispatcher._kunserve_current_forward_mode = mode
+                dispatcher._kunserve_current_batch_size = batch_size
+            except Exception:
+                pass
 
     def _normalize_balloon_variant(self, variant: Union[str, object]) -> str:
         variant_value = getattr(variant, "value", variant)
@@ -5597,9 +5624,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             }
         )
         kunserve_timing_log("model_runner_forward_select", **forward_timing_fields)
+        forward_select_count = int(
+            getattr(self, "_kunserve_forward_select_log_count", 0)
+        )
         if balloon_state != "local" or runtime_variant == "global":
-            log_count = int(getattr(self, "_kunserve_forward_select_log_count", 0)) + 1
+            log_count = forward_select_count + 1
             self._kunserve_forward_select_log_count = log_count
+            forward_select_count = log_count
             should_log = (
                 log_count <= 8
                 or not can_run_graph
@@ -5648,12 +5679,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     captured_variants,
                 )
 
+        probe_this_forward = (
+            _kunserve_global_forward_probe_enabled()
+            and (balloon_state != "local" or runtime_variant == "global")
+        )
+        if probe_this_forward:
+            self._kunserve_set_forward_probe_context(
+                forward_batch, int(forward_select_count)
+            )
+
         if can_run_graph:
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_forward_graph_replay_enter "
+                    "count=%d forward_pass_id=%d state=%s variant=%s mode=%s "
+                    "batch_size=%s input_tokens=%s",
+                    int(forward_select_count),
+                    int(self.forward_pass_id),
+                    balloon_state,
+                    runtime_variant,
+                    forward_batch.forward_mode,
+                    getattr(forward_batch, "batch_size", None),
+                    input_tokens_for_timing,
+                )
             with kunserve_timing_scope("model_runner_graph_replay", **forward_timing_fields):
                 ret = self.graph_runner.replay(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
+                )
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_forward_graph_replay_exit "
+                    "count=%d forward_pass_id=%d",
+                    int(forward_select_count),
+                    int(self.forward_pass_id),
                 )
             return ModelRunnerOutput(
                 logits_output=ret,
@@ -5663,12 +5723,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+        if probe_this_forward:
+            _kunserve_ms(
+                "[KUNSERVE-DBG] model_forward_eager_enter "
+                "count=%d forward_pass_id=%d state=%s variant=%s mode=%s "
+                "batch_size=%s input_tokens=%s",
+                int(forward_select_count),
+                int(self.forward_pass_id),
+                balloon_state,
+                runtime_variant,
+                forward_batch.forward_mode,
+                getattr(forward_batch, "batch_size", None),
+                input_tokens_for_timing,
+            )
+
         # For MLP sync
+        if probe_this_forward:
+            _kunserve_ms(
+                "[KUNSERVE-DBG] model_forward_prepare_sync_enter count=%d "
+                "global_num_tokens=%s",
+                int(forward_select_count),
+                getattr(forward_batch, "global_num_tokens_cpu", None),
+            )
         with kunserve_timing_scope("model_runner_prepare_sync", **forward_timing_fields):
             if forward_batch.global_num_tokens_cpu is not None:
                 forward_batch.prepare_mlp_sync_batch(self)
             else:
                 forward_batch.prepare_attn_tp_scatter_input(self)
+        if probe_this_forward:
+            _kunserve_ms(
+                "[KUNSERVE-DBG] model_forward_prepare_sync_exit count=%d",
+                int(forward_select_count),
+            )
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
@@ -5682,29 +5768,69 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if forward_batch.forward_mode.is_decode():
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_decode_enter count=%d",
+                    int(forward_select_count),
+                )
             with kunserve_timing_scope("model_runner_forward_decode", **forward_timing_fields):
                 ret = self.forward_decode(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_decode_exit count=%d",
+                    int(forward_select_count),
+                )
         elif forward_batch.forward_mode.is_split_prefill():
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_split_prefill_enter count=%d",
+                    int(forward_select_count),
+                )
             with kunserve_timing_scope("model_runner_forward_split_prefill", **forward_timing_fields):
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
                     forward_count=split_forward_count,
                 )
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_split_prefill_exit count=%d",
+                    int(forward_select_count),
+                )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_extend_enter count=%d",
+                    int(forward_select_count),
+                )
             with kunserve_timing_scope("model_runner_forward_extend", **forward_timing_fields):
                 ret, can_run_graph = self.forward_extend(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_extend_exit count=%d",
+                    int(forward_select_count),
+                )
         elif forward_batch.forward_mode.is_idle():
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_idle_enter count=%d",
+                    int(forward_select_count),
+                )
             with kunserve_timing_scope("model_runner_forward_idle", **forward_timing_fields):
                 ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_forward_idle_exit count=%d",
+                    int(forward_select_count),
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
@@ -5712,9 +5838,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.global_num_tokens_cpu is not None
             and self.pp_group.is_last_rank
         ):
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_post_mlp_sync_enter count=%d",
+                    int(forward_select_count),
+                )
             with kunserve_timing_scope("model_runner_post_mlp_sync", **forward_timing_fields):
                 forward_batch.post_forward_mlp_sync_batch(ret)
+            if probe_this_forward:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] model_runner_post_mlp_sync_exit count=%d",
+                    int(forward_select_count),
+                )
 
+        if probe_this_forward:
+            _kunserve_ms(
+                "[KUNSERVE-DBG] model_forward_eager_exit count=%d forward_pass_id=%d",
+                int(forward_select_count),
+                int(self.forward_pass_id),
+            )
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
