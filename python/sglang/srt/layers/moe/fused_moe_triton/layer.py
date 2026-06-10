@@ -128,37 +128,41 @@ def _kunserve_runtime_log(message: str, *args) -> None:
 # by verl) + a hard global cap, so it needs no new env plumbing and cannot
 # flood a long run. Fully try/except-guarded — it can never raise into the
 # hot forward path. M1-only diagnostic; remove or raise the cap once green.
-_KUN_M1_MAX_LOGS = 6000
-_kun_m1_count = 0
+# Sample by FORWARD (not by stage), with NO hard stop, so the whole run stays
+# covered — including the idle-replica keepalive / teardown tail where the
+# DeepEP GLOBAL path tends to crash (e.g. the 2026-06-10 M1 run died in an idle
+# keepalive forward at the very end, long after a fixed cap would have stopped).
+_KUN_M1_DENSE = 400      # first N GLOBAL forwards: log every one (startup/commit)
+_KUN_M1_SAMPLE = 100     # after that: log 1 in N (steady state + tail)
+_kun_m1_fwd = 0
 
 
 def _kun_m1_enabled(layer) -> bool:
-    if _kun_m1_count >= _KUN_M1_MAX_LOGS:
-        return False
+    global _kun_m1_fwd
     if not os.environ.get("KUNSERVE_DETAIL_LOG"):
         return False
     try:
-        return int(getattr(layer, "layer_id", -1)) == 0 and (
+        is_global = int(getattr(layer, "layer_id", -1)) == 0 and (
             "global" in str(getattr(layer, "runtime_variant", "")).lower()
         )
     except Exception:
         return False
+    if not is_global:
+        return False
+    _kun_m1_fwd += 1
+    return _kun_m1_fwd <= _KUN_M1_DENSE or (_kun_m1_fwd % _KUN_M1_SAMPLE == 0)
 
 
 def _kun_m1_log(layer, stage: str) -> None:
-    global _kun_m1_count
-    if _kun_m1_count >= _KUN_M1_MAX_LOGS:
-        return
-    _kun_m1_count += 1
     try:
         disp = type(getattr(layer, "dispatcher", None)).__name__
     except Exception:
         disp = "?"
     _kunserve_runtime_log(
-        "[M1] layer0 variant=global dispatcher=%s stage=%s n=%d",
+        "[M1] layer0 variant=global dispatcher=%s stage=%s fwd=%d",
         disp,
         stage,
-        _kun_m1_count,
+        _kun_m1_fwd,
     )
 
 
