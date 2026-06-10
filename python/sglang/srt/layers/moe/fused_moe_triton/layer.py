@@ -117,6 +117,51 @@ def _kunserve_runtime_log(message: str, *args) -> None:
         pass
 
 
+# --- M1 (DeepEP GLOBAL) per-stage bisection probe -------------------------
+# The DeepEP GLOBAL cross-replica path has never run green end-to-end; the
+# known failure mode is a *silent hang* a few hundred decode steps in (no
+# Python/NCCL exception). These marks bracket the three forward stages
+# (dispatch / expert / combine) for layer 0 of the GLOBAL bundle so a hang
+# localizes to whichever ".enter" has no matching ".exit".
+#
+# Gated on KUNSERVE_DETAIL_LOG (already forwarded to the scheduler subprocess
+# by verl) + a hard global cap, so it needs no new env plumbing and cannot
+# flood a long run. Fully try/except-guarded — it can never raise into the
+# hot forward path. M1-only diagnostic; remove or raise the cap once green.
+_KUN_M1_MAX_LOGS = 6000
+_kun_m1_count = 0
+
+
+def _kun_m1_enabled(layer) -> bool:
+    if _kun_m1_count >= _KUN_M1_MAX_LOGS:
+        return False
+    if not os.environ.get("KUNSERVE_DETAIL_LOG"):
+        return False
+    try:
+        return int(getattr(layer, "layer_id", -1)) == 0 and (
+            "global" in str(getattr(layer, "runtime_variant", "")).lower()
+        )
+    except Exception:
+        return False
+
+
+def _kun_m1_log(layer, stage: str) -> None:
+    global _kun_m1_count
+    if _kun_m1_count >= _KUN_M1_MAX_LOGS:
+        return
+    _kun_m1_count += 1
+    try:
+        disp = type(getattr(layer, "dispatcher", None)).__name__
+    except Exception:
+        disp = "?"
+    _kunserve_runtime_log(
+        "[M1] layer0 variant=global dispatcher=%s stage=%s n=%d",
+        disp,
+        stage,
+        _kun_m1_count,
+    )
+
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     *,
@@ -1374,6 +1419,9 @@ class FusedMoE(torch.nn.Module):
             "moe_ep_size": int(self.moe_ep_size),
         }
 
+        _m1 = _kun_m1_enabled(self)
+        if _m1:
+            _kun_m1_log(self, "dispatch.enter bs=%d" % int(hidden_states.shape[0]))
         if detail_timing:
             with kunserve_timing_scope("fused_moe_dispatch", **timing_fields):
                 dispatch_output = self.dispatcher.dispatch(
@@ -1383,6 +1431,8 @@ class FusedMoE(torch.nn.Module):
             dispatch_output = self.dispatcher.dispatch(
                 hidden_states=hidden_states, topk_output=topk_output
             )
+        if _m1:
+            _kun_m1_log(self, "dispatch.exit")
         local_expert_mapping = getattr(
             self.dispatcher, "local_expert_mapping", self.active_local_expert_mapping
         )
@@ -1440,6 +1490,8 @@ class FusedMoE(torch.nn.Module):
                     ..., :origin_hidden_states_dim
                 ].contiguous()
         else:
+            if _m1:
+                _kun_m1_log(self, "expert.enter")
             if detail_timing:
                 with kunserve_timing_scope("fused_moe_core", **timing_fields):
                     combine_input = self.run_moe_core(
@@ -1449,6 +1501,8 @@ class FusedMoE(torch.nn.Module):
                 combine_input = self.run_moe_core(
                     dispatch_output=dispatch_output,
                 )
+            if _m1:
+                _kun_m1_log(self, "expert.exit / combine.enter")
 
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1462,6 +1516,8 @@ class FusedMoE(torch.nn.Module):
                     final_hidden_states = self.dispatcher.combine(
                         combine_input=combine_input
                     )
+                if _m1:
+                    _kun_m1_log(self, "combine.exit")
 
                 kunserve_tp_allreduce_done = bool(
                     getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
