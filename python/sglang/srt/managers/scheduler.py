@@ -156,6 +156,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.kunserve_forward_timing import (
     kunserve_scheduler_gap_timing_enabled,
     kunserve_timing_log,
+    kunserve_timing_scope,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -4510,14 +4511,24 @@ class Scheduler(
         graph buckets can be invalidated symmetrically on all ranks.
         """
         stage_ns = time.perf_counter_ns()
-        max_bs, min_bs, any_force_eager, state_fingerprint, raw_max_bs, raw_min_bs = (
-            self.tp_worker.model_runner.negotiate_balloon_step_state(
-                int(local_bs),
-                bool(local_force_eager),
-                local_padded_bs=local_padded_bs,
-                local_state_signature=local_state_signature,
-            )
+        local_padded_for_timing = (
+            int(local_padded_bs) if local_padded_bs is not None else int(local_bs)
         )
+        with kunserve_timing_scope(
+            "phase_e_negotiate",
+            loop="phase_e",
+            local_bs=int(local_bs),
+            local_padded_bs=int(local_padded_for_timing),
+            local_force_eager=bool(local_force_eager),
+        ):
+            max_bs, min_bs, any_force_eager, state_fingerprint, raw_max_bs, raw_min_bs = (
+                self.tp_worker.model_runner.negotiate_balloon_step_state(
+                    int(local_bs),
+                    bool(local_force_eager),
+                    local_padded_bs=local_padded_bs,
+                    local_state_signature=local_state_signature,
+                )
+            )
         self._kunserve_scheduler_gap_log(
             "scheduler_gap_phase_e_negotiate_end",
             stage_ns,
