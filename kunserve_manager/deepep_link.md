@@ -21,7 +21,7 @@
 | M4 适配骨架 | ✅ | `kunserve_runner_adapter.py`,签名+契约,实现 `raise NotImplementedError` |
 | M1 探针 | ✅ | sglang `54370fef1`→`bf6e7f95a`:`layer.py` 加 `[M1]` 逐段标(dispatch/expert/combine),改为采样式覆盖全程 |
 | **M1 端到端跑通(NORMAL/eager/fp8)** | ✅ **正确性 green** 2026-06-10 | 跑见 `deepep_normal_fp8_20260610_145355`:rollout 完整跑完、temp=0 答案正确 → static remap + DeepEP dispatch/combine + deep_gemm 链路数值全对。**慢是预期**(全程 eager NORMAL,含 LOCAL,~8.8 tok/s);**末尾 idle-keepalive 崩溃见风险④,未污染答案** |
-| **M2 LL + CUDA graph** | 🔧 进行中 | 脚本 `verl/data/run_deepep_ll_graph_fp8_smoke.sh`(`SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0` + `KUNSERVE_DEEPEP_MODE=auto`)。目标:LOCAL 回 Standard+graph、GLOBAL 走 LL + 捕图,恢复速度。环境已验证 LL 可行;LL graph/keepalive 是未知点 |
+| **M2 LL + CUDA graph** | 🔧 进行中 | 脚本 `run_deepep_ll_graph_fp8_smoke.sh`。**已闯过两道坑**:① MNNVL 误判(`NVSHMEM_DISABLE_MNNVL=1`);② **mode 分叉 crash 已修**(见 DR-7)。**当前卡点**:第一个 LL `low_latency_dispatch`(decode fwd=2)四 rank 都进 dispatch、无一 exit → 死锁。疑似**跨实例 LL dispatch 需要 IBGDA**(buffer 创建走 P2P 回退 OK,但 dispatch 的 RDMA put/get 在 P2P 上死锁)。用 `repro_deepep_ll_2replica_buffer.sh`(TEST_DISPATCH)确证 → 若需 IBGDA 则 host `modprobe nvidia_peermem` |
 | M3 量收益 | ⏳ | — |
 | M4 bf16 | ⏳ | 仅骨架 |
 
@@ -91,6 +91,13 @@ BALLOON 后 physical expert layout 变成两 replica 互补;router 输出 logica
 
 ### DR-5 为什么 GLOBAL 用 DeepEP 而非 StandardDispatcher
 Standard 假设所有 EP rank 一开始就有同一 batch hidden;但跨 replica 时 peer 没有你的 request hidden/KV/scheduler 状态。DeepEP 只把 MoE 所需 hidden dispatch 到 expert owner,算完 combine 回来——正好契合。
+
+### DR-7 跨实例 DeepEP mode 必须协商一致(per-forward is_extend negotiate) — 2026-06-11
+`deepep_mode=auto` 按各 replica 自己的 batch 解析 NORMAL(prefill)/LL(decode)。两 replica 独立调度,同一个跨实例 collective 上可能一个 NORMAL 一个 LL → 共享的 4-rank `runtime.sync`/dispatch 参数不一致 → `deep_ep.cpp:200 'invalid argument'` 崩。
+- **修法**:`model_runner._negotiate_balloon_deepep_is_extend`——每个 GLOBAL forward all-gather 4 rank 的 `is_extend` 取 OR,`set_is_extend_in_batch(any_extend)`;任一 replica 有 extend → 全员 NORMAL,否则全员 LL。恢复"单实例内所有 EP rank 共享一个 is_extend"的不变量到跨实例。
+- **关键时序**:必须放在 `prepare_mlp_sync_batch`(forward_batch_info.py:796 会 `set_is_extend_in_batch(本地值)`)**之后**、`model.forward` 之前,否则被本地值冲掉(实测过:放 `_forward_raw` 开头无效)。
+- **开销可忽略**:1-int all-gather/forward,淹没在每 forward ~100 个 EP collective 里;不新增同步点(跨实例 EP 本就 lockstep)。"跨实例全局变量"省不掉这次交换。
+- commit `ec86399d2`(协商)+ `be2501016`(挪到正确时序)。✅ 实测四 rank mode 一致、NORMAL/LL 两 buffer 都一致建成、不再崩。
 
 ### DR-6 为什么不合并实例
 live merge 要迁移 req_to_token / KV / radix tree / scheduler queue / sampling / HTTP stream / graph / PG。本方案请求与 KV 永不迁移,只跨 replica 发 MoE hidden states。
