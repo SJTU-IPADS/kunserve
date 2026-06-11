@@ -5435,11 +5435,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Phase E (DeepEP): negotiate is_extend across replicas BEFORE any MoE
-        # collective so both replicas resolve the same DeepEP mode (NORMAL vs
-        # LOW_LATENCY) and the shared 4-rank buffer/dispatch collectives match.
-        # Eager + once per GLOBAL forward; no-op unless balloon+deepep.
-        self._negotiate_balloon_deepep_is_extend(forward_batch)
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -5554,6 +5549,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.prepare_mlp_sync_batch(self)
             else:
                 forward_batch.prepare_attn_tp_scatter_input(self)
+
+        # Phase E (DeepEP): negotiate is_extend across replicas. MUST run AFTER
+        # prepare_mlp_sync_batch -- that calls set_is_extend_in_batch(local) which
+        # would otherwise clobber the negotiated value back to this replica's own
+        # prefill/decode state (the M2 crash: replica0 set False by negotiate but
+        # re-set True here -> NORMAL while replica1 stayed LL -> mismatched sync).
+        # Placed before model.forward (the MoE dispatch) so _get_impl sees the
+        # negotiated value. No-op unless balloon+deepep.
+        self._negotiate_balloon_deepep_is_extend(forward_batch)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
