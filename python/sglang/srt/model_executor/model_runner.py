@@ -1055,13 +1055,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             ct = int(getattr(self, "_deepep_extend_neg_ct", 0)) + 1
             self._deepep_extend_neg_ct = ct
-            # Log the first few + every step where the negotiated value differs
-            # from the local one (the cross-replica-prefill case we are fixing).
-            if ct <= 8 or any_extend != local_extend:
+            # Log the first 30 + every NORMAL-resolving step (any_extend=True,
+            # the cross-replica-prefill case) so we see every mode flip.
+            if ct <= 30 or any_extend:
                 _kunserve_ms(
-                    "[KUNSERVE-DBG] deepep is_extend negotiate ct=%d local=%s "
-                    "negotiated=%s -> mode=%s",
+                    "[KUNSERVE-DBG] deepep is_extend negotiate ct=%d fwd_id=%s "
+                    "local=%s negotiated=%s -> mode=%s",
                     ct,
+                    int(getattr(self, "forward_pass_id", -1)),
                     local_extend,
                     any_extend,
                     "NORMAL" if any_extend else "LOW_LATENCY",

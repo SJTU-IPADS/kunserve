@@ -289,10 +289,19 @@ class DeepEPBuffer:
                     _bk = _d.get_backend(group)
                 except Exception:
                     _bk = "?"
+                try:
+                    from sglang.srt.layers.dp_attention import (
+                        get_is_extend_in_batch as _gie,
+                    )
+                    _isext = _gie()
+                except Exception:
+                    _isext = "?"
                 with open(_p, "a", encoding="utf-8") as _f:
                     _f.write(
                         f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
-                        f"[M1-BUF] pre-Buffer ll={resolved_deepep_mode.enable_low_latency()} "
+                        f"[M1-BUF] pre-Buffer is_extend={_isext} "
+                        f"resolved_dispatch_mode={resolved_dispatch_mode} "
+                        f"ll={resolved_deepep_mode.enable_low_latency()} "
                         f"nvl={num_nvl_bytes} rdma={num_rdma_bytes} qps={num_qps_per_rank} "
                         f"grp_size={group.size()} grp_rank={group.rank()} ranks={_ranks} "
                         f"backend={_bk} cur_dev={torch.cuda.current_device()} "
