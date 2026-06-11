@@ -311,6 +311,11 @@ class DeepEPBuffer:
         except Exception:
             pass
 
+        # How many DeepEP buffers already exist on THIS group? If a NORMAL buffer
+        # was created earlier (fwd=1) and we are now creating the LL buffer
+        # (fwd=2), this is the 2nd NVSHMEM-using buffer on the same group ->
+        # suspected double-init deadlock. Log the existing modes.
+        _existing = list(group_cache.keys())
         buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -320,6 +325,18 @@ class DeepEPBuffer:
             # TODO can be false when unneeded
             allow_mnnvl=True,
         )
+        try:
+            import os as _os2, datetime as _dt2
+            _p2 = _os2.environ.get("KUNSERVE_DETAIL_LOG")
+            if _p2:
+                with open(_p2, "a", encoding="utf-8") as _f2:
+                    _f2.write(
+                        f"[{_dt2.datetime.now()} pid={_os2.getpid()}] [KUNSERVE-DBG] "
+                        f"[M1-BUF] POST Buffer() returned mode={resolved_dispatch_mode} "
+                        f"existing_modes_before={_existing}\n"
+                    )
+        except Exception:
+            pass
         group_cache[resolved_dispatch_mode] = _DeepEPBufferEntry(
             buffer=buffer,
             hidden_size=hidden_size,
