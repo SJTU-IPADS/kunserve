@@ -1004,6 +1004,76 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return int(local_bs), int(local_bs), bool(local_force_eager)
 
+    def _negotiate_balloon_deepep_is_extend(self, forward_batch) -> None:
+        """Phase E (DeepEP): cross-replica per-forward is_extend negotiation.
+
+        The two replicas schedule independently, so at the same cross-replica
+        MoE collective replica A may be EXTEND (-> DeepEP NORMAL) while replica
+        B is DECODE (-> DeepEP LOW_LATENCY). Mismatched modes pass inconsistent
+        args to the shared 4-rank ``runtime.sync`` / dispatch collective and
+        crash (deep_ep.cpp:200 'invalid argument'; see deepep_link.md).
+
+        Within ONE instance every EP rank shares one scheduler/batch, so
+        ``is_extend_in_batch`` is identical on all ranks and the mode resolves
+        consistently. This restores that invariant ACROSS replicas: all-gather
+        each rank's local ``is_extend`` over the cross-replica runtime_group and
+        OR them. If ANY rank has extend this step -> ALL use NORMAL; else all
+        use LL. One tiny (1-int) all-gather per GLOBAL forward, issued eagerly
+        before any MoE collective (never inside a captured graph).
+
+        No-op unless balloon==balloon and comm_backend==deepep. On any failure
+        it leaves the local value (no worse than before).
+        """
+        if str(self._balloon_state) != "balloon":
+            return
+        if str(self._balloon_kunserve_comm_backend or "").lower() != "deepep":
+            return
+        try:
+            runtime_group = self._resolve_balloon_process_group(
+                self._balloon_process_group_name
+            )
+        except Exception:
+            return
+        if runtime_group is None:
+            return
+        try:
+            from sglang.srt.layers.dp_attention import (
+                get_is_extend_in_batch,
+                set_is_extend_in_batch,
+            )
+
+            local_extend = bool(get_is_extend_in_batch())
+            device = torch.device("cuda", torch.cuda.current_device())
+            local_t = torch.tensor(
+                [1 if local_extend else 0], dtype=torch.int32, device=device
+            )
+            world = self._kunserve_group_world_size(runtime_group)
+            all_t = torch.empty(world, dtype=torch.int32, device=device)
+            self._kunserve_all_gather_into_tensor(runtime_group, all_t, local_t)
+            any_extend = bool(int(all_t.max().item()))
+            set_is_extend_in_batch(any_extend)
+
+            ct = int(getattr(self, "_deepep_extend_neg_ct", 0)) + 1
+            self._deepep_extend_neg_ct = ct
+            # Log the first few + every step where the negotiated value differs
+            # from the local one (the cross-replica-prefill case we are fixing).
+            if ct <= 8 or any_extend != local_extend:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] deepep is_extend negotiate ct=%d local=%s "
+                    "negotiated=%s -> mode=%s",
+                    ct,
+                    local_extend,
+                    any_extend,
+                    "NORMAL" if any_extend else "LOW_LATENCY",
+                )
+        except Exception as exc:
+            _kunserve_ms(
+                "[KUNSERVE-MS] deepep is_extend negotiate failed: %r "
+                "-- leaving local is_extend",
+                exc,
+            )
+            return
+
     def _default_balloon_physical_to_logical_map(self):
         metadata = (
             self._balloon_local_expert_location_metadata
@@ -5364,6 +5434,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Phase E (DeepEP): negotiate is_extend across replicas BEFORE any MoE
+        # collective so both replicas resolve the same DeepEP mode (NORMAL vs
+        # LOW_LATENCY) and the shared 4-rank buffer/dispatch collectives match.
+        # Eager + once per GLOBAL forward; no-op unless balloon+deepep.
+        self._negotiate_balloon_deepep_is_extend(forward_batch)
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
