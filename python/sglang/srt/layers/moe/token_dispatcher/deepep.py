@@ -777,6 +777,37 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
+
+        # Path-B instrumentation: dump the exact LL dispatch inputs + bracket the
+        # call so a hang shows as pre with no post (and we see the topk routing).
+        import os as _os
+
+        _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+        _llct = getattr(type(self), "_kun_ll_core_ct", 0) + 1
+        type(self)._kun_ll_core_ct = _llct
+        _log_ll = bool(_dbg) and _llct <= 30
+        if _log_ll:
+            try:
+                import datetime as _dt
+
+                _ti = topk_ids
+                _tmin = int(_ti.min().item())
+                _tmax = int(_ti.max().item())
+                _nneg = int((_ti < 0).sum().item())
+                _noor = int((_ti >= self.num_experts).sum().item())
+                with open(_dbg, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-CORE] ct={_llct} PRE low_latency_dispatch "
+                        f"x={tuple(hidden_states.shape)} topk={tuple(_ti.shape)} "
+                        f"topk_min={_tmin} topk_max={_tmax} n_neg={_nneg} "
+                        f"n_oor={_noor} num_max={self.num_max_dispatch_tokens_per_rank} "
+                        f"num_experts={self.num_experts} use_fp8={use_fp8} "
+                        f"return_recv_hook={self.return_recv_hook}\n"
+                    )
+            except Exception:
+                pass
+
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -798,6 +829,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
+        if _log_ll:
+            try:
+                import datetime as _dt
+
+                with open(_dbg, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-CORE] ct={_llct} POST low_latency_dispatch returned "
+                        f"(host call done; recv via "
+                        f"{'hook' if self.return_recv_hook else 'event.wait'})\n"
+                    )
+            except Exception:
+                pass
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
