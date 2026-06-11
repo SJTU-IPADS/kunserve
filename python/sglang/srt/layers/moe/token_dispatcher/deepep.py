@@ -709,7 +709,41 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         event,
         hook,
     ):
+        # Path-B probe: localize the LL-dispatch hang. The cross-replica
+        # low_latency_dispatch comm happens inside hook() (return_recv_hook=True)
+        # or in low_latency_dispatch itself (False). Mark enter/exit of the wait
+        # so a hang shows as ENTER with no EXIT. KUNSERVE_DETAIL_LOG-gated, capped.
+        import os as _os
+
+        _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+        _ct = getattr(type(self), "_kun_ll_dispb_ct", 0) + 1
+        type(self)._kun_ll_dispb_ct = _ct
+        if _dbg and _ct <= 40:
+            try:
+                import datetime as _dt
+
+                with open(_dbg, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-DISP] recv_wait ENTER ct={_ct} "
+                        f"return_recv_hook={self.return_recv_hook}\n"
+                    )
+            except Exception:
+                pass
+
         hook() if self.return_recv_hook else event.current_stream_wait()
+
+        if _dbg and _ct <= 40:
+            try:
+                import datetime as _dt
+
+                with open(_dbg, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-DISP] recv_wait EXIT ct={_ct}\n"
+                    )
+            except Exception:
+                pass
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m

@@ -194,7 +194,12 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            # KunServe Path-B: the cross-replica LL dispatch hangs in the deferred
+            # recv-hook (deepep.py dispatch_b hook()); the standalone 4-rank repro
+            # used inline dispatch (return_recv_hook=False) and worked. Allow
+            # forcing inline via env to test. Default True = upstream behavior.
+            return_recv_hook=os.environ.get("KUNSERVE_DEEPEP_RETURN_RECV_HOOK", "1")
+            != "0",
         )
     elif a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
