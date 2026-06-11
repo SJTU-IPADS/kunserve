@@ -273,6 +273,35 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
+        # [M1-BUF] ground-truth probe right before the crashing Buffer() sync.
+        # The isolated repro matches every Buffer param + GPU masking and PASSES,
+        # so the differentiator is the real process's device/group state. Dump it.
+        try:
+            import os as _os, datetime as _dt
+            from torch import distributed as _d
+            _p = _os.environ.get("KUNSERVE_DETAIL_LOG")
+            if _p:
+                try:
+                    _ranks = _d.get_process_group_ranks(group)
+                except Exception:
+                    _ranks = "?"
+                try:
+                    _bk = _d.get_backend(group)
+                except Exception:
+                    _bk = "?"
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[M1-BUF] pre-Buffer ll={resolved_deepep_mode.enable_low_latency()} "
+                        f"nvl={num_nvl_bytes} rdma={num_rdma_bytes} qps={num_qps_per_rank} "
+                        f"grp_size={group.size()} grp_rank={group.rank()} ranks={_ranks} "
+                        f"backend={_bk} cur_dev={torch.cuda.current_device()} "
+                        f"dev_count={torch.cuda.device_count()} "
+                        f"CVD={_os.environ.get('CUDA_VISIBLE_DEVICES')}\n"
+                    )
+        except Exception:
+            pass
+
         buffer = Buffer(
             group,
             num_nvl_bytes,
