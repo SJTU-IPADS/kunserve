@@ -2,7 +2,12 @@
 
 > 分支:`feat/deepep-comm`
 > 最后更新:2026-06-11
-> 状态:**mode 分叉 crash 已修(DR-7);当前卡在 LL Buffer 创建的 `runtime.sync` 死锁,未解。**
+> 状态:**✅ 已解(2026-06-12)。** 根因 = NVSHMEM(`NVSHMEM_USE_NCCL=ON` 编译)在建 team 时新建 NCCL communicator,与宿主 SGLang 进程已有的 NCCL/CUDA graph/VMM 状态冲突 → `team_internal.cpp:679 'unhandled cuda error'` → `runtime.sync` 挂死。
+> **修法:`NVSHMEM_DISABLE_NCCL=1`**(NVSHMEM team 改用自带 ring/recexch,不碰宿主 NCCL)。验证:`[BUF-INIT]` 出现 `POST runtime.sync`,LL dispatch/combine 连续跑 ~25900 个 GLOBAL forward 在实际生成。NVSHMEM_DEBUG=INFO 日志直接读出失败点(非模拟推断)。
+> 关键诊断手段:`NVSHMEM_DEBUG=INFO` 暴露 IBGDA/IBRC 失败后 NVSHMEM 走 P2P、然后在 NCCL-backed team setup 上 `unhandled cuda error`。
+> 遗留:① CUDA OOM(LOCAL graph 14G + LL NVSHMEM heap + 同卡 FSDP 22G,util=0.83 撑爆)→ `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + 降 util;② GLOBAL CUDA graph 仍未捕(`captured_variants=['local']`),LL 目前 eager,graph 是后续提速。
+>
+> ——以下为排查过程存档——
 > 本文是 M2(LL + CUDA graph)调试的专门记录,供接手者快速进入。总览见同目录 `deepep_link.md`。
 
 ---
