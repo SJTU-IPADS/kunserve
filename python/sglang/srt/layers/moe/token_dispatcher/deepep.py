@@ -867,6 +867,32 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        # Probe: compare combine's topk vs dispatch's ([LL-CORE]) + dump per-local
+        # -expert recv counts (masked_m) so we can see if tokens landed on the
+        # wrong experts (garbled GLOBAL LL decode). Capped, KUNSERVE_DETAIL_LOG.
+        import os as _os
+
+        _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+        _cmbct = getattr(type(self), "_kun_ll_cmb_ct", 0) + 1
+        type(self)._kun_ll_cmb_ct = _cmbct
+        if _dbg and _cmbct <= 20:
+            try:
+                import datetime as _dt
+
+                _rc = getattr(self, "packed_recv_count", None)
+                _rc_list = _rc.tolist() if _rc is not None else None
+                with open(_dbg, "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-CMB] ct={_cmbct} combine topk_min={int(topk_ids.min().item())} "
+                        f"topk_max={int(topk_ids.max().item())} "
+                        f"topk_shape={tuple(topk_ids.shape)} "
+                        f"num_experts={self.num_experts} "
+                        f"packed_recv_count(per_local_expert)={_rc_list}\n"
+                    )
+            except Exception:
+                pass
+
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
