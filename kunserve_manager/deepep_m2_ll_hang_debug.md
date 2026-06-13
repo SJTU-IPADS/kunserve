@@ -160,3 +160,33 @@ IB 口 `PORT_INIT`(死链路)。IBGDA 失败后,NVSHMEM 选下一个传输:
 2. 若不中:真实 run 设 `NVSHMEM_DEBUG=INFO`,抓 IBGDA 失败后 NVSHMEM 的 transport fallback 在哪 hang。
 3. 若还不行:怀疑 **NVSHMEM init 与进程内已有 NCCL communicator / CUDA graph / 非默认 stream 冲突**——尝试把 LL buffer 的创建挪到 **warmup 阶段、在任何 forward/graph 之前**(干净上下文)预建,看是否绕开。
 4. 性能动机:用户实测 **NORMAL vs LL 性能差距很大**,Path A(纯 NORMAL)不可接受,必须打通 LL。
+
+---
+
+## 11. 【2026-06-13 更新】hang 已解,新问题:GLOBAL-LL decode 输出乱码
+
+### 11.1 进展
+- **hang 根因已锤定并修复**:`NVSHMEM_DISABLE_NCCL=1`(详见 §0/§7 与 memory `finding_deepep_ll_needs_nvshmem_disable_nccl`)。LL dispatch/combine 已连续跑 ~25900 个 GLOBAL forward。
+- **OOM 已解**:降 `GPU_MEMORY_UTILIZATION=0.7` + batch 14(不要用 expandable_segments,与 TorchMemorySaver 冲突,会崩启动)。
+- **新问题**:能跑通,但 **balloon 进入 GLOBAL-LL 的 decode 输出乱码**(如 "step. the ..1.1..000000" / "000$-1000$-1000..."),而 M1(NORMAL)输出正确。
+
+### 11.2 乱码的定位证据(已排除项)
+- **定位到 GLOBAL-LL decode**:log `deepep_ll_graph_fp8_20260613_021642`。Sample 100(`decode_steps_balloon:0`,全程 LOCAL,finish=stop)输出**连贯正确** → 单实例/LOCAL-LL 没问题;乱码只在 balloon 后的 GLOBAL-LL decode 出现。
+- **排除 fp8**:M1 的 NORMAL 路径 `_DeepEPDispatcherImplNormal._dispatch_core` **也走** `sglang_per_token_group_quant_fp8`(NORMAL 同样 fp8 dispatch),NORMAL 正确 → 不是 fp8 量化误差。
+- **排除容量溢出**:`num_max_dispatch_tokens=128` > batch,`packed_recv_count` 每个 local expert 计数正常、分布合理。
+- **唯一可疑异常**([LL-CMB]/[LL-CORE] 探针):**rank1(replica0 的 TP1,pid 465617)** 的 dispatch topk 持续 `n_neg=8`(某个 token 的 8 个 topk 全是 -1)+ combine `topk_min=-1`;而 **rank0(同 replica、同 token)** `n_neg=0`。**同一 replica 两个 TP rank 的 topk 不一致**——这是 TP-rank 间 topk 不对称,尚不能从 min/max 区分是真发散还是 padding。
+
+### 11.3 数值对拍工具(本次产出)
+`/workspace/verl/data/parity_deepep_ll_remap.sh` —— **LL round-trip 正确性对拍**(必须 H20 跑,A800 无 NVSHMEM 不能跑 LL):
+- 建真实 4-rank 跨实例组,用真实 KunServe **非连续 ownership**(rank0→{0..31}、rank1→{64..95}、rank2→{32..63}、rank3→{96..127})+ **remap**(`dispatch_id//32==owner_rank`,即 layer0 的 `(0,32,64,96)→(0,64,32,96)`)。
+- 每专家 = `f_e(x)=x+e`(distinct、fp8-robust、可直接验算);参考 `out[t]=Σ_k w[t,k]*(x[t]+e_k)`。
+- 同输入跑 `low_latency_dispatch`(bf16,清晰)→ 对 group i 加 `inv_remap(r*32+i)` 的 logical id → `low_latency_combine`,逐元素 diff 参考。
+- **判读**:
+  - **全 PASS** → DeepEP LL + remap 这套 round-trip 正确 → bug 在 **SGLang wiring**(`active_local_expert_mapping` 喂 LL packed 的 row 对应、或 **TP token 复制**那一维——对拍当前是每 rank 自己 token 的简单 EP,没建模 replica 内 2 个 TP rank 共享 token,§11.2 的 rank0/rank1 topk 不对称正指向这维)。下一步把 TP 复制建进对拍。
+  - **任一 FAIL** → LL+remap 本身就错 → 非连续布局喂 LL 不成立,需改布局为连续 或 放弃 LL 内部路由。
+- 用法:`REPLICA0_GPUS=2,3 REPLICA1_GPUS=4,7 bash /workspace/verl/data/parity_deepep_ll_remap.sh`(语法已本机校验)。
+
+### 11.4 下一步
+1. H20 跑 §11.3 对拍,看 PASS/FAIL 二分。
+2. 若 PASS:把 **TP token 复制**(replica 内 rank0/rank1 同 token)建进对拍,复现 §11.2 的 rank1 `n_neg=8` 不对称,定位是 SGLang 在 TP+EP 下喂 LL 的 topk/token 分片错位。
+3. 若 FAIL:打印 worst token 的 `out_ll vs out_ref + logical/disp topk`,看是 group↔logical 错位还是 combine 回写错位。
