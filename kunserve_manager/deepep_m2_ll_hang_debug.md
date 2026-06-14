@@ -261,3 +261,10 @@ rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
   - `gemm0_max_abs_diff` 大(ref 与 act 量级接近但内容差,或量级都差) → **GEMM-0 的 fp8 scale 消费错**(疑 KunServe 喂 masked 核的激活 scale 布局/或 scale vs scale_inv)。
   - diff 小 → GEMM-0 没问题,转查激活量化(silu_and_mul_masked_post_quant)或 GEMM-1(w2)。
 - 透传已加 `KUNSERVE_MASKED_REF`/`KUNSERVE_WEIGHT_PROBE`(constants_ppo.py)。
+
+### 11.13 【2026-06-14 log 153614】GEMM-0 算术正确 + "发散"是误判 → 转查权重 provenance
+- **GEMM-0 算术正确**:in-situ [MASKED-REF](反量化 fp8 激活+w13 手算 bf16 参考)`gemm0_max_abs_diff=0.002~0.004`、mean=2e-5、`ref_mean_abs==act_mean_abs`、ref[:4]≈act[:4]。`hsc_shape=(32,512,16)` 反量化布局假设正确。w13 的 fp8 scale 消费没问题。
+- **撤销"发散"判断**:`_kun_mg_ct` 是 class 级计数器,跨所有 MoE 层共享。核实时间戳:连续 ct 间隔 ~3ms = **同一 forward 内逐层**(非 decode step)。`down_valid_mean` 0.013→0.195 是**残差流随层深正常增长**,不是发散。§11.12 的发散结论作废。
+- **in-situ ref 的盲区**:它用 kernel 自己的 `w13[g]` 同时算 ref 和 act,只验证"算得对",**无法验证 `w13[g]` 是否正确专家的权重(provenance)**。这是非连续 balloon 布局最易错处(layer.py:548 注释疑 replica1 读错半区)。
+- **下一步 = 权重 provenance**:`KUNSERVE_WEIGHT_PROBE`(已设进 smoke 默认 + constants_ppo 透传)。`build_dense_expert_runtime_tensors` 打每 rank 的 `start`/`length`/`sl_abs_sum`(所用行校验和)/`alt_abs_sum`(另一半)。判读:某 rank 的 `sl_abs_sum`==另一 rank 的、或==自己 `alt_abs_sum` → 读错半区 = 应用错专家。
+- 探针扩展:[MASKED-REF] 现同时测 t=0 与 t=last(masked_m[g]-1),查 packed buffer 的 token 索引/scale 错位。
