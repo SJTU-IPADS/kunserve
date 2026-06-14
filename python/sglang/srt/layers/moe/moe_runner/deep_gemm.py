@@ -276,7 +276,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # gated, ct<=2.
         try:
             import os as _os
-            if _os.environ.get("KUNSERVE_MASKED_REF") and getattr(type(self), "_kun_mg_ct", 0) < 2:
+            if _os.environ.get("KUNSERVE_DETAIL_LOG") and getattr(type(self), "_kun_mg_ct", 0) < 2:
                 import datetime as _dt
                 _hsc0 = runner_input.hidden_states_scale  # logical [ng, m, k//128]
                 _g = int((masked_m > 0).nonzero()[0].item())
