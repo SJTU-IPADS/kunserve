@@ -244,3 +244,11 @@ rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
   - down NaN 或 max 爆炸 → kernel blow-up(疑 scale 布局:UE8M0 / `get_mn_major_tma_aligned_tensor` 对 GLOBAL bundle narrowed 权重不匹配)。
   - norms 正常但仍乱 → 更隐蔽,下一步加 in-situ 参考对拍(反量化权重+激活做 bf16 分组 matmul,逐 group diff masked 输出,定位 GEMM-0 vs GEMM-1)。
 - 另跑 `KUNSERVE_WEIGHT_PROBE=1`(layer.py:556 已有)验证四 rank 权重字节溯源(replica1 是否读错半)。
+
+### 11.11 【2026-06-14 log 140752】masked GEMM 输出含 NaN — 待分清有效行 vs padding
+- `[MASKED-GEMM]` 四 rank、ct=1 起**全部 `down_mean_abs=nan down_max_abs=nan down_has_nan=True`**。w13=(32,1536,2048) w13_scale=(32,12,16)、w2=(32,2048,768) w2_scale=(32,16,6) 形状都对;masked_m_sum≈128-328 合理。
+- **但这是整 tensor 判的**:masked GEMM 每专家 m=512 槽、只有 masked_m[g] 有效(sum≈210/16384),`down_output=torch.empty` 的 **padding 行未初始化→NaN 属预期且无害**(combine 只读有效行)。所以**还不能定罪**。
+- **探针已细化**(`_run_masked_gemm`):只统计**有效行**([0,masked_m[g]))的 NaN,分 `gateup_valid_nan`(GEMM-0)/`down_valid_nan`(GEMM-1)+ `down_valid_mean_abs`,并保留 `down_all_nan`。
+  - `gateup_valid_nan=True` → NaN 起于 **GEMM-0**(`(hs_fp8,hs_scale)@(w13,w13_scale)`),疑激活/权重 scale 布局(UE8M0/tma-align)。
+  - `gateup_valid_nan=False & down_valid_nan=True` → 起于 act 或 **GEMM-1**。
+  - **两个 valid_nan 都 False** → 有效行无 NaN,bug 是"值错不爆"→ 上 in-situ 反量化参考对拍定位。

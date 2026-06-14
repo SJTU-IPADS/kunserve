@@ -311,6 +311,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+        # [MASKED-GEMM] valid-row probe (part 1): NaN in GEMM-0 output, VALID rows
+        # only (rows [0, masked_m[g]) per group). Padding rows are uninitialized so
+        # whole-tensor NaN is expected+harmless; only valid-row NaN is the bug.
+        _kun_gateup_valid_nan = None
+        try:
+            import os as _os
+            if _os.environ.get("KUNSERVE_DETAIL_LOG") and getattr(type(self), "_kun_mg_ct", 0) < 40:
+                _ng, _mtot = gateup_output.shape[0], gateup_output.shape[1]
+                _vm = (torch.arange(_mtot, device=gateup_output.device).unsqueeze(0)
+                       < masked_m.unsqueeze(1))
+                _gv = gateup_output[_vm]
+                _kun_gateup_valid_nan = bool(torch.isnan(_gv).any().item()) if _gv.numel() else False
+        except Exception:
+            _kun_gateup_valid_nan = None
         del gateup_output
 
         # GroupGemm-1
@@ -368,9 +382,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 if _ct <= 40:
                     import datetime as _dt
                     _mm = masked_m
-                    _dmean = float(down_output.abs().mean().item())
-                    _dnan = bool(torch.isnan(down_output).any().item())
-                    _dmax = float(down_output.abs().max().item())
+                    # VALID rows only ([0, masked_m[g]) per group) — the rows combine
+                    # actually reads. Padding-row NaN is harmless; valid-row NaN = bug.
+                    _vm = (torch.arange(down_output.shape[1], device=down_output.device).unsqueeze(0)
+                           < _mm.unsqueeze(1))
+                    _dv = down_output[_vm]
+                    _dnan_valid = bool(torch.isnan(_dv).any().item()) if _dv.numel() else False
+                    _dmean_valid = float(_dv.abs()[~torch.isnan(_dv.abs())].mean().item()) if _dv.numel() else 0.0
+                    _dnan_all = bool(torch.isnan(down_output).any().item())
                     _mm_sum = int(_mm.sum().item())
                     _mm_head = _mm[:8].tolist()
                     with open(_dbg, "a", encoding="utf-8") as _f:
@@ -379,9 +398,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                             f"[MASKED-GEMM] ct={_ct} num_groups={num_groups} m={m} "
                             f"masked_m_sum={_mm_sum} masked_m_head={_mm_head} "
                             f"w13={tuple(w13_weight.shape)} w13_scale={tuple(w13_scale.shape)} "
-                            f"w2={tuple(w2_weight.shape)} w2_scale={tuple(w2_scale.shape)} "
-                            f"down_mean_abs={_dmean:.4f} down_max_abs={_dmax:.3f} "
-                            f"down_has_nan={_dnan} expected_m={expected_m}\n"
+                            f"gateup_valid_nan={_kun_gateup_valid_nan} "
+                            f"down_valid_nan={_dnan_valid} down_valid_mean_abs={_dmean_valid:.4f} "
+                            f"down_all_nan={_dnan_all} expected_m={expected_m}\n"
                         )
         except Exception:
             pass
