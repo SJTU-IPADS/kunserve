@@ -190,3 +190,30 @@ IB 口 `PORT_INIT`(死链路)。IBGDA 失败后,NVSHMEM 选下一个传输:
 1. H20 跑 §11.3 对拍,看 PASS/FAIL 二分。
 2. 若 PASS:把 **TP token 复制**(replica 内 rank0/rank1 同 token)建进对拍,复现 §11.2 的 rank1 `n_neg=8` 不对称,定位是 SGLang 在 TP+EP 下喂 LL 的 topk/token 分片错位。
 3. 若 FAIL:打印 worst token 的 `out_ll vs out_ref + logical/disp topk`,看是 group↔logical 错位还是 combine 回写错位。
+
+### 11.5 【2026-06-14】对拍结果:全 PASS → bug 在 SGLang wiring(TP 维)
+H20 实跑 `parity_deepep_ll_remap.sh`,四 rank 全 PASS:
+```
+rank0: max_abs_diff=0.4403 mean=0.111 ref_mean=65.7 PASS
+rank1: max_abs_diff=0.4395 mean=0.107 ref_mean=63.2 PASS
+rank2: max_abs_diff=0.4280 mean=0.113 ref_mean=66.3 PASS
+rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
+```
+`max_abs_diff≈0.44` 在 `ref_mean≈65` 上是 **bf16 舍入级别**(routing 错位会差几十)→ **DeepEP LL + 非连续 remap + combine round-trip 本身正确**。
+**bug 锁定在 SGLang wiring**,且强指向对拍**故意没建模的那一维**:replica 内 2 个 TP rank 共享同一份 token——正对应 §11.2 的 rank0 `n_neg=0` vs rank1 `n_neg=8`(同 replica 同 token,topk 却不一致,本不该发生)。
+**下一步**:进真实代码查"为什么同 replica 两 TP rank 喂 LL 的 topk 不一样"(per-rank remap / ExpertLocationDispatch / topk 构造)。
+
+### 11.6 【2026-06-14】缩小到 LL 特有 + 非对称负载(疑 Phase E)
+对 M1(NORMAL 正确)vs M2(LL 乱码)逐一排除非 LL 差异:
+- **GLOBAL CUDA graph 不是变量**:M2 日志只捕 `variant='local'`,**GLOBAL LL 跑 eager**(没捕 GLOBAL 图)。排除 graph。
+- **forward 路径相同**:`moe_a2a_backend=deepep` → `QwenMoeSparseMoeBlock.forward` 走 `forward_deepep`(qwen3_moe.py:285),**不做末尾 `tensor_model_parallel_all_reduce`**(combine 已跨 EP world 聚合,对拍已证 LL combine = 全 topk 求和),且给 `self.topk` 传 `num_token_non_padded`。NORMAL/LL 共用此路 → "双重 reduce""padding 未 mask" 都不是 LL 特有差异,排除。
+- **per-rank `logical_to_rank_dispatch_physical_map[ep_rank]`**:确为 per-rank 切片,但 KunServe 每 logical 仅 1 个物理副本 → `_find_nearest_expert` 候选唯一 → 各 rank map 相同;且 `assert all != -1` → remap 不产出 -1。故 rank1 的 `n_neg=8`(整 token 全 -1)**只能来自 remap 之前**(padding / num_token_non_padded mask)。
+- **剩下的唯一谜点**:rank0(replica0 TP0)`n_neg=0` vs rank1(replica0 TP1)`n_neg=8`。TP 伙伴 token 相同、router logits all-reduce 后相同 → 后续 topk 本应**逐元素相同**。出现非对称,只能是**两 rank 的 `num_token_non_padded` / 实际 token 数不同** → 强烈指向 **replica 间非对称负载 / idle-keepalive(Phase E 未做)**:一侧有真 decode token、另一侧 idle 用 dummy 凑数,LL 的**固定容量 `num_max_dispatch_tokens_per_rank` 打包 + 跨实例 combine 不容忍这种非对称**,而 NORMAL 的动态 layout 能容忍 → 只有 LL 乱。
+
+**下一步二选一**:
+1. **真实代码探针(H20)**:在第一个 GLOBAL-LL decode forward,rank0 与 rank1 各 dump `num_token_non_padded` + 前若干**真实** token 的 post-remap topk + `forward_mode`/是否 idle-keepalive。若两 rank 的 num_token_non_padded 不同 → 实锤 Phase E 非对称。
+2. **对拍升级**:在 `parity_deepep_ll_remap.sh` 上加 (a) TP 复制(replica 内两 rank 同 token)+ (b) 一侧 idle(real token 数不同),看是否复现乱码。
+
+### 11.7 新探针 [LL-ANOM](已加,worktree 自动同步 H20)
+`deepep.py _DeepEPDispatcherImplLowLatency._dispatch_core`:在 `low_latency_dispatch` 前,**只要 topk 有整行 -1(n_neg>0)就触发**(独立计数 ≤80,跨过 [LL-CORE] 的前 30 次限制,能抓到 decode 乱码时刻),dump `n_tokens / n_neg / fully_masked_rows / num_max`。`KUNSERVE_DETAIL_LOG` 门控。
+**判读**:跑 M2 后比对同一 decode step 下 rank0 与 rank1(同 replica 两 pid)的 [LL-ANOM]:`n_tokens` 或 `fully_masked_rows` 不同 → 实锤非对称负载/idle-keepalive(Phase E)在腐蚀 LL 固定容量打包。日志:`grep -aE '\[LL-ANOM\]' kunserve_sglang_detail.log`。

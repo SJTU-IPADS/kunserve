@@ -825,6 +825,37 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             except Exception:
                 pass
 
+        # Phase E probe: catch the GLOBAL-LL decode garbling moment. The capped
+        # [LL-CORE] above only covers the first 30 calls (warmup/prefill). Here we
+        # fire specifically when topk has any -1 row (n_neg>0) regardless of call
+        # index, dumping per-rank token count + WHICH token rows are fully masked.
+        # If two TP-partner ranks (same replica) report different token counts or
+        # different fully-masked rows on the same decode step => asymmetric-load /
+        # idle-keepalive (Phase E) is corrupting the LL fixed-capacity packing.
+        if _dbg:
+            try:
+                _ti2 = topk_ids
+                _nneg2 = int((_ti2 < 0).sum().item())
+                if _nneg2 > 0:
+                    _act = getattr(type(self), "_kun_ll_anom_ct", 0) + 1
+                    type(self)._kun_ll_anom_ct = _act
+                    if _act <= 80:
+                        import datetime as _dt
+
+                        _full_masked = (
+                            (_ti2 < 0).all(dim=1).nonzero(as_tuple=False).flatten().tolist()
+                        )
+                        with open(_dbg, "a", encoding="utf-8") as _f:
+                            _f.write(
+                                f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                                f"[LL-ANOM] ct={_act} n_tokens={hidden_states.shape[0]} "
+                                f"n_neg={_nneg2} fully_masked_rows={_full_masked[:16]} "
+                                f"(n_full={len(_full_masked)}) num_max="
+                                f"{self.num_max_dispatch_tokens_per_rank}\n"
+                            )
+            except Exception:
+                pass
+
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
