@@ -252,3 +252,12 @@ rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
   - `gateup_valid_nan=True` → NaN 起于 **GEMM-0**(`(hs_fp8,hs_scale)@(w13,w13_scale)`),疑激活/权重 scale 布局(UE8M0/tma-align)。
   - `gateup_valid_nan=False & down_valid_nan=True` → 起于 act 或 **GEMM-1**。
   - **两个 valid_nan 都 False** → 有效行无 NaN,bug 是"值错不爆"→ 上 in-situ 反量化参考对拍定位。
+
+### 11.12 【2026-06-14 log 143349】NaN 红鲱鱼,真凶=masked GEMM 输出值错并发散
+- **有效行无 NaN**(`gateup_valid_nan=False down_valid_nan=False` 全 160 次)→ 整 tensor NaN 只是无害 padding;且 `down_valid_nan=False` 反证 GEMM-1 正确掩码忽略了输入 padding 的 NaN。**NaN 排除**。
+- **真凶 = 值错且发散**:`down_valid_mean_abs` 单 pid 单调上升 **0.013→0.195(40 步 ~15×,近指数)**。GLOBAL-LL 专家输出值不爆但错,每步注入小误差→残差流累积发散→乱码不停。解释了"balloon 步少的请求仍连贯(3 个 finish=stop 都步少)、步多的崩"。
+- **形状全对**:w13=(32,1536,2048)/scale=(32,12,16)、w2=(32,2048,768)/scale=(32,16,6),masked_m 合理。所以是**数值/scale 消费**错,非形状/计数。
+- **新探针 [MASKED-REF]**(`_run_masked_gemm` GEMM-0 后,`KUNSERVE_MASKED_REF=1` 门控,ct≤2):反量化本 rank fp8 激活(用 `runner_input.hidden_states_scale` 原始逻辑 scale,非 line254 TMA 重排后的)+ w13(per-128x128 block scale),手算 bf16 参考,diff 单个有效 (g,t) 的 `gateup_output`。
+  - `gemm0_max_abs_diff` 大(ref 与 act 量级接近但内容差,或量级都差) → **GEMM-0 的 fp8 scale 消费错**(疑 KunServe 喂 masked 核的激活 scale 布局/或 scale vs scale_inv)。
+  - diff 小 → GEMM-0 没问题,转查激活量化(silu_and_mul_masked_post_quant)或 GEMM-1(w2)。
+- 透传已加 `KUNSERVE_MASKED_REF`/`KUNSERVE_WEIGHT_PROBE`(constants_ppo.py)。

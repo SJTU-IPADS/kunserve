@@ -267,6 +267,48 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
         )
+        # [MASKED-REF] in-situ GEMM-0 parity: dequant THIS rank's fp8 activation +
+        # w13 (per-128x128 block scales) and matmul a clean bf16 reference for one
+        # valid (group,token), diff vs the kernel's gateup_output. Localizes whether
+        # the masked-GEMM fp8 scale consumption is wrong (-> diverging values, the
+        # confirmed garbling mechanism). Uses runner_input.hidden_states_scale (the
+        # ORIGINAL logical scale, before the line-254 TMA reorder). KUNSERVE_MASKED_REF
+        # gated, ct<=2.
+        try:
+            import os as _os
+            if _os.environ.get("KUNSERVE_MASKED_REF") and getattr(type(self), "_kun_mg_ct", 0) < 2:
+                import datetime as _dt
+                _hsc0 = runner_input.hidden_states_scale  # logical [ng, m, k//128]
+                _g = int((masked_m > 0).nonzero()[0].item())
+                _t = 0
+                _ng, _m, _k = hidden_states.shape
+                _bk = _k // 128
+                _hx = hidden_states[_g, _t].float().view(_bk, 128) * _hsc0[_g, _t].float().view(_bk, 1)
+                _hx = _hx.view(_k)                                   # [k] dequant activation
+                _nw = w13_weight.shape[1]                            # 1536
+                _bn = _nw // 128
+                _w = (w13_weight[_g].float().view(_bn, 128, _bk, 128)
+                      * w13_scale[_g].float().view(_bn, 1, _bk, 1)).view(_nw, _k)
+                _ref = (_hx @ _w.t()).to(torch.bfloat16)             # [n]
+                _act = gateup_output[_g, _t]
+                _d = (_ref.float() - _act.float()).abs()
+                with open(_os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[MASKED-REF] g={_g} t={_t} hsc_shape={tuple(_hsc0.shape)} "
+                        f"w13_scale_shape={tuple(w13_scale.shape)} "
+                        f"gemm0_max_abs_diff={_d.max().item():.4f} gemm0_mean_abs_diff={_d.mean().item():.5f} "
+                        f"ref_mean_abs={_ref.float().abs().mean().item():.4f} "
+                        f"act_mean_abs={_act.float().abs().mean().item():.4f} "
+                        f"ref[:4]={_ref[:4].float().tolist()} act[:4]={_act[:4].float().tolist()}\n"
+                    )
+        except Exception as _e:
+            try:
+                import os as _os2
+                with open(_os2.environ.get("KUNSERVE_DETAIL_LOG","/dev/null"), "a", encoding="utf-8") as _f:
+                    _f.write(f"[KUNSERVE-DBG] [MASKED-REF] ERROR: {_e!r}\n")
+            except Exception:
+                pass
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
