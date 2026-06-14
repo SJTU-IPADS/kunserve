@@ -217,3 +217,30 @@ rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
 ### 11.7 新探针 [LL-ANOM](已加,worktree 自动同步 H20)
 `deepep.py _DeepEPDispatcherImplLowLatency._dispatch_core`:在 `low_latency_dispatch` 前,**只要 topk 有整行 -1(n_neg>0)就触发**(独立计数 ≤80,跨过 [LL-CORE] 的前 30 次限制,能抓到 decode 乱码时刻),dump `n_tokens / n_neg / fully_masked_rows / num_max`。`KUNSERVE_DETAIL_LOG` 门控。
 **判读**:跑 M2 后比对同一 decode step 下 rank0 与 rank1(同 replica 两 pid)的 [LL-ANOM]:`n_tokens` 或 `fully_masked_rows` 不同 → 实锤非对称负载/idle-keepalive(Phase E)在腐蚀 LL 固定容量打包。日志:`grep -aE '\[LL-ANOM\]' kunserve_sglang_detail.log`。
+
+### 11.8 【2026-06-14 log 20260614_030306】修正:Phase-E 是红鲱鱼,真凶疑 LL fp8 scale 路径
+- **乱码确认仍在**:37 个经 balloon 的请求 **34 个 finish=length**(顶满 32K 不停,balloon_steps≈21600+),3 个 finish=stop 的 balloon_steps 很少(2420/9656/10287,大部分 decode 在 LOCAL)。完全吻合"finish=length=乱码"签名。
+- **[LL-ANOM] 是正常 padding,排除**:4 rank 都 27 token;两个 replica-B rank(816685/816686)decode 期**一致**地 row26 整行 -1(=26 真实+1 padding),replica-A(816330/816332)27 真实无 mask。replica 内两 rank 一致 → 不是 TP 非对称;dispatch/combine 对 -1 按 API 正常处理(combine `topk_min=-1` 也是 padding 所致)。**Phase-E 非对称假设推翻**。
+- **重新聚焦**:对拍 PASS 用的是 **bf16 + 合成专家 + 喂对的 mapping**;真实 run 是 **fp8 + 真实权重**。`_dispatch_core`:`elif not SGLANG_DEEPEP_BF16_DISPATCH: use_fp8=True` → **LL 走 fp8**,返回 `(packed_recv_x_fp8, packed_recv_x_scales[.., hidden//128])`,per-128-channel scale、列主序布局——**与 NORMAL fp8 是不同代码路径**。之前"NORMAL 也 fp8 故排除 fp8"的推理**不成立**(两条 fp8 路径不同)。
+- **专家核约束**:`layer.py:1743 local_expert_offset = moe_ep_rank * num_local_experts` → group i 必须 = 物理 `ep_rank*num_local+i`(连续),靠 remap 伪装非连续 ownership——对拍已证这套正确。
+- **对拍已升级 fp8**(`parity_deepep_ll_remap.sh` 加 `USE_FP8=1`):dispatch `use_fp8=True` → 用返回 scales 反量化 `(fp8.float().view(nl,M,H//128,128)*scales[...,None]).view(nl,M,H)` → +e → combine,阈值放宽到 2.0。
+  - **FAIL** → LL fp8 dispatch/scale 路径就是真凶(反量化/scale 布局错)。
+  - **PASS** → fp8 也没问题,真凶在真实**专家权重行 wiring**(active_local_expert_mapping ↔ masked-GEMM group 顺序),需在真实 forward 探针对比 NORMAL/LL 喂给专家核的权重行。
+
+### 11.9 【2026-06-14】fp8 对拍也 PASS → comm 全清,补 TP 一致性测试
+- **fp8 对拍 PASS**:`USE_FP8=1` 四 rank `max_abs_diff≈0.53`(仅比 bf16 的 0.44 多 0.09 = 纯 fp8 量化噪声,远低于阈值 2.0)。**LL fp8 dispatch+scale 反量化+combine round-trip 正确,fp8-LL 不是 bug**。
+- 至此 comm 侧(dispatch/combine/remap/非连续布局/bf16/fp8)**全部被对拍洗清**;NORMAL 正确又证明权重排列+contiguous active_local_expert_mapping(model_runner.py:1153 只支持 contiguous narrow)对。
+- **LL vs NORMAL 唯一未双重验证的差异 = 专家核**:LL 用 deep_gemm **masked** grouped GEMM,NORMAL 用 **contiguous** grouped GEMM。外加对拍**没建模 TP 复制**(真实里 replica 内两 TP rank token 相同、都往 EP=4 dispatch,产生 duplication;且 combine 后两者输出必须逐元素相等,否则下一层 TP attention 发散→乱码)。
+- **对拍补 TP 一致性**(`TP_REPLICATE=1`):按 replica(rank//2)播种,使 rank0/rank1 同 token、都 dispatch(模拟 duplication);两 partner 都对**同一份**参考,若 LL 有任何 rank 相关发散,其中一个会 FAIL。
+  - **TP_REPLICATE FAIL** → TP 复制/duplication 下 LL combine 产生 rank 间发散 = 真凶。
+  - **TP_REPLICATE PASS** → comm+TP 全清,真凶只剩**真实 deep_gemm masked grouped GEMM 路径**(kernel 本身 / 权重 scale `w13_weight_scale_inv` 喂 masked 核的方式),需在真实 forward 探针对比单专家 LL 输出 vs 手算参考。
+
+### 11.10 【2026-06-14】TP_REPLICATE 也 PASS → 锁定 masked grouped GEMM 数值路径
+- **TP_REPLICATE PASS(bf16+fp8)**:按 replica 播种使 rank0/rank1 同 token、都 dispatch(真实 duplication)。结果 **rank0 与 rank1 的 max_abs_diff/ref_mean 完全相同**(0.4403/65.695),rank2/rank3 相同(0.4395/63.195)→ **TP 伙伴输出逐元素一致,TP 复制/duplication 排除**。
+- **scale 切分一致**:`build_dense_expert_runtime_tensors`(layer.py:546)对 w13_weight 和 w13_weight_scale(_inv)用**同一 `narrow(0,start,length)`** → 权重/scale 切得一致,"scale 切错"排除。
+- **adapter 不在路径上**:`kunserve_runner_adapter.py` 是未实现骨架,且只服务 bf16/triton;fp8 路径不用它。
+- **排除法定论**:comm(dispatch/combine/remap/非连续/bf16/fp8)+ TP + 权重排列/scale切分 全清。LL vs NORMAL 唯一未验证差异 = **deep_gemm masked grouped GEMM**(`moe_runner/deep_gemm.py:_run_masked_gemm`,LL 专属;NORMAL 走 contiguous,M1 从没碰过 masked)。M2 里这个 masked 运行器**只有 GLOBAL LL 会触发**(LOCAL 已是 StandardDispatcher)。
+- **新探针 [MASKED-GEMM]**(`moe_runner/deep_gemm.py` down_output 后,KUNSERVE_DETAIL_LOG 门控,≤40):dump `num_groups/m/masked_m/w13+scale 形状/down_mean_abs/down_max_abs/down_has_nan`。
+  - down NaN 或 max 爆炸 → kernel blow-up(疑 scale 布局:UE8M0 / `get_mn_major_tma_aligned_tensor` 对 GLOBAL bundle narrowed 权重不匹配)。
+  - norms 正常但仍乱 → 更隐蔽,下一步加 in-situ 参考对拍(反量化权重+激活做 bf16 分组 matmul,逐 group diff masked 输出,定位 GEMM-0 vs GEMM-1)。
+- 另跑 `KUNSERVE_WEIGHT_PROBE=1`(layer.py:556 已有)验证四 rank 权重字节溯源(replica1 是否读错半)。

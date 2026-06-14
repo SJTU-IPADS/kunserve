@@ -352,6 +352,40 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
+        # KunServe [MASKED-GEMM] probe: in M2 this masked runner fires ONLY for the
+        # GLOBAL LL bundle (LOCAL is StandardDispatcher post-balloon). Comm + remap +
+        # fp8-dispatch + TP are all exonerated by parity_deepep_ll_remap.sh, so the
+        # last suspect for the GLOBAL-LL garbling is this masked GEMM numeric path.
+        # Dump per-stage norms / NaN / masked_m / scale shapes so we can tell a
+        # kernel blow-up (NaN/huge) from a subtle scale-layout error (norms sane but
+        # output still wrong). KUNSERVE_DETAIL_LOG-gated, sampled.
+        try:
+            import os as _os
+            _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+            if _dbg:
+                _ct = getattr(type(self), "_kun_mg_ct", 0) + 1
+                type(self)._kun_mg_ct = _ct
+                if _ct <= 40:
+                    import datetime as _dt
+                    _mm = masked_m
+                    _dmean = float(down_output.abs().mean().item())
+                    _dnan = bool(torch.isnan(down_output).any().item())
+                    _dmax = float(down_output.abs().max().item())
+                    _mm_sum = int(_mm.sum().item())
+                    _mm_head = _mm[:8].tolist()
+                    with open(_dbg, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                            f"[MASKED-GEMM] ct={_ct} num_groups={num_groups} m={m} "
+                            f"masked_m_sum={_mm_sum} masked_m_head={_mm_head} "
+                            f"w13={tuple(w13_weight.shape)} w13_scale={tuple(w13_scale.shape)} "
+                            f"w2={tuple(w2_weight.shape)} w2_scale={tuple(w2_scale.shape)} "
+                            f"down_mean_abs={_dmean:.4f} down_max_abs={_dmax:.3f} "
+                            f"down_has_nan={_dnan} expected_m={expected_m}\n"
+                        )
+        except Exception:
+            pass
+
         return down_output
 
     @property
