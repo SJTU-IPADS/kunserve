@@ -277,3 +277,22 @@ rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
 - **A/B 修复实验 `KUNSERVE_ZERO_PAD=1`**(已设进 smoke 默认 + 透传):combine 前把 down_output padding 行清零。
   - 乱码消失(finish=length→stop) → **实锤:NaN-padding 经 combine 传染**,正式修复=zero/mask masked-GEMM 输出 padding。
   - 仍乱 → combine 正确忽略 padding,NaN 无害,bug 在别处(回头查 combine 的 topk_weights 应用 / 残差加法)。
+
+---
+
+## 12. ✅ 已解(2026-06-15):GLOBAL-LL 乱码根因 = masked-GEMM padding NaN 经 combine 传染
+
+### 根因
+deep_gemm masked 运行器(`moe_runner/deep_gemm.py:_run_masked_gemm`)的 `down_output = torch.empty(num_groups, m, n)`,**padding 行([masked_m[g], m))未初始化 = NaN**(探针 `down_all_nan=True` 而 `down_valid_nan=False`)。`low_latency_combine` 对每个专家的全部 m 个槽做 `sum(weight_i * x_i)`;padding 槽 combine 权重=0 但 x=NaN,**`0 * NaN = NaN`** → NaN 传染进真实 token 的合并输出 → decode 乱码(finish=length 不停)。
+
+### 为何对拍没抓到
+`parity_deepep_ll_remap.sh` 的 padding 是有限垃圾(dispatch 写的),不是 NaN;NaN 是真实 run 里 masked-GEMM `torch.empty` 引入的。所以对拍把 dispatch/combine/remap/fp8/非连续布局/权重 provenance/GEMM 算术全判对——都对,唯独差这个 NaN-padding。
+
+### 修复
+GEMM-1 之后、combine 之前,把 `down_output` 的 padding 行清零(`masked_fill_`,in-place)。`0 * 0 = 0`,NaN 不再产生。默认开启,`KUNSERVE_ZERO_PAD=0` 可 A/B 回退。
+
+### 验证(deepep_ll_graph_fp8_20260615_014628)
+经 balloon 的请求 finish_type **从 100% length 翻转为 100% stop**(3/3,GLOBAL-LL 解码 3513/3353/7202 步后正确吐 EOS=151645)。M2 LL GLOBAL 推理首次产出连贯正确输出。
+
+### 排错全链(供复盘)
+对拍逐步排除:dispatch/combine(§11.3-11.4)→ fp8-LL(§11.9)→ TP 复制(§11.10)→ 权重 provenance(§11.14)→ 全对;真实 run 探针:NaN 仅在 padding(§11.11)→ "发散"是层深增长误判(§11.13)→ GEMM 算术正确(§11.13)→ 最终定位 NaN-padding×combine(§12)。教训:对拍要复现真实的**未初始化/NaN** 边界,不能只用有限随机值。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -411,23 +412,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
-        # KunServe A/B FIX EXPERIMENT (KUNSERVE_ZERO_PAD=1): down_output is torch.empty
-        # so its PADDING rows ([masked_m[g], m) per group) are uninitialized -> NaN
-        # (confirmed: down_all_nan=True while down_valid_nan=False). parity_deepep_ll
-        # could NOT catch NaN-padding propagation through low_latency_combine because
-        # its padding was finite garbage, not NaN. If combine touches any padding row,
-        # NaN leaks into real tokens -> garbling. Zero the padding rows and see if the
-        # GLOBAL-LL garbling disappears (finish=length -> finish=stop). If it fixes,
-        # the real fix is to zero/mask the masked-GEMM output padding.
-        try:
-            import os as _os
-            if _os.environ.get("KUNSERVE_ZERO_PAD") == "1":
-                _vmask = (torch.arange(down_output.shape[1], device=down_output.device).unsqueeze(0)
-                          < masked_m.unsqueeze(1))
-                down_output = torch.where(_vmask.unsqueeze(-1), down_output,
-                                          torch.zeros((), dtype=down_output.dtype, device=down_output.device))
-        except Exception:
-            pass
+        # KunServe M2 FIX (GLOBAL-LL garbling root cause): down_output is torch.empty,
+        # so its PADDING rows ([masked_m[g], m) per local expert) are uninitialized ->
+        # NaN. low_latency_combine reduces `sum(weight_i * x_i)` over ALL m slots; a
+        # padding slot has combine weight 0 but x = NaN, and 0 * NaN = NaN, so the NaN
+        # leaks into real tokens' combined output -> garbled decode (finish=length).
+        # Zeroing the padding rows makes 0 * 0 = 0, fixing it. Verified 2026-06-15
+        # (deepep_ll_graph_fp8_20260615_014628): balloon reqs flipped 100% length ->
+        # 100% stop (EOS) across thousands of GLOBAL-LL decode steps.
+        # parity_deepep_ll_remap.sh could not catch this: its padding was finite
+        # garbage, not NaN. Set KUNSERVE_ZERO_PAD=0 to A/B the (broken) original.
+        if os.environ.get("KUNSERVE_ZERO_PAD", "1") != "0":
+            _pad_mask = (
+                torch.arange(down_output.shape[1], device=down_output.device).unsqueeze(0)
+                >= masked_m.unsqueeze(1)
+            )  # [num_groups, m] True on padding rows
+            down_output.masked_fill_(_pad_mask.unsqueeze(-1), 0.0)
 
         # KunServe [MASKED-GEMM] probe: in M2 this masked runner fires ONLY for the
         # GLOBAL LL bundle (LOCAL is StandardDispatcher post-balloon). Comm + remap +
