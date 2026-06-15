@@ -412,17 +412,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
-        # KunServe M2 FIX (GLOBAL-LL garbling root cause): down_output is torch.empty,
-        # so its PADDING rows ([masked_m[g], m) per local expert) are uninitialized ->
-        # NaN. low_latency_combine reduces `sum(weight_i * x_i)` over ALL m slots; a
-        # padding slot has combine weight 0 but x = NaN, and 0 * NaN = NaN, so the NaN
-        # leaks into real tokens' combined output -> garbled decode (finish=length).
-        # Zeroing the padding rows makes 0 * 0 = 0, fixing it. Verified 2026-06-15
-        # (deepep_ll_graph_fp8_20260615_014628): balloon reqs flipped 100% length ->
-        # 100% stop (EOS) across thousands of GLOBAL-LL decode steps.
-        # parity_deepep_ll_remap.sh could not catch this: its padding was finite
-        # garbage, not NaN. Set KUNSERVE_ZERO_PAD=0 to A/B the (broken) original.
-        if os.environ.get("KUNSERVE_ZERO_PAD", "1") != "0":
+        # KunServe NaN-padding hygiene (NOT the garbling fix — see below). down_output
+        # is torch.empty so its PADDING rows ([masked_m[g], m) per local expert) are
+        # NaN. Zeroing them is harmless hygiene, but it does NOT fix the GLOBAL-LL
+        # garbling: 2026-06-15 A/B (deepep_ll_graph_fp8_20260615_023450, ZERO_PAD=1)
+        # still produced 46/47 finish=length. So low_latency_combine does NOT actually
+        # propagate the padding NaN (output is garbled TEXT, not NaN). The real bug is
+        # elsewhere (leading hypothesis: slow fp8 accumulation drift over ~10K decode
+        # steps — short requests finish coherently, long ones garble). Default OFF to
+        # avoid hot-path overhead; KUNSERVE_ZERO_PAD=1 re-enables for experiments.
+        if os.environ.get("KUNSERVE_ZERO_PAD", "0") != "0":
             _pad_mask = (
                 torch.arange(down_output.shape[1], device=down_output.device).unsqueeze(0)
                 >= masked_m.unsqueeze(1)

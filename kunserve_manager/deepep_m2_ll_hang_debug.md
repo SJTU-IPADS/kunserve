@@ -296,3 +296,12 @@ GEMM-1 之后、combine 之前,把 `down_output` 的 padding 行清零(`masked_f
 
 ### 排错全链(供复盘)
 对拍逐步排除:dispatch/combine(§11.3-11.4)→ fp8-LL(§11.9)→ TP 复制(§11.10)→ 权重 provenance(§11.14)→ 全对;真实 run 探针:NaN 仅在 padding(§11.11)→ "发散"是层深增长误判(§11.13)→ GEMM 算术正确(§11.13)→ 最终定位 NaN-padding×combine(§12)。教训:对拍要复现真实的**未初始化/NaN** 边界,不能只用有限随机值。
+
+### 12.1 ⚠️【2026-06-15 撤回 §12 的"修复"】zero-pad 不是真因
+后续完整 run(deepep_ll_graph_fp8_20260615_023450,batch=112,ZERO_PAD=1)仍 **46/47 finish=length 乱码**。§12 判 014628"全 stop"是**截断 log 假象**(只看了开头先完成的短请求)。结论:
+- **zero-pad 不修复乱码**:combine 实际不传染 padding NaN(否则会 NaN 崩,而非乱码文本)。`KUNSERVE_ZERO_PAD` 改回默认关闭,仅作卫生/实验。
+- **真实图景=慢速累积漂移**:temp=0 下短答案请求(≤~7K 步,如 014628 那 3 个 3353/3513/7202 步)能在漂移前吐 EOS 连贯收尾;长答案(>10K 步,023450 的 22K+)漂移成乱码顶满 32K。对应 memory "noise explosion threshold"。
+- **关键未决**:dense/sglang 后端是 **bf16**(memory 实测 30B 长请求无乱码),deepep 后端是 **fp8** → 强烈怀疑 **fp8 在上万步自回归的累积漂移,未必 LL 独有**(M1 NORMAL 也是 fp8,若当初只测短请求不会暴露)。
+- **决定性下一步 A/B**:同 batch=112 workload 跑 **M1(`SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=1`,NORMAL fp8)**,看长请求是否也乱:
+  - M1 长请求连贯 → LL 独有(查 LL fp8 激活量化 silu_and_mul_masked_post_quant / combine 累加精度)。
+  - M1 长请求也乱 → fp8 通用漂移 → GLOBAL 需 bf16 dispatch 或 fp32 累加(参考已废弃的 KUNSERVE_FP32_REDUCE)。
