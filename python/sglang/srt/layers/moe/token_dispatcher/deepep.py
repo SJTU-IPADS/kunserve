@@ -912,12 +912,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
                 _rc = getattr(self, "packed_recv_count", None)
                 _rc_list = _rc.tolist() if _rc is not None else None
+                # D8 inputs: topk_weights row-sum should be ~1 per token; -1 in topk_ids
+                # marks padding. Misaligned/zeroed weights or x/topk mismatch -> garble.
+                _tw = topk_weights.float()
+                _rowsum = _tw.sum(dim=-1)
+                _xin = hidden_states
+                _xnan = bool(torch.isnan(_xin).any().item()) if _xin is not None else None
                 with open(_dbg, "a", encoding="utf-8") as _f:
                     _f.write(
                         f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
                         f"[LL-CMB] ct={_cmbct} combine topk_min={int(topk_ids.min().item())} "
                         f"topk_max={int(topk_ids.max().item())} "
                         f"topk_shape={tuple(topk_ids.shape)} "
+                        f"tw_shape={tuple(topk_weights.shape)} "
+                        f"tw_rowsum_mean={_rowsum.mean().item():.4f} "
+                        f"tw_rowsum_min={_rowsum.min().item():.4f} tw_rowsum_max={_rowsum.max().item():.4f} "
+                        f"tw_min={_tw.min().item():.4f} tw_max={_tw.max().item():.4f} "
+                        f"x_in_shape={tuple(_xin.shape) if _xin is not None else None} x_in_nan={_xnan} "
                         f"num_experts={self.num_experts} "
                         f"packed_recv_count(per_local_expert)={_rc_list}\n"
                     )
@@ -940,6 +951,29 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
+
+        # [LL-CMB-OUT] D8 output: combine result (per-token MoE output) after wait.
+        # If runner down_output was correct ([MASKED-REF2] small) but THIS is garbage
+        # -> the low_latency_combine weighting/alignment/reduce (D8) is the bug.
+        import os as _os
+        _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+        _oct = getattr(type(self), "_kun_ll_cmbout_ct", 0) + 1
+        type(self)._kun_ll_cmbout_ct = _oct
+        if _dbg and _oct <= 20:
+            try:
+                import datetime as _dt
+                _h = hidden_states
+                _f0 = _h.float()
+                with open(_dbg, "a", encoding="utf-8") as _ff:
+                    _ff.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-CMB-OUT] ct={_oct} out_shape={tuple(_h.shape)} "
+                        f"out_mean_abs={_f0.abs().mean().item():.4f} out_max_abs={_f0.abs().max().item():.3f} "
+                        f"out_nan={bool(torch.isnan(_h).any().item())} "
+                        f"row0[:4]={_f0.reshape(-1, _h.shape[-1])[0,:4].tolist()}\n"
+                    )
+            except Exception:
+                pass
 
         return hidden_states
 

@@ -275,6 +275,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # confirmed garbling mechanism). Uses runner_input.hidden_states_scale (the
         # ORIGINAL logical scale, before the line-254 TMA reorder). KUNSERVE_MASKED_REF
         # gated, ct<=2.
+        self._kun_ref_down = None   # reset each call (compared after GEMM-1 below)
         try:
             import os as _os
             if _os.environ.get("KUNSERVE_DETAIL_LOG") and getattr(type(self), "_kun_mg_ct", 0) < 2:
@@ -306,7 +307,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                             f"act_mean_abs={_act.float().abs().mean().item():.4f} "
                             f"ref[:4]={_ref[:4].float().tolist()} act[:4]={_act[:4].float().tolist()}\n"
                         )
+                # D5+D6 full bf16 reference for (g, t=0): gateup -> silu_and_mul ->
+                # @ w2. Stash; compared against the kernel's down_output (after GEMM-1)
+                # in the [MASKED-GEMM] block below. Localizes whether the LL-only
+                # silu_and_mul_masked_post_quant_fwd (D5) or masked GEMM-1 (D6) diverges.
+                import torch.nn.functional as _F
+                _hx0 = (hidden_states[_g, 0].float().view(_bk, 128)
+                        * _hsc0[_g, 0].float().view(_bk, 1)).view(_k)
+                _gateup0 = _hx0 @ _w.t()                       # [1536] bf16-ish (float)
+                _half = _nw // 2                               # 768
+                _din0 = _F.silu(_gateup0[:_half]) * _gateup0[_half:]   # [768] D5 ref
+                _nw2 = w2_weight.shape[1]                      # 2048
+                _bk2 = _half // 128                            # 6
+                _bn2 = _nw2 // 128                             # 16
+                _w2 = (w2_weight[_g].float().view(_bn2, 128, _bk2, 128)
+                       * w2_scale[_g].float().view(_bn2, 1, _bk2, 1)).view(_nw2, _half)
+                self._kun_ref_down = (_din0 @ _w2.t())         # [2048] D6 ref
+                self._kun_ref_din = _din0                      # [768] D5 ref (bf16 silu·mul)
+                self._kun_ref_g = _g
         except Exception as _e:
+            self._kun_ref_down = None
             try:
                 import os as _os2
                 with open(_os2.environ.get("KUNSERVE_DETAIL_LOG","/dev/null"), "a", encoding="utf-8") as _f:
@@ -371,6 +391,40 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 _kun_gateup_valid_nan = bool(torch.isnan(_gv).any().item()) if _gv.numel() else False
         except Exception:
             _kun_gateup_valid_nan = None
+
+        # [MASKED-REF-DIN] D5 isolation: dequant the kernel's down_input (fp8 output of
+        # silu_and_mul_masked_post_quant_fwd) at (g,t=0) and diff vs the bf16 reference
+        # silu(gateup_ref[:768])*gateup_ref[768:] stashed in [MASKED-REF]. Done BEFORE
+        # the line-~400 scale TMA reorder so down_input_scale is logical. If this
+        # diverges -> D5 (LL-only act quant) is the bug; if it matches but down_output
+        # diverges -> D6 (masked GEMM-1).
+        try:
+            _rdin = getattr(self, "_kun_ref_din", None)
+            if _rdin is not None and os.environ.get("KUNSERVE_DETAIL_LOG"):
+                import datetime as _dt
+                _g2 = self._kun_ref_g
+                _half = down_input.shape[2]                 # 768
+                _bkd = _half // 128                          # 6
+                # logical index [g,0]; log scale shape so a column-major mismatch is visible
+                _din_dq = (down_input[_g2, 0].float().view(_bkd, 128)
+                           * down_input_scale[_g2, 0].float().view(_bkd, 1)).view(_half)
+                _dd5 = (_rdin.float() - _din_dq).abs()
+                with open(os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _f:
+                    _f.write(
+                        f"[{_dt.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
+                        f"[MASKED-REF-DIN] g={_g2} t=0 din_shape={tuple(down_input.shape)} "
+                        f"din_scale_shape={tuple(down_input_scale.shape)} "
+                        f"din_max_abs_diff={_dd5.max().item():.4f} din_mean_abs_diff={_dd5.mean().item():.5f} "
+                        f"ref_mean_abs={_rdin.float().abs().mean().item():.4f} "
+                        f"act_mean_abs={_din_dq.abs().mean().item():.4f} "
+                        f"ref[:4]={_rdin[:4].float().tolist()} act[:4]={_din_dq[:4].tolist()}\n"
+                    )
+        except Exception as _e:
+            try:
+                with open(os.environ.get("KUNSERVE_DETAIL_LOG", "/dev/null"), "a", encoding="utf-8") as _f:
+                    _f.write(f"[KUNSERVE-DBG] [MASKED-REF-DIN] ERROR: {_e!r}\n")
+            except Exception:
+                pass
         del gateup_output
 
         # GroupGemm-1
@@ -464,6 +518,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                             f"down_valid_nan={_dnan_valid} down_valid_mean_abs={_dmean_valid:.4f} "
                             f"down_all_nan={_dnan_all} expected_m={expected_m}\n"
                         )
+                    # D5+D6 check: compare kernel down_output[g,t=0] vs the bf16
+                    # reference (gateup->silu_and_mul->@w2) stashed in [MASKED-REF].
+                    # gemm0 (D4) already matches; if THIS diverges, the LL-only act
+                    # quant (silu_and_mul_masked_post_quant, D5) or masked GEMM-1 (D6)
+                    # is the garbling source. If it matches too, bug is in D8 combine.
+                    _rd = getattr(self, "_kun_ref_down", None)
+                    if _rd is not None:
+                        _rg = self._kun_ref_g
+                        _ad = down_output[_rg, 0].float()
+                        _dd = (_rd.float() - _ad).abs()
+                        with open(_dbg, "a", encoding="utf-8") as _f:
+                            _f.write(
+                                f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                                f"[MASKED-REF2] g={_rg} t=0 down_max_abs_diff={_dd.max().item():.4f} "
+                                f"down_mean_abs_diff={_dd.mean().item():.5f} "
+                                f"ref_mean_abs={_rd.float().abs().mean().item():.4f} "
+                                f"act_mean_abs={_ad.abs().mean().item():.4f} "
+                                f"ref[:4]={_rd[:4].float().tolist()} act[:4]={_ad[:4].tolist()}\n"
+                            )
         except Exception:
             pass
 
