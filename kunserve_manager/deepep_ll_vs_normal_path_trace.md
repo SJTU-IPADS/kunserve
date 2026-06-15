@@ -141,3 +141,26 @@ diff(ref_down[valid], down_output[valid])   # 若大 → D5/D6 是真凶(LL mask
 | `[LL-CMB-OUT]` | deepep.py | **D8** combine 输出 | 前面都小但 out 乱 → **combine 内部(权重乘/reduce/对齐)错** |
 
 定位逻辑(从前往后第一个"diff 大"即真凶):D4→D5→D6→D8。全小则问题在 runner/combine 之外(残差、attention、采样)。
+
+---
+
+## 5. 【2026-06-15 重大转向】乱码 = retract + re-prefill 触发,不是稳态 MoE 数值
+
+排查结论(基于完整 run "kunserve copy"):
+- **纯 LOCAL 请求连贯**(balloon=0 → finish=stop);乱码 100% 在 balloon 请求。
+- **乱码与 retract+re-prefill 完美相关**:length(乱码)请求 avg_retract_ms=736s、prefill_count=1.53;stop/abort(连贯)请求 retract=0、prefill=1。
+- **D4–D8 全部数值正确**——但这是因为 GEMM 对拍**用 kernel 自己的输入算 ref**,"垃圾进垃圾出"也匹配,所以**测不出上游/映射/累积损坏**。
+- **eager 回退问题已澄清**:`forward_select` 日志显示**所有** forward 都 `can_run=False, replay_enabled=False`(GLOBAL 图从没捕,captured_variants=['local'] 但 balloon 都是 variant=global)→ **全程 eager**,包括 22 个 `mode=1`(EXTEND/re-prefill,input_tokens≈12012)。`force_eager` 标志虽恒 False,但 eager 已由 can_run=False 达成。**所以"在 prefill 上重放图"不存在,graph/eager 排除。**
+- **真凶定位**:retract→re-prefill 在 **balloon GLOBAL 态**的正确性(疑:扩展 KV 池 slot,或 GLOBAL collective 处理"一副本 re-prefill 12012 token、另一副本 decode/idle"的非对称 forward)。
+
+### 新探针(下次跑全在 KUNSERVE_DETAIL_LOG)
+| 探针 | 文件 | 作用 |
+|------|------|------|
+| `[RETRACT]` | scheduler.py | retract_decode 触发:n、rid+已生成长度、kv_full |
+| `[RESUME-PREFILL]` | scheduler.py | prefill batch 含被 retract 过的请求:rid、outlen、retract 次数 |
+| `[MOE-IO]` | qwen3_moe.py | layer0 MoE 输入/输出范数,**必记 re-prefill(n_tok>500)+ 其后 5 步 + 1/20 采样** |
+
+### 判读(下次跑)
+按时间戳排 [RETRACT]→[RESUME-PREFILL]→[MOE-IO]:
+- 若某请求 re-prefill(MOE-IO n_tok 大)**之后**的 decode `in_abs_mean` 突然爆炸 → **实锤 re-prefill 损坏状态**(去查 balloon KV slot / 非对称 forward)。
+- 若范数平滑、无跳变 → 回到累积假设。

@@ -2840,6 +2840,26 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+        # [RESUME-PREFILL] mark when this prefill batch is re-prefilling RETRACTED
+        # requests (the suspected garbling trigger). Pairs with [RETRACT] by rid.
+        try:
+            import os as _os, datetime as _dt
+            _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+            if _dbg:
+                _res = [
+                    (getattr(r, "rid", "?")[:8], len(r.output_ids), int(getattr(r, "retraction_count", 0)))
+                    for r in can_run_list
+                    if bool(getattr(r, "retracted_stain", False)) or int(getattr(r, "retraction_count", 0)) > 0
+                ]
+                if _res:
+                    with open(_dbg, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                            f"[RESUME-PREFILL] n_resumed={len(_res)} n_total={len(can_run_list)} "
+                            f"reqs(rid,outlen,retractcnt)={_res[:8]}\n"
+                        )
+        except Exception:
+            pass
         kunserve_timing_log(
             "scheduler_prefill_scheduled",
             new_reqs=len(can_run_list),
@@ -2977,6 +2997,24 @@ class Scheduler(
                 max_total=int(self.max_total_num_tokens),
                 kv_full=bool(kv_full_retract_flag),
             )
+
+            # [RETRACT] KunServe detail-log marker (same file as [MOE-IO]/[MASKED-*])
+            # so we can correlate a retract event with the subsequent re-prefill and
+            # any garbling onset (suspected: re-prefill in balloon GLOBAL corrupts).
+            try:
+                import os as _os, datetime as _dt
+                _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
+                if _dbg and len(retracted_reqs) > 0:
+                    _rids = [(getattr(r, "rid", "?")[:8], len(r.output_ids)) for r in retracted_reqs[:8]]
+                    with open(_dbg, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                            f"[RETRACT] n={len(retracted_reqs)} running_after={batch.batch_size()} "
+                            f"waiting={len(self.waiting_queue)} kv_full={bool(kv_full_retract_flag)} "
+                            f"gained={int(new_token_gained)} reqs(rid,outlen)={_rids}\n"
+                        )
+            except Exception:
+                pass
 
             self.num_retracted_reqs = len(retracted_reqs)
             if self.enable_metrics and len(retracted_reqs) > 0:

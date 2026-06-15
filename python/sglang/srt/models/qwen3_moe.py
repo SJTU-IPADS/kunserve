@@ -383,7 +383,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if _moe_io and hidden_states.shape[0] > 0:
             _c = getattr(type(self), "_kun_moe_io_ct", 0) + 1
             type(self)._kun_moe_io_ct = _c
-            if _c % 50 == 1:  # sample 1/50 to cover the whole run cheaply
+            # always log re-prefill (n_tok large) so retract→re-prefill is never
+            # missed; sample 1/20 of decodes to keep the whole-run timeline dense.
+            _is_prefill = hidden_states.shape[0] > 500
+            if _c % 20 == 1 or _is_prefill or getattr(type(self), "_kun_moe_io_after", 0) > 0:
+                # log the 5 forwards right after any re-prefill to catch garbling onset
+                if _is_prefill:
+                    type(self)._kun_moe_io_after = 6
+                else:
+                    type(self)._kun_moe_io_after = max(0, getattr(type(self), "_kun_moe_io_after", 0) - 1)
                 _f = hidden_states.float()
                 _moe_in_stat = (_c, _f.abs().mean().item(), _f.abs().max().item(),
                                 bool(torch.isnan(_f).any().item()), _f.shape[0])
