@@ -268,3 +268,12 @@ rank3: max_abs_diff=0.4833 mean=0.116 ref_mean=66.5 PASS
 - **in-situ ref 的盲区**:它用 kernel 自己的 `w13[g]` 同时算 ref 和 act,只验证"算得对",**无法验证 `w13[g]` 是否正确专家的权重(provenance)**。这是非连续 balloon 布局最易错处(layer.py:548 注释疑 replica1 读错半区)。
 - **下一步 = 权重 provenance**:`KUNSERVE_WEIGHT_PROBE`(已设进 smoke 默认 + constants_ppo 透传)。`build_dense_expert_runtime_tensors` 打每 rank 的 `start`/`length`/`sl_abs_sum`(所用行校验和)/`alt_abs_sum`(另一半)。判读:某 rank 的 `sl_abs_sum`==另一 rank 的、或==自己 `alt_abs_sum` → 读错半区 = 应用错专家。
 - 探针扩展:[MASKED-REF] 现同时测 t=0 与 t=last(masked_m[g]-1),查 packed buffer 的 token 索引/scale 错位。
+
+### 11.14 【2026-06-14 log 160340】权重 provenance 正确(用 ep_rank 重判) → 锁定 NaN-padding 经 combine 传染
+- **pid→rank(ep_rank 实证)**:1806552=rank0(phys0-31), 1807880=rank1(phys64-95), 1806557=rank2(phys32-63), 1807881=rank3(phys96-127)。**replica 分组是 ep 奇偶(0,1)/(2,3),pid 是交错的**(之前按 pid 前缀分组判错了)。
+- **权重 provenance 全对**:ranks0/1 留 VMM 前缀(start=0)、ranks2/3 留后缀(start=32),逐一对应各自拥有的物理专家(build_complementary:replica0 留前缀、replica1 留后缀)。跨 rank 校验和相同 = 两 replica 是同模型副本、同物理专家权重当然相同。**weight bug 排除**。
+- 至此 dispatch/combine(对拍)、GEMM 算术(MASKED-REF)、provenance、层增长 全部验证正确,但仍乱(本 run 105 length)。
+- **对拍盲区 = NaN padding**:真实 `down_output=torch.empty` → padding 行 NaN(`down_all_nan=True`,`down_valid_nan=False`)。对拍的 padding 是有限垃圾(非 NaN),故无法发现 **low_latency_combine 若触碰 padding 行 → NaN 传染真实 token → 乱码**。这是 LL 特有、对拍未覆盖、且能解释乱码的唯一剩余点。
+- **A/B 修复实验 `KUNSERVE_ZERO_PAD=1`**(已设进 smoke 默认 + 透传):combine 前把 down_output padding 行清零。
+  - 乱码消失(finish=length→stop) → **实锤:NaN-padding 经 combine 传染**,正式修复=zero/mask masked-GEMM 输出 padding。
+  - 仍乱 → combine 正确忽略 padding,NaN 无害,bug 在别处(回头查 combine 的 topk_weights 应用 / 残差加法)。

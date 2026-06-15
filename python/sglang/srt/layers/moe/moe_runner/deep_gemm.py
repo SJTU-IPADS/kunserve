@@ -411,6 +411,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
+        # KunServe A/B FIX EXPERIMENT (KUNSERVE_ZERO_PAD=1): down_output is torch.empty
+        # so its PADDING rows ([masked_m[g], m) per group) are uninitialized -> NaN
+        # (confirmed: down_all_nan=True while down_valid_nan=False). parity_deepep_ll
+        # could NOT catch NaN-padding propagation through low_latency_combine because
+        # its padding was finite garbage, not NaN. If combine touches any padding row,
+        # NaN leaks into real tokens -> garbling. Zero the padding rows and see if the
+        # GLOBAL-LL garbling disappears (finish=length -> finish=stop). If it fixes,
+        # the real fix is to zero/mask the masked-GEMM output padding.
+        try:
+            import os as _os
+            if _os.environ.get("KUNSERVE_ZERO_PAD") == "1":
+                _vmask = (torch.arange(down_output.shape[1], device=down_output.device).unsqueeze(0)
+                          < masked_m.unsqueeze(1))
+                down_output = torch.where(_vmask.unsqueeze(-1), down_output,
+                                          torch.zeros((), dtype=down_output.dtype, device=down_output.device))
+        except Exception:
+            pass
+
         # KunServe [MASKED-GEMM] probe: in M2 this masked runner fires ONLY for the
         # GLOBAL LL bundle (LOCAL is StandardDispatcher post-balloon). Comm + remap +
         # fp8-dispatch + TP are all exonerated by parity_deepep_ll_remap.sh, so the
