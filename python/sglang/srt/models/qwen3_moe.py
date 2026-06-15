@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -371,6 +372,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        # [MOE-IO] compounding-drift tracker: log layer-0 MoE INPUT/OUTPUT magnitude
+        # across the WHOLE run (uncapped, sampled). The per-forward GEMM parity is
+        # input-faithful (garbage-in-garbage-out matches), so it cannot see a slow
+        # autoregressive drift; this does. If layer-0 input abs-mean grows steadily
+        # over decode steps -> the residual stream is blowing up (compounding) and we
+        # can see WHEN it crosses into garbage. KUNSERVE_DETAIL_LOG-gated.
+        _moe_io = bool(os.environ.get("KUNSERVE_DETAIL_LOG")) and int(getattr(self, "layer_id", -1)) == 0
+        _moe_in_stat = None
+        if _moe_io and hidden_states.shape[0] > 0:
+            _c = getattr(type(self), "_kun_moe_io_ct", 0) + 1
+            type(self)._kun_moe_io_ct = _c
+            if _c % 50 == 1:  # sample 1/50 to cover the whole run cheaply
+                _f = hidden_states.float()
+                _moe_in_stat = (_c, _f.abs().mean().item(), _f.abs().max().item(),
+                                bool(torch.isnan(_f).any().item()), _f.shape[0])
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -388,6 +404,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if _moe_in_stat is not None:
+            try:
+                import datetime as _dt
+                _of = final_hidden_states.float()
+                with open(os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _fp:
+                    _fp.write(
+                        f"[{_dt.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
+                        f"[MOE-IO] L0 ct={_moe_in_stat[0]} n_tok={_moe_in_stat[4]} "
+                        f"in_abs_mean={_moe_in_stat[1]:.4f} in_abs_max={_moe_in_stat[2]:.2f} in_nan={_moe_in_stat[3]} "
+                        f"out_abs_mean={_of.abs().mean().item():.4f} out_abs_max={_of.abs().max().item():.2f} "
+                        f"out_nan={bool(torch.isnan(_of).any().item())}\n"
+                    )
+            except Exception:
+                pass
         return final_hidden_states
 
     def op_gate(self, state):
