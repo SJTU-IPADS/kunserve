@@ -109,3 +109,17 @@ deep_ep 文档明确警告：`low_latency_dispatch`/`low_latency_combine` **只�
 **决定性测试(最便宜,先做)= 方案 B**:`KUNSERVE_DEEPEP_RETURN_RECV_HOOK=1` 重跑 M2(→ `async_finish=False`,逐 LL 调用同步,和 parity 一致)。
 - **乱码消失** → **H2 实锤**(async/buffer 复用)。临时修法:强同步(慢但对);正解:保证 combine 读完前 buffer 不被复用 / 用 `get_next_low_latency_combine_buffer` 双缓冲。
 - **仍乱** → 排除 H2;回到"真实 run 比同步 parity 还多的东西"(SGLang dispatcher a/b split 的 self.handle / packed_recv_count 状态跨层复用)。
+
+## 10. 【2026-06-16】H2(async)排除 → 上方案 A(marker)
+
+`KUNSERVE_DEEPEP_RETURN_RECV_HOOK=1`(→`async_finish=False`,逐 LL 调用同步,与 PASS 的 parity 一致)重跑 M2:仍 **76 length 乱码**(BALLOON {stop:3, length:76})。recv_wait 确认走 hook(`return_recv_hook=True`)。→ **H2(async/2-buffer 复用)排除**:同步照样乱,bug 是确定性的、与时序无关。
+
+至此:H0(拓扑)✗、H2(async)✗;parity 同步+num_max128+padding+fp8+TP 全 PASS,真实同步仍乱。差异只剩 **48 层序列 + 真实 masked GEMM + 真实数据 + SGLang dispatcher 包装**。
+
+**已实现方案 A(marker 注入,`KUNSERVE_MARKER=1`,诊断 run 会破坏生成)**:
+- `combine_a`(deepep.py):把 combine 输入每个 local group g 全写成 global dispatch_id = `ep_rank*num_local+g`,并存 topk_ids/topk_weights。
+- `combine_b`:验证 `out[t][0] == Σ_{topk_ids[t,k]>=0} topk_weights[t,k]*topk_ids[t,k]`,打 `[LL-MARKER]`(map_max_abs_diff / n_bad / worst token 的 predict vs actual + topk）。
+- 透传已加 `KUNSERVE_MARKER`。
+判读:
+- **map_max_abs_diff 大 / n_bad>0** → **H1 实锤**:真实 run 里 combine 把 token 映射错了(worst token 的 actual 反推出它实际拿到的是哪些 expert → 错位规律)。
+- **map_max_abs_diff≈0** → combine 映射在真实 run 也对 → bug 只能在"真实 masked GEMM 的 per-token 输出"或"48 层 dispatcher 状态(self.handle/packed_recv_count)跨层错配",转查那条。

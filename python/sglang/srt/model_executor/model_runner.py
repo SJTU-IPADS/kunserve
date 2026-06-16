@@ -770,7 +770,58 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get()
             and not envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
         ):
-            self._force_local_bundle_to_standard_dispatcher()
+            # KUNSERVE_LOCAL_NORMAL (default 1): force LOCAL to DeepEP **NORMAL**
+            # mode (deep_gemm contiguous, the M1-correct LOCAL path) instead of the
+            # StandardDispatcher+Triton path. The Standard+Triton override is known to
+            # produce ~25% degenerate/garbled outputs (see comment above + the
+            # 2026-06-16 isolation: deepep_normal smoke = correct, LL smoke forced
+            # Standard+Triton = 8/8 garbled, both no-balloon/fp8). DeepEP-NORMAL skips
+            # NVSHMEM init (buffer.py:96 gate) so it does NOT double-init with the
+            # GLOBAL LL bundle, yet computes correctly. Set =0 to revert to the
+            # (broken) Standard+Triton override for A/B.
+            if os.environ.get("KUNSERVE_LOCAL_NORMAL", "1") != "0":
+                self._force_local_bundle_to_deepep_normal()
+            else:
+                self._force_local_bundle_to_standard_dispatcher()
+
+    def _force_local_bundle_to_deepep_normal(self) -> None:
+        """Force each LOCAL DeepEP dispatcher to NORMAL mode (no NVSHMEM).
+
+        The LOCAL bundle's MaybeTboDeepEPDispatcher was built with deepep_mode=AUTO,
+        so it already has a `_normal_dispatcher` (NORMAL uses buffer.dispatch over the
+        local TP group, which skips NVSHMEM). Flipping each inner DeepEPDispatcher's
+        deepep_mode to NORMAL makes `_get_impl()` always return that normal path:
+          - decode no longer routes to the LL (low_latency) path → no NVSHMEM init on
+            the LOCAL group → no double-init clash with the GLOBAL LL bundle;
+          - keeps the original deep_gemm runner (contiguous GEMM) — the exact LOCAL
+            path that the GLOBAL_DEEPEP_NORMAL=1 (M1) config runs CORRECTLY.
+        This replaces the StandardDispatcher+Triton override, which produced garbled
+        output (see gate comment above).
+        """
+        if self.is_draft_worker:
+            return
+        from sglang.srt.layers.moe.utils import DeepEPMode
+
+        layers = self._iter_fused_moe_layers()
+        if not layers:
+            return
+        n_inner = 0
+        for layer in layers:
+            disp = getattr(layer.local_bundle, "dispatcher", None)
+            inners = getattr(disp, "_inners", None)
+            if inners is None:
+                inners = [disp] if disp is not None else []
+            for inner in inners:
+                if hasattr(inner, "deepep_mode"):
+                    inner.deepep_mode = DeepEPMode.NORMAL
+                    n_inner += 1
+        _kunserve_ms(
+            "[KUNSERVE-MS] forced LOCAL DeepEP dispatcher to NORMAL mode "
+            "(deep_gemm contiguous, no NVSHMEM) on %d inner dispatchers across "
+            "%d FusedMoE layers; avoids the broken Standard+Triton override.",
+            n_inner,
+            len(layers),
+        )
 
     def _force_local_bundle_to_standard_dispatcher(self) -> None:
         """Replace each FusedMoE layer's LOCAL bundle with a StandardDispatcher.

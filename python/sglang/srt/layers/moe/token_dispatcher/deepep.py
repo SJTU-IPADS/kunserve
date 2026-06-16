@@ -935,6 +935,25 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             except Exception:
                 pass
 
+        # [LL-MARKER] 方案 A: 诊断 run（KUNSERVE_MARKER=1，会破坏本次生成）。把 combine
+        # 输入每个 local group g 全写成它的 global dispatch_id = ep_rank*num_local + g，
+        # 那么 combine 正确时 out[t][c] == Σ_{topk_ids[t,k]>=0} topk_weights[t,k]*topk_ids[t,k]。
+        # 在 combine_b 验证。若不符 = combine 把 token 映射到了错的 (expert,slot) → 实锤 H1。
+        # 这是唯一绕开 input-faithful + 保范数盲点的检查（marker 受控、可逐 token 验算）。
+        self._kun_marker = None
+        try:
+            import os as _os2
+            if _os2.environ.get("KUNSERVE_MARKER") == "1" and getattr(type(self), "_kun_mk_ct", 0) < 8:
+                type(self)._kun_mk_ct = getattr(type(self), "_kun_mk_ct", 0) + 1
+                _nl = hidden_states.shape[0]
+                _myrank = self.group.rank()
+                _gids = (torch.arange(_nl, device=hidden_states.device, dtype=torch.float32)
+                         + float(_myrank * _nl)).view(_nl, 1, 1)
+                hidden_states[:] = _gids.to(hidden_states.dtype)   # 覆盖 combine 输入为 marker
+                self._kun_marker = (topk_ids.detach().clone(), topk_weights.detach().clone())
+        except Exception:
+            self._kun_marker = None
+
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
@@ -974,6 +993,35 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     )
             except Exception:
                 pass
+
+        # [LL-MARKER] 验证 combine 的 token 映射（配对 combine_a 注入的 marker）。
+        _mk = getattr(self, "_kun_marker", None)
+        if _mk is not None:
+            self._kun_marker = None
+            try:
+                import datetime as _dt
+                _tids, _tws = _mk                       # dispatch ids + weights, [n_tok, topk]
+                _valid = (_tids >= 0).float()
+                # 正确时 out[t][c] = Σ_k w[t,k] * dispatch_id_k（marker = dispatch_id）
+                _predict = (_valid * _tws.float() * _tids.float().clamp(min=0)).sum(-1)  # [n_tok]
+                _actual = hidden_states.float().reshape(_predict.shape[0], -1)[:, 0]      # out[t][0]
+                _d = (_predict - _actual).abs()
+                _bad = int((_d > 0.5).sum().item())
+                _wt = int(_d.argmax().item())
+                with open(_dbg or "/dev/null", "a", encoding="utf-8") as _ff:
+                    _ff.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[LL-MARKER] n_tok={_predict.shape[0]} map_max_abs_diff={_d.max().item():.3f} "
+                        f"map_mean_abs_diff={_d.mean().item():.4f} n_bad(>0.5)={_bad} "
+                        f"worst_t={_wt} predict={_predict[_wt].item():.3f} actual={_actual[_wt].item():.3f} "
+                        f"worst_topk_ids={_tids[_wt].tolist()} worst_w={[round(x,3) for x in _tws[_wt].tolist()]}\n"
+                    )
+            except Exception as _e:
+                try:
+                    with open(_os.environ.get("KUNSERVE_DETAIL_LOG", "/dev/null"), "a", encoding="utf-8") as _ff:
+                        _ff.write(f"[KUNSERVE-DBG] [LL-MARKER] ERROR: {_e!r}\n")
+                except Exception:
+                    pass
 
         return hidden_states
 
