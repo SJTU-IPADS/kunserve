@@ -282,6 +282,15 @@ def _kun_wd(message: str) -> None:
         pass
 
 
+def _kunserve_local_forward_probe_enabled() -> bool:
+    return os.environ.get("KUNSERVE_LOCAL_FORWARD_PROBE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 _BATCH_TIMING_LOG = os.environ.get("SGLANG_BATCH_TIMING_LOG", "").strip()
 _REPLICA_RANK = os.environ.get("SGLANG_REPLICA_RANK", "")
 _REQ_LIFECYCLE_LOG = os.environ.get("SGLANG_REQ_LIFECYCLE_LOG", "").strip()
@@ -841,6 +850,8 @@ class Scheduler(
         self._kunserve_prefill_blocked_full_log_ct: int = 0
         self._kunserve_graph_prefill_defer_log_ct: int = 0
         self._kunserve_phase_e_prefill_defer_log_ct: int = 0
+        self._kunserve_balloon_prefill_mem_defer_log_ct: int = 0
+        self._kunserve_balloon_prefill_budget_log_ct: int = 0
         # Phase E negotiation is a lockstep collective.  A rank cannot safely
         # decide to negotiate only because its own local batch changed; peers
         # that reuse a cached decision would deadlock.  The cache therefore
@@ -2687,6 +2698,9 @@ class Scheduler(
             )
             return None
 
+        if self._kunserve_should_defer_prefill_for_balloon_memory():
+            return None
+
         if (
             self.chunked_req is None
             and self._kunserve_should_defer_prefill_for_global_graph()
@@ -2796,6 +2810,11 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        max_prefill_tokens, chunked_prefill_size = (
+            self._kunserve_effective_prefill_budget_for_balloon(
+                self.max_prefill_tokens, chunked_prefill_size
+            )
+        )
 
         # Prefill policy
         adder = PrefillAdder(
@@ -2804,7 +2823,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -2894,6 +2913,11 @@ class Scheduler(
             running=len(self.running_batch.reqs),
             waiting_before=len(self.waiting_queue),
             chunked_req=self.chunked_req is not None,
+            log_input_tokens=int(adder.log_input_tokens),
+            max_prefill_tokens=int(max_prefill_tokens),
+            chunked_prefill_size=(
+                int(chunked_prefill_size) if chunked_prefill_size is not None else None
+            ),
         )
         self._kunserve_prefill_blocked_full_log_ct = 0
         self._kunserve_graph_prefill_defer_log_ct = 0
@@ -3153,6 +3177,20 @@ class Scheduler(
             "gap_ms": round(gap_ms, 3),
         }
         kunserve_timing_log("scheduler_run_batch_begin", **run_timing_fields)
+        local_forward_probe = _kunserve_local_forward_probe_enabled()
+        if local_forward_probe:
+            _kun_wd(
+                "[KUNSERVE-LOCAL] scheduler_run_batch_begin fwd_ct=%d mode=%s "
+                "bs=%d running=%d waiting=%d gap_ms=%.3f"
+                % (
+                    int(self.forward_ct),
+                    batch.forward_mode,
+                    int(batch.batch_size()),
+                    len(self.running_batch.reqs),
+                    len(self.waiting_queue),
+                    float(gap_ms),
+                )
+            )
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -3234,12 +3272,32 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                if local_forward_probe:
+                    _kun_wd(
+                        "[KUNSERVE-LOCAL] scheduler_forward_enter fwd_ct=%d mode=%s bs=%d"
+                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
+                    )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
+                if local_forward_probe:
+                    _kun_wd(
+                        "[KUNSERVE-LOCAL] scheduler_forward_exit fwd_ct=%d mode=%s bs=%d"
+                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                if local_forward_probe:
+                    _kun_wd(
+                        "[KUNSERVE-LOCAL] scheduler_update_cache_enter fwd_ct=%d mode=%s bs=%d"
+                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
+                    )
                 self.update_cache_from_scheduler(batch, batch_result)
+                if local_forward_probe:
+                    _kun_wd(
+                        "[KUNSERVE-LOCAL] scheduler_update_cache_exit fwd_ct=%d mode=%s bs=%d"
+                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
+                    )
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -3872,6 +3930,163 @@ class Scheduler(
                 return False
         return True
 
+    def _kunserve_balloon_global_runtime_active(self) -> bool:
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return False
+        if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
+            return False
+        try:
+            variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
+            runtime_variant = str(variant_getter())
+        except Exception:
+            runtime_variant = str(
+                getattr(model_runner, "_balloon_runtime_variant", "local")
+            )
+        return runtime_variant == "global"
+
+    def _kunserve_align_prefill_budget(self, value: int) -> int:
+        value = max(int(value), int(self.page_size))
+        return max(int(self.page_size), (value // int(self.page_size)) * int(self.page_size))
+
+    def _kunserve_effective_prefill_budget_for_balloon(
+        self,
+        max_prefill_tokens: int,
+        chunked_prefill_size: Optional[int],
+    ) -> Tuple[int, Optional[int]]:
+        """Limit eager EXTEND token count after GLOBAL balloon.
+
+        Decode replay is graph-captured, but a waiting/retracted request still
+        enters as EXTEND and therefore runs eager.  Under GLOBAL dispatch that
+        eager step pads/gathers by token count across replicas, so a very large
+        re-prefill can allocate hundreds of MiB of temporary MoE/dispatch
+        buffers while graph private pools and the expanded KV pool are resident.
+        Keep the cap local to balloon/global so baseline and local KunServe
+        startup prefill keep the configured large prefill budget.
+        """
+        if not self._kunserve_balloon_global_runtime_active():
+            return int(max_prefill_tokens), chunked_prefill_size
+
+        max_cap = get_int_env_var("KUNSERVE_BALLOON_MAX_PREFILL_TOKENS", 8192)
+        chunk_cap = get_int_env_var(
+            "KUNSERVE_BALLOON_CHUNKED_PREFILL_SIZE",
+            max_cap if max_cap > 0 else 8192,
+        )
+
+        effective_max = int(max_prefill_tokens)
+        if max_cap > 0:
+            effective_max = min(
+                effective_max, self._kunserve_align_prefill_budget(max_cap)
+            )
+
+        effective_chunk = chunked_prefill_size
+        if chunk_cap > 0:
+            aligned_chunk = self._kunserve_align_prefill_budget(chunk_cap)
+            effective_chunk = (
+                aligned_chunk
+                if effective_chunk is None
+                else min(int(effective_chunk), aligned_chunk)
+            )
+
+        changed = (
+            int(effective_max) != int(max_prefill_tokens)
+            or effective_chunk != chunked_prefill_size
+        )
+        if changed:
+            self._kunserve_balloon_prefill_budget_log_ct += 1
+            log_ct = self._kunserve_balloon_prefill_budget_log_ct
+            if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] balloon prefill budget cap: count=%d "
+                    "max_prefill=%d->%d chunk=%s->%s running=%d waiting=%d",
+                    log_ct,
+                    int(max_prefill_tokens),
+                    int(effective_max),
+                    str(chunked_prefill_size),
+                    str(effective_chunk),
+                    len(self.running_batch.reqs),
+                    len(self.waiting_queue),
+                )
+            kunserve_timing_log(
+                "scheduler_balloon_prefill_budget_cap",
+                count=int(log_ct),
+                max_prefill_tokens=int(max_prefill_tokens),
+                effective_max_prefill_tokens=int(effective_max),
+                chunked_prefill_size=(
+                    int(chunked_prefill_size)
+                    if chunked_prefill_size is not None
+                    else None
+                ),
+                effective_chunked_prefill_size=(
+                    int(effective_chunk) if effective_chunk is not None else None
+                ),
+                running=len(self.running_batch.reqs),
+                waiting=len(self.waiting_queue),
+            )
+
+        return int(effective_max), effective_chunk
+
+    def _kunserve_should_defer_prefill_for_balloon_memory(self) -> bool:
+        if not self._kunserve_balloon_global_runtime_active():
+            return False
+        if len(self.waiting_queue) == 0 and self.chunked_req is None:
+            return False
+        running_batch = getattr(self, "running_batch", None)
+        if running_batch is None or running_batch.is_empty():
+            return False
+
+        try:
+            min_free_gb = float(
+                os.environ.get("KUNSERVE_BALLOON_PREFILL_MIN_FREE_GB", "1.0")
+            )
+        except Exception:
+            min_free_gb = 1.0
+        if min_free_gb <= 0:
+            return False
+
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        except Exception:
+            return False
+        min_free_bytes = int(min_free_gb * (1024**3))
+        if int(free_bytes) >= min_free_bytes:
+            self._kunserve_balloon_prefill_mem_defer_log_ct = 0
+            return False
+
+        self._kunserve_balloon_prefill_mem_defer_log_ct += 1
+        log_ct = self._kunserve_balloon_prefill_mem_defer_log_ct
+        try:
+            available_tokens = self.token_to_kv_pool_allocator.available_size()
+        except Exception:
+            available_tokens = -1
+        if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
+            _kunserve_ms(
+                "[KUNSERVE-MS] defer balloon prefill for cuda headroom: "
+                "count=%d free_gb=%.3f threshold_gb=%.3f running=%d waiting=%d "
+                "chunked=%s available_tokens=%d max_total=%d",
+                log_ct,
+                float(free_bytes) / (1024**3),
+                float(min_free_gb),
+                len(self.running_batch.reqs),
+                len(self.waiting_queue),
+                self.chunked_req is not None,
+                int(available_tokens),
+                int(self.max_total_num_tokens),
+            )
+        kunserve_timing_log(
+            "scheduler_prefill_deferred_balloon_memory",
+            count=int(log_ct),
+            free_bytes=int(free_bytes),
+            total_bytes=int(total_bytes),
+            threshold_bytes=int(min_free_bytes),
+            running=len(self.running_batch.reqs),
+            waiting=len(self.waiting_queue),
+            chunked=self.chunked_req is not None,
+            available_tokens=int(available_tokens),
+            max_total=int(self.max_total_num_tokens),
+        )
+        return True
+
     def _kunserve_should_defer_prefill_for_global_graph(self) -> bool:
         """Legacy conservative gate for keeping graph replay decode-only.
 
@@ -3896,20 +4111,7 @@ class Scheduler(
         ):
             return False
 
-        model_runner = getattr(self.tp_worker, "model_runner", None)
-        if model_runner is None:
-            return False
-        if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
-            return False
-
-        try:
-            variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
-            runtime_variant = str(variant_getter())
-        except Exception:
-            runtime_variant = str(
-                getattr(model_runner, "_balloon_runtime_variant", "local")
-            )
-        if runtime_variant != "global":
+        if not self._kunserve_balloon_global_runtime_active():
             return False
 
         return self._kunserve_global_graph_replay_active()
@@ -4048,14 +4250,9 @@ class Scheduler(
         negotiated_min_bs = int(negotiated_min_bs)
         negotiated_raw_max_bs = int(negotiated_raw_max_bs)
         negotiated_raw_min_bs = int(negotiated_raw_min_bs)
-        raw_busy_mismatch = (
-            negotiated_raw_min_bs > 0
-            and negotiated_raw_min_bs != negotiated_raw_max_bs
-        )
         cacheable = (
             negotiated_max_bs > 0
             and not bool(negotiated_any_force_eager)
-            and not raw_busy_mismatch
             and self._capture_bs_supported(negotiated_max_bs)
         )
         if not cacheable:
@@ -4127,15 +4324,10 @@ class Scheduler(
                 local_padded_bs=int(local_padded),
                 local_state_signature=local_signature,
             )
-            guard_raw_busy_mismatch = (
-                int(guard_raw_min_bs) > 0
-                and int(guard_raw_min_bs) != int(guard_raw_max_bs)
-            )
             cache_changed = (
                 guard_state_fingerprint != previous_state_fingerprint
                 or int(guard_max_bs) > int(self._phase_e_cached_max_bs)
                 or bool(guard_any_force_eager)
-                or bool(guard_raw_busy_mismatch)
             )
             if cache_changed:
                 self._phase_e_reset_cached_decision("guard state changed")
@@ -4147,17 +4339,28 @@ class Scheduler(
                     guard_any_force_eager=bool(guard_any_force_eager),
                     guard_raw_max_bs=int(guard_raw_max_bs),
                     guard_raw_min_bs=int(guard_raw_min_bs),
-                    guard_raw_busy_mismatch=bool(guard_raw_busy_mismatch),
+                    guard_raw_busy_mismatch=bool(
+                        int(guard_raw_min_bs) > 0
+                        and int(guard_raw_min_bs) != int(guard_raw_max_bs)
+                    ),
                     previous_state_fingerprint=previous_state_fingerprint,
                     guard_state_fingerprint=guard_state_fingerprint,
                 )
-                # All ranks observed the same guard event. Run one eager step
-                # instead of replaying a possibly stale GLOBAL graph; the next
-                # loop will negotiate a fresh cacheable bucket.
+                self._phase_e_update_cached_decision(
+                    negotiated_max_bs=int(guard_max_bs),
+                    negotiated_min_bs=int(guard_min_bs),
+                    negotiated_raw_max_bs=int(guard_raw_max_bs),
+                    negotiated_raw_min_bs=int(guard_raw_min_bs),
+                    negotiated_any_force_eager=bool(guard_any_force_eager),
+                    state_fingerprint=guard_state_fingerprint,
+                )
+                # All ranks observed the same guard event. Reuse the freshly
+                # negotiated bucket on this step; only a real force-eager signal
+                # (EXTEND/mixed prefill) disables graph replay.
                 return (
                     int(guard_max_bs),
                     int(guard_min_bs),
-                    True,
+                    bool(guard_any_force_eager),
                     False,
                     guard_state_fingerprint,
                     int(guard_raw_max_bs),
@@ -4287,8 +4490,6 @@ class Scheduler(
             int(negotiated_raw_min_bs) > 0
             and int(negotiated_raw_min_bs) != int(negotiated_raw_max_bs)
         )
-        if raw_busy_mismatch:
-            negotiated_any_force_eager = True
         kunserve_timing_log(
             "phase_e_negotiated",
             source="collective",
@@ -4408,14 +4609,12 @@ class Scheduler(
           replicas build a keepalive batch of size ``max_bs`` and graph replay
           is safe only when ``any_force_eager`` is false.
         * ``raw_min_bs > 0 and raw_min_bs != raw_max_bs`` -- busy/busy raw
-          mismatch.  This is not represented safely by the current graph
-          contract, so all ranks force eager and the dynamic dispatcher pads
-          to the runtime max_m.
+          mismatch.  This is safe for GLOBAL graph replay as long as every rank
+          uses the same negotiated graph bucket; smaller local batches pad extra
+          rows to dummy req/KV state in ``CudaGraphRunner``.
         * ``min_bs > 0 and min_bs != max_bs`` -- busy/busy with mismatched
-          padded bs but equal raw bs.  All ranks replay the ``max_bs`` GLOBAL
-          graph bucket and smaller local batches pad extra rows to dummy KV.
-        * ``min_bs == max_bs`` -- uniform decode graph bucket, graph replay safe
-          when the raw guard also matches.
+          padded bs.  All ranks replay the ``max_bs`` GLOBAL graph bucket.
+        * ``min_bs == max_bs`` -- uniform decode graph bucket.
         """
         model_runner = getattr(self.tp_worker, "model_runner", None)
         if model_runner is None:
@@ -4429,7 +4628,7 @@ class Scheduler(
             and negotiated_raw_min_bs != negotiated_raw_max_bs
         )
         graph_bs_override: Optional[int] = None
-        force_eager = bool(negotiated_any_force_eager) or bool(raw_busy_mismatch)
+        force_eager = bool(negotiated_any_force_eager)
         mismatch_decode = (
             negotiated_min_bs > 0 and negotiated_min_bs != negotiated_max_bs
         )
@@ -4439,7 +4638,7 @@ class Scheduler(
                 graph_bs_override = graph_bs_override_hint
             else:
                 force_eager = True
-        elif mismatch_decode and not force_eager:
+        elif negotiated_max_bs > 0 and not force_eager:
             if self._capture_bs_supported(negotiated_max_bs):
                 graph_bs_override = negotiated_max_bs
             else:

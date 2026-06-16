@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -323,32 +324,38 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     ),
                 }
             )
-        dispatcher = getattr(self.experts, "dispatcher", None)
-        probe_log = getattr(dispatcher, "_runtime_probe_log", None)
-        if callable(probe_log):
-            try:
-                dispatcher._kunserve_current_layer_id = int(self.layer_id)
-            except Exception:
-                pass
-            probe_log(
-                "qwen3_moe_forward_enter",
-                num_tokens=int(num_tokens),
-                hidden_dim=int(hidden_dim),
+        runtime_variant = str(
+            getattr(
+                getattr(self.experts, "runtime_variant", "local"),
+                "value",
+                getattr(self.experts, "runtime_variant", "local"),
             )
-
+        ).lower()
+        timing_fields["runtime_variant"] = runtime_variant
+        dispatcher = getattr(self.experts, "dispatcher", None)
         # router_logits: (num_tokens, n_experts)
-        if callable(probe_log):
-            probe_log("qwen3_moe_router_gate_enter", input=hidden_states)
         if detail_timing:
             with kunserve_timing_scope("qwen3_moe_router_gate", **timing_fields):
                 router_logits, _ = self.gate(hidden_states)
         else:
             router_logits, _ = self.gate(hidden_states)
-        if callable(probe_log):
-            probe_log("qwen3_moe_router_gate_exit", output=router_logits)
+        runtime_variant = str(
+            getattr(
+                getattr(self.experts, "runtime_variant", "local"),
+                "value",
+                getattr(self.experts, "runtime_variant", "local"),
+            )
+        ).lower()
+        kunserve_local_standard = (
+            envs.SGLANG_KUNSERVE_MANAGER_ENABLE.get()
+            and runtime_variant != "global"
+        )
         expert_location_dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_global_server_args().ep_dispatch_algorithm is not None
+            if (
+                get_global_server_args().ep_dispatch_algorithm is not None
+                and not kunserve_local_standard
+            )
             else None
         )
         allow_kunserve_tp_allreduce_fusion = (
@@ -363,8 +370,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if callable(set_kunserve_fusion):
             set_kunserve_fusion(allow_kunserve_tp_allreduce_fusion)
         try:
-            if callable(probe_log):
-                probe_log("qwen3_moe_topk_enter", router_logits=router_logits)
             if detail_timing:
                 with kunserve_timing_scope("qwen3_moe_topk", **timing_fields):
                     topk_output = self.topk(
@@ -378,20 +383,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     router_logits,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-            if callable(probe_log):
-                probe_log(
-                    "qwen3_moe_topk_exit",
-                    topk_ids=getattr(topk_output, "topk_ids", None),
-                    topk_weights=getattr(topk_output, "topk_weights", None),
-                )
-                probe_log("qwen3_moe_experts_enter", input=hidden_states)
             if detail_timing:
                 with kunserve_timing_scope("qwen3_moe_experts_total", **timing_fields):
                     final_hidden_states = self.experts(hidden_states, topk_output)
             else:
                 final_hidden_states = self.experts(hidden_states, topk_output)
-            if callable(probe_log):
-                probe_log("qwen3_moe_experts_exit", output=final_hidden_states)
         finally:
             if callable(set_kunserve_fusion):
                 set_kunserve_fusion(False)
@@ -401,8 +397,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 getattr(final_hidden_states, "_kunserve_tp_allreduce_done", False)
             )
         ):
-            if callable(probe_log):
-                probe_log("qwen3_moe_mlp_all_reduce_enter", input=final_hidden_states)
             if detail_timing:
                 with kunserve_timing_scope("qwen3_moe_mlp_all_reduce", **timing_fields):
                     final_hidden_states = tensor_model_parallel_all_reduce(
@@ -410,11 +404,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     )
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            if callable(probe_log):
-                probe_log("qwen3_moe_mlp_all_reduce_exit", output=final_hidden_states)
-
-        if callable(probe_log):
-            probe_log("qwen3_moe_forward_exit", output=final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
@@ -879,6 +868,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
             "kv_tokens": int(getattr(forward_batch, "seq_lens_sum", 0) or 0),
             "global_num_tokens": getattr(forward_batch, "global_num_tokens_cpu", None),
         }
+        try:
+            runtime_variant = str(
+                getattr(
+                    getattr(self.mlp.experts, "runtime_variant", "local"),
+                    "value",
+                    getattr(self.mlp.experts, "runtime_variant", "local"),
+                )
+            ).lower()
+        except Exception:
+            runtime_variant = "unknown"
+        timing_fields["runtime_variant"] = runtime_variant
 
         if detail_timing:
             with kunserve_timing_scope("qwen3_moe_layer_prepare_attn", **timing_fields):

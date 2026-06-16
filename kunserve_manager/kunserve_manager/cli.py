@@ -126,7 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-eager-warmup",
         dest="eager_warmup",
         action="store_false",
-        default=_env_or("KUNSERVE_MANAGER_EAGER_WARMUP", "1") in ("1", "true"),
+        default=_env_or("KUNSERVE_MANAGER_EAGER_WARMUP", "0") in ("1", "true"),
         help="Skip /kunserve/warmup_balloon at startup; rely on lazy capture.",
     )
     p.add_argument(

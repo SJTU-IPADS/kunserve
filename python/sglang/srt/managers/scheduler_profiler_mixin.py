@@ -208,7 +208,12 @@ class SchedulerProfilerMixin:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.gpu_id == get_global_server_args().base_gpu_id:
+            profile_all_ranks = (
+                os.environ.get("KUNSERVE_NSYS_STAGE_PROFILE", "0")
+                in {"1", "true", "True", "yes", "on", "ON"}
+                or os.environ.get("PROFILE_BACKEND", "").lower() == "nsys"
+            )
+            if profile_all_ranks or self.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -318,7 +323,12 @@ class SchedulerProfilerMixin:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.gpu_id == get_global_server_args().base_gpu_id:
+            profile_all_ranks = (
+                os.environ.get("KUNSERVE_NSYS_STAGE_PROFILE", "0")
+                in {"1", "true", "True", "yes", "on", "ON"}
+                or os.environ.get("PROFILE_BACKEND", "").lower() == "nsys"
+            )
+            if profile_all_ranks or self.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()

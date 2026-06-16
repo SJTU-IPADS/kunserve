@@ -254,13 +254,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
-_KUNSERVE_TRUE_VALUES = {"1", "true", "True", "yes", "on"}
-
-
-def _kunserve_global_forward_probe_enabled() -> bool:
-    return os.environ.get("KUNSERVE_GLOBAL_FORWARD_PROBE", "0") in _KUNSERVE_TRUE_VALUES
-
-
 def _kunserve_ms(message: str, *args) -> None:
     """Emit a [KUNSERVE-MS] milestone line.
 
@@ -309,6 +302,15 @@ def _kun_wd(message: str) -> None:
             fh.write(f"[{ts} pid={os.getpid()}] {message}\n")
     except Exception:
         pass
+
+
+def _kunserve_local_forward_probe_enabled() -> bool:
+    return os.environ.get("KUNSERVE_LOCAL_FORWARD_PROBE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -888,28 +890,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ]
         return self._balloon_fused_moe_layers
 
-    def _kunserve_set_forward_probe_context(
-        self, forward_batch: ForwardBatch, forward_select_count: int
-    ) -> None:
-        if not _kunserve_global_forward_probe_enabled():
-            return
-        try:
-            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
-        except Exception:
-            batch_size = -1
-        mode = str(getattr(forward_batch, "forward_mode", "unknown"))
-        for layer in self._iter_fused_moe_layers():
-            dispatcher = getattr(layer, "dispatcher", None)
-            if dispatcher is None:
-                continue
-            try:
-                dispatcher._kunserve_current_forward_id = int(forward_select_count)
-                dispatcher._kunserve_current_forward_pass_id = int(self.forward_pass_id)
-                dispatcher._kunserve_current_forward_mode = mode
-                dispatcher._kunserve_current_batch_size = batch_size
-            except Exception:
-                pass
-
     def _normalize_balloon_variant(self, variant: Union[str, object]) -> str:
         variant_value = getattr(variant, "value", variant)
         variant_value = str(variant_value).lower()
@@ -998,8 +978,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         The decision used by CUDA graph replay needs both the semantic batch
         size (``raw_bs``) and the selected fixed-padded graph bucket.  The first
         two return values remain the negotiated padded max/min for keepalive and
-        graph-bucket selection; the final two return values are raw max/min so
-        the scheduler can force eager for busy/busy raw mismatches.
+        graph-bucket selection; the final two return values are raw max/min for
+        diagnostics and guard checks.  Busy/busy raw mismatches replay the
+        negotiated graph bucket with dummy padding rows instead of forcing eager.
         """
         local_raw_bs = int(local_bs)
         local_padded = (
@@ -1292,6 +1273,61 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
         return bool(self._balloon_graph_replay_enabled)
 
+    def _sync_kunserve_local_cuda_graph_decision(
+        self,
+        can_run_graph: bool,
+        *,
+        mode_allows_graph: bool,
+        has_graph_runner: bool,
+    ) -> bool:
+        """Keep LOCAL graph/eager selection identical across TP ranks.
+
+        Native CUDA graph replay and eager forward contain different TP
+        collective sequences.  If one TP rank replays a graph while its peer
+        falls back to eager, the eager rank blocks inside the next TP
+        collective.  KunServe changes graph availability dynamically during
+        weight sync / capture / fallback, so make the decision a TP-wide MIN:
+        all ranks replay only when every rank can replay.
+        """
+        if not (
+            envs.SGLANG_KUNSERVE_MANAGER_ENABLE.get()
+            and mode_allows_graph
+            and has_graph_runner
+        ):
+            return bool(can_run_graph)
+        if os.environ.get(
+            "KUNSERVE_DISABLE_LOCAL_GRAPH_DECISION_SYNC", "0"
+        ).lower() in ("1", "true", "yes", "on"):
+            return bool(can_run_graph)
+
+        try:
+            tp_group = get_tp_group()
+            if int(getattr(tp_group, "world_size", 1) or 1) <= 1:
+                return bool(can_run_graph)
+            flag = torch.tensor(
+                [1 if can_run_graph else 0], dtype=torch.int32, device="cpu"
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+            synced = bool(int(flag.item()) > 0)
+        except Exception:
+            logger.exception(
+                "[KunServe] failed to synchronize LOCAL cuda graph decision; "
+                "falling back to local decision"
+            )
+            return bool(can_run_graph)
+
+        if bool(can_run_graph) and not synced:
+            _kun_wd(
+                "[KUNSERVE-LOCAL] local_graph_decision_sync force_eager "
+                "fp=%d tp_rank=%s bs=%s"
+                % (
+                    int(getattr(self, "forward_pass_id", -1)),
+                    getattr(self, "tp_rank", None),
+                    "unknown",
+                )
+            )
+        return synced
+
     def get_balloon_step_graph_bs_override(self) -> Optional[int]:
         if getattr(self, "_balloon_step_force_eager", False):
             return None
@@ -1313,9 +1349,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def set_balloon_step_force_eager(self, force: bool) -> None:
         """Phase E hook for steps that cannot safely replay GLOBAL graphs.
 
-        EXTEND/mixed prefill and busy/busy raw-batch mismatches must run eager.
-        Equal-raw decode steps with mismatched padded buckets are handled
-        separately by ``_balloon_step_graph_bs_override``.
+        EXTEND/mixed prefill must run eager.  Decode raw-batch or padded-bucket
+        mismatches are handled by ``_balloon_step_graph_bs_override`` and
+        CUDA-graph dummy padding rows.
         """
         self._balloon_step_force_eager = bool(force)
         self._balloon_step_graph_bs_override = None
@@ -1380,18 +1416,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raw_min = int(guard.get("raw_min_bs", 0) or 0)
         except Exception:
             raw_max = raw_min = 0
-        if raw_min > 0 and raw_max != raw_min:
+        if raw_max > 0 and expected > 0 and raw_max > expected:
             message = (
-                "[KUNSERVE-MS] GLOBAL graph guard raw busy/busy mismatch: "
+                "[KUNSERVE-MS] GLOBAL graph guard raw exceeds bucket: "
                 f"raw_min_bs={raw_min} raw_max_bs={raw_max} "
-                f"graph_bs={actual} raw_bs={int(raw_bs)} graph_key={graph_key} "
+                f"expected_bs={expected} graph_bs={actual} raw_bs={int(raw_bs)} graph_key={graph_key} "
                 f"guard={guard}"
             )
             _kunserve_ms("%s", message)
             kunserve_timing_log(
-                "phase_e_graph_guard_raw_mismatch",
+                "phase_e_graph_guard_raw_exceeds_bucket",
                 raw_min_bs=raw_min,
                 raw_max_bs=raw_max,
+                expected_bs=expected,
                 graph_bs=actual,
                 raw_bs=int(raw_bs),
                 graph_key=str(graph_key),
@@ -1400,16 +1437,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if raise_on_error:
                 raise RuntimeError(message)
             return False
-        if raw_min > 0 and int(raw_bs) != raw_min:
+        if expected > 0 and int(raw_bs) > expected:
             message = (
-                "[KUNSERVE-MS] GLOBAL graph guard local raw mismatch: "
-                f"expected_raw_bs={raw_min} raw_bs={int(raw_bs)} "
+                "[KUNSERVE-MS] GLOBAL graph guard local raw exceeds bucket: "
+                f"expected_bs={expected} raw_bs={int(raw_bs)} "
                 f"graph_bs={actual} graph_key={graph_key} guard={guard}"
             )
             _kunserve_ms("%s", message)
             kunserve_timing_log(
-                "phase_e_graph_guard_local_raw_mismatch",
-                expected_raw_bs=raw_min,
+                "phase_e_graph_guard_local_raw_exceeds_bucket",
+                expected_bs=expected,
                 raw_bs=int(raw_bs),
                 graph_bs=actual,
                 graph_key=str(graph_key),
@@ -4342,18 +4379,85 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        # Phase F: lane-filtered init.  Non-participating TP workers
-        # record None so _resolve_balloon_process_group can detect them
-        # and the dispatcher can fall back gracefully.
-        if (
-            lane_only_tp_rank is not None
-            and int(lane_only_tp_rank) != int(self.tp_rank)
-        ):
+        lane_target_tp_rank: Optional[int] = None
+        lane_participates = True
+        if lane_only_tp_rank is not None:
+            lane_target_tp_rank = int(lane_only_tp_rank)
+            if lane_target_tp_rank < 0 or lane_target_tp_rank >= int(self.tp_size):
+                return False, (
+                    f"Invalid lane_only_tp_rank={lane_target_tp_rank} for "
+                    f"tp_size={self.tp_size}."
+                )
+            lane_participates = lane_target_tp_rank == int(self.tp_rank)
+
+        def _sync_lane_init_result(success: bool, message: str):
+            """Return the participating lane rank's init result on every TP rank.
+
+            The HTTP control path observes the TP0 scheduler result.  For lane
+            1, TP0 is intentionally non-participating, so returning "skipped"
+            from TP0 lets the manager mark the lane ready while TP1 may still
+            be blocked or failed in rendezvous.  Synchronizing the target
+            lane rank result over the local TP CPU group makes the HTTP result
+            represent the worker that actually created the lane subgroup.
+            """
+
+            if lane_target_tp_rank is None:
+                return success, message
+            payload = {
+                "success": bool(success),
+                "message": str(message),
+                "tp_rank": int(self.tp_rank),
+                "lane_only_tp_rank": int(lane_target_tp_rank),
+            }
+            try:
+                tp_group = get_tp_group()
+                if int(lane_target_tp_rank) >= len(tp_group.ranks):
+                    return False, (
+                        "Failed to synchronize lane subgroup init result: "
+                        f"lane_only_tp_rank={lane_target_tp_rank} is outside "
+                        f"tp group ranks={tp_group.ranks}."
+                    )
+                obj_list = [payload if lane_participates else None]
+                # Do not use GroupCoordinator.broadcast_object here.  Its
+                # message-queue fast path only supports src=0, while lane1 must
+                # publish the result from local TP rank 1.
+                dist.broadcast_object_list(
+                    obj_list,
+                    src=tp_group.ranks[int(lane_target_tp_rank)],
+                    group=tp_group.cpu_group,
+                )
+                synced = obj_list[0]
+                if not isinstance(synced, dict):
+                    return False, (
+                        "Failed to synchronize lane subgroup init result: "
+                        f"unexpected payload {synced!r}."
+                    )
+                return bool(synced.get("success")), str(
+                    synced.get("message", "unknown lane init result")
+                )
+            except Exception as sync_exc:
+                logger.exception(
+                    "Failed to synchronize lane subgroup init result for %s "
+                    "lane_only_tp_rank=%s",
+                    group_name,
+                    lane_target_tp_rank,
+                )
+                return False, (
+                    "Failed to synchronize lane subgroup init result across "
+                    f"local TP group: {sync_exc}."
+                )
+
+        # Phase F: lane-filtered init.  Non-participating TP workers record
+        # None so _resolve_balloon_process_group can detect them, then wait
+        # for the participating lane rank to broadcast the real success/fail
+        # result before the HTTP control path returns.
+        if not lane_participates:
             self._model_update_group[group_name] = None
-            return True, (
+            return _sync_lane_init_result(
+                True,
                 f"Skipped non-participating tp_rank={self.tp_rank} for "
                 f"lane group {group_name!r} (lane_only_tp_rank="
-                f"{lane_only_tp_rank})."
+                f"{lane_only_tp_rank}).",
             )
 
         if explicit_group_rank is not None:
@@ -4371,7 +4475,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 f"init custom process group: group_name={group_name} already initialized, returning success."
             )
-            return True, "Process group already initialized."
+            return _sync_lane_init_result(True, "Process group already initialized.")
 
         timeout_sec = float(os.environ.get("KUNSERVE_PG_INIT_TIMEOUT_SEC", "60"))
         pg_timeout = datetime.timedelta(seconds=max(1.0, timeout_sec))
@@ -4401,8 +4505,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=int(rank),
                     world_size=int(world_size),
                     device=torch.device("cuda", torch.cuda.current_device()),
+                    timeout_seconds=max(1.0, timeout_sec),
                 )
-                return (
+                return _sync_lane_init_result(
                     True,
                     "Succeeded to initialize KunServe PyNccl registered "
                     "collective group.",
@@ -4416,7 +4521,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 rank=rank,
                 group_name=group_name,
             )
-            return True, "Succeeded to initialize custom process group."
+            return _sync_lane_init_result(
+                True, "Succeeded to initialize custom process group."
+            )
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
             logger.error(message)
@@ -4442,7 +4549,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 gc.collect()
             except Exception:
                 pass
-            return False, message
+            return _sync_lane_init_result(False, message)
 
     def destroy_weights_update_group(self, group_name):
         try:
@@ -4570,20 +4677,130 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
-        elif load_format in self.server_args.custom_weight_loader:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
-        elif load_format is None:
-            self.model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
-        return True, "Success"
+        def _load_weights_from_tensor_list():
+            unwrapped_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
+            if load_format == "direct":
+                _model_load_weights_direct(self.model, unwrapped_tensors)
+            elif load_format in self.server_args.custom_weight_loader:
+                custom_loader = dynamic_import(load_format)
+                custom_loader(self.model, unwrapped_tensors)
+            elif load_format is None:
+                self.model.load_weights(unwrapped_tensors)
+            else:
+                raise NotImplementedError(f"Unknown load_format={load_format}")
+            return True, "Success"
+
+        try:
+            return _load_weights_from_tensor_list()
+        except torch.OutOfMemoryError:
+            if not envs.SGLANG_KUNSERVE_MANAGER_ENABLE.get():
+                raise
+            dropped_variants = self._release_cuda_graphs_for_weight_sync_retry()
+            if not dropped_variants:
+                raise
+            try:
+                return _load_weights_from_tensor_list()
+            finally:
+                self._recapture_cuda_graphs_after_weight_sync_retry(dropped_variants)
+
+    def _release_cuda_graphs_for_weight_sync_retry(self) -> List[str]:
+        graph_runner = getattr(self, "graph_runner", None)
+        get_variants = getattr(graph_runner, "get_captured_variants", None)
+        drop_variant = getattr(graph_runner, "drop_captured_variant", None)
+        if graph_runner is None or not callable(get_variants) or not callable(drop_variant):
+            return []
+
+        try:
+            variants = list(get_variants())
+        except Exception:
+            logger.exception(
+                "[KunServe] failed to inspect captured CUDA graph variants before "
+                "weight-sync OOM retry"
+            )
+            return []
+        if not variants:
+            return []
+
+        dropped_total = 0
+        for variant in variants:
+            try:
+                dropped_total += int(drop_variant(variant))
+            except Exception:
+                logger.exception(
+                    "[KunServe] failed to drop CUDA graph variant=%s before "
+                    "weight-sync OOM retry",
+                    variant,
+                )
+        if dropped_total <= 0:
+            return []
+
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.exception(
+                "[KunServe] torch.cuda.empty_cache failed after dropping CUDA graphs"
+            )
+
+        logger.warning(
+            "[KunServe] update_weights_from_tensor hit CUDA OOM; dropped %d CUDA "
+            "graphs across variants=%s and will retry once",
+            dropped_total,
+            variants,
+        )
+        return variants
+
+    def _recapture_cuda_graphs_after_weight_sync_retry(self, variants: List[str]) -> None:
+        if not variants or self.server_args.disable_cuda_graph:
+            return
+        # Recapturing immediately inside update_weights_from_tensor keeps the
+        # control-plane HTTP request open and can stall for minutes when the
+        # post-sync free memory is close to zero.  Default to leaving the
+        # dropped LOCAL graphs uncaptured; decode will fall back to eager until
+        # a later explicit capture path is used.
+        if os.environ.get(
+            "SGLANG_KUNSERVE_RECAPTURE_GRAPHS_AFTER_WEIGHT_SYNC", "0"
+        ).lower() in ("0", "false", "no", "off"):
+            logger.warning(
+                "[KunServe] skipped immediate CUDA graph recapture after weight "
+                "sync; variants=%s",
+                variants,
+            )
+            return
+
+        for variant in variants:
+            try:
+                self.ensure_cuda_graph_variant_captured(variant)
+                logger.warning(
+                    "[KunServe] recaptured CUDA graph variant=%s after weight sync",
+                    variant,
+                )
+            except torch.OutOfMemoryError:
+                logger.exception(
+                    "[KunServe] OOM while recapturing CUDA graph variant=%s after "
+                    "weight sync; continuing without that graph variant",
+                    variant,
+                )
+                try:
+                    self._drop_cuda_graph_variant(variant)
+                    torch.cuda.empty_cache()
+                except Exception:
+                    logger.exception(
+                        "[KunServe] failed to clean up variant=%s after recapture OOM",
+                        variant,
+                    )
+            except Exception:
+                logger.exception(
+                    "[KunServe] failed to recapture CUDA graph variant=%s after "
+                    "weight sync; continuing without that graph variant",
+                    variant,
+                )
 
     def _update_weights_from_flattened_bucket(
         self,
@@ -5592,7 +5809,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         runner_can_run = False
         if mode_allows_graph and has_graph_runner:
             runner_can_run = bool(self.graph_runner.can_run(forward_batch))
-        can_run_graph = bool(mode_allows_graph and has_graph_runner and runner_can_run)
+        local_can_run_graph = bool(
+            mode_allows_graph and has_graph_runner and runner_can_run
+        )
+        can_run_graph = self._sync_kunserve_local_cuda_graph_decision(
+            local_can_run_graph,
+            mode_allows_graph=mode_allows_graph,
+            has_graph_runner=has_graph_runner,
+        )
+        tp_graph_decision_changed = bool(local_can_run_graph != can_run_graph)
 
         try:
             input_tokens_for_timing = int(forward_batch.input_ids.numel())
@@ -5604,6 +5829,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "batch_size": getattr(forward_batch, "batch_size", None),
             "input_tokens": input_tokens_for_timing,
             "can_run_graph": bool(can_run_graph),
+            "local_can_run_graph": bool(local_can_run_graph),
+            "tp_graph_decision_changed": bool(tp_graph_decision_changed),
             "mode_allows_graph": bool(mode_allows_graph),
             "runner_can_run": bool(runner_can_run),
             "skip_attn_backend_init": bool(skip_attn_backend_init),
@@ -5627,6 +5854,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_select_count = int(
             getattr(self, "_kunserve_forward_select_log_count", 0)
         )
+        local_forward_probe = _kunserve_local_forward_probe_enabled()
+        if local_forward_probe:
+            _kun_wd(
+                "[KUNSERVE-LOCAL] model_forward_select fp=%d state=%s variant=%s "
+                "mode=%s bs=%s input_tokens=%s can_run_graph=%s "
+                "local_can_run_graph=%s tp_graph_decision_changed=%s "
+                "mode_allows_graph=%s has_graph_runner=%s runner_can_run=%s "
+                "replay_enabled=%s force_eager=%s graph_bs_override=%s "
+                "tp_rank=%s pp_rank=%s"
+                % (
+                    int(self.forward_pass_id),
+                    balloon_state,
+                    runtime_variant,
+                    forward_batch.forward_mode,
+                    getattr(forward_batch, "batch_size", None),
+                    input_tokens_for_timing,
+                    bool(can_run_graph),
+                    bool(local_can_run_graph),
+                    bool(tp_graph_decision_changed),
+                    bool(mode_allows_graph),
+                    bool(has_graph_runner),
+                    bool(runner_can_run),
+                    bool(self.is_cuda_graph_replay_enabled()),
+                    bool(getattr(self, "_balloon_step_force_eager", False)),
+                    self.get_balloon_step_graph_bs_override(),
+                    getattr(self, "tp_rank", None),
+                    getattr(self, "pp_rank", None),
+                )
+            )
         if balloon_state != "local" or runtime_variant == "global":
             log_count = forward_select_count + 1
             self._kunserve_forward_select_log_count = log_count
@@ -5679,28 +5935,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     captured_variants,
                 )
 
-        probe_this_forward = (
-            _kunserve_global_forward_probe_enabled()
-            and (balloon_state != "local" or runtime_variant == "global")
-        )
-        if probe_this_forward:
-            self._kunserve_set_forward_probe_context(
-                forward_batch, int(forward_select_count)
-            )
-
         if can_run_graph:
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_forward_graph_replay_enter "
-                    "count=%d forward_pass_id=%d state=%s variant=%s mode=%s "
-                    "batch_size=%s input_tokens=%s",
-                    int(forward_select_count),
-                    int(self.forward_pass_id),
-                    balloon_state,
-                    runtime_variant,
-                    forward_batch.forward_mode,
-                    getattr(forward_batch, "batch_size", None),
-                    input_tokens_for_timing,
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_graph_replay_enter fp=%d state=%s "
+                    "variant=%s mode=%s bs=%s graph_bs_override=%s"
+                    % (
+                        int(self.forward_pass_id),
+                        balloon_state,
+                        runtime_variant,
+                        forward_batch.forward_mode,
+                        getattr(forward_batch, "batch_size", None),
+                        self.get_balloon_step_graph_bs_override(),
+                    )
                 )
             with kunserve_timing_scope("model_runner_graph_replay", **forward_timing_fields):
                 ret = self.graph_runner.replay(
@@ -5708,12 +5955,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_forward_graph_replay_exit "
-                    "count=%d forward_pass_id=%d",
-                    int(forward_select_count),
-                    int(self.forward_pass_id),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_graph_replay_exit fp=%d"
+                    % int(self.forward_pass_id)
                 )
             return ModelRunnerOutput(
                 logits_output=ret,
@@ -5723,39 +5968,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
-        if probe_this_forward:
-            _kunserve_ms(
-                "[KUNSERVE-DBG] model_forward_eager_enter "
-                "count=%d forward_pass_id=%d state=%s variant=%s mode=%s "
-                "batch_size=%s input_tokens=%s",
-                int(forward_select_count),
-                int(self.forward_pass_id),
-                balloon_state,
-                runtime_variant,
-                forward_batch.forward_mode,
-                getattr(forward_batch, "batch_size", None),
-                input_tokens_for_timing,
-            )
-
         # For MLP sync
-        if probe_this_forward:
-            _kunserve_ms(
-                "[KUNSERVE-DBG] model_forward_prepare_sync_enter count=%d "
-                "global_num_tokens=%s",
-                int(forward_select_count),
-                getattr(forward_batch, "global_num_tokens_cpu", None),
+        if local_forward_probe:
+            _kun_wd(
+                "[KUNSERVE-LOCAL] model_prepare_sync_enter fp=%d mode=%s bs=%s"
+                % (
+                    int(self.forward_pass_id),
+                    forward_batch.forward_mode,
+                    getattr(forward_batch, "batch_size", None),
+                )
             )
         with kunserve_timing_scope("model_runner_prepare_sync", **forward_timing_fields):
             if forward_batch.global_num_tokens_cpu is not None:
                 forward_batch.prepare_mlp_sync_batch(self)
             else:
                 forward_batch.prepare_attn_tp_scatter_input(self)
-        if probe_this_forward:
-            _kunserve_ms(
-                "[KUNSERVE-DBG] model_forward_prepare_sync_exit count=%d",
-                int(forward_select_count),
+        if local_forward_probe:
+            _kun_wd(
+                "[KUNSERVE-LOCAL] model_prepare_sync_exit fp=%d"
+                % int(self.forward_pass_id)
             )
-
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
             forward_batch.num_token_non_padded is not None
@@ -5768,10 +6000,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if forward_batch.forward_mode.is_decode():
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_decode_enter count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_decode_enter fp=%d bs=%s"
+                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
                 )
             with kunserve_timing_scope("model_runner_forward_decode", **forward_timing_fields):
                 ret = self.forward_decode(
@@ -5779,16 +6011,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_decode_exit count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_decode_exit fp=%d"
+                    % int(self.forward_pass_id)
                 )
         elif forward_batch.forward_mode.is_split_prefill():
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_split_prefill_enter count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_split_prefill_enter fp=%d bs=%s"
+                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
                 )
             with kunserve_timing_scope("model_runner_forward_split_prefill", **forward_timing_fields):
                 ret = self.forward_split_prefill(
@@ -5796,16 +6028,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     reinit_attn_backend=reinit_attn_backend,
                     forward_count=split_forward_count,
                 )
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_split_prefill_exit count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_split_prefill_exit fp=%d"
+                    % int(self.forward_pass_id)
                 )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_extend_enter count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_extend_enter fp=%d bs=%s"
+                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
                 )
             with kunserve_timing_scope("model_runner_forward_extend", **forward_timing_fields):
                 ret, can_run_graph = self.forward_extend(
@@ -5813,23 +6045,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_extend_exit count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_extend_exit fp=%d"
+                    % int(self.forward_pass_id)
                 )
         elif forward_batch.forward_mode.is_idle():
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_idle_enter count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_idle_enter fp=%d bs=%s"
+                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
                 )
             with kunserve_timing_scope("model_runner_forward_idle", **forward_timing_fields):
                 ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_forward_idle_exit count=%d",
-                    int(forward_select_count),
+            if local_forward_probe:
+                _kun_wd(
+                    "[KUNSERVE-LOCAL] model_forward_idle_exit fp=%d"
+                    % int(self.forward_pass_id)
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
@@ -5838,25 +6070,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.global_num_tokens_cpu is not None
             and self.pp_group.is_last_rank
         ):
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_post_mlp_sync_enter count=%d",
-                    int(forward_select_count),
-                )
             with kunserve_timing_scope("model_runner_post_mlp_sync", **forward_timing_fields):
                 forward_batch.post_forward_mlp_sync_batch(ret)
-            if probe_this_forward:
-                _kunserve_ms(
-                    "[KUNSERVE-DBG] model_runner_post_mlp_sync_exit count=%d",
-                    int(forward_select_count),
-                )
-
-        if probe_this_forward:
-            _kunserve_ms(
-                "[KUNSERVE-DBG] model_forward_eager_exit count=%d forward_pass_id=%d",
-                int(forward_select_count),
-                int(self.forward_pass_id),
-            )
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(

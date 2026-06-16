@@ -80,6 +80,7 @@ class KunServePyNcclGroup:
         rank: int,
         world_size: int,
         device: Optional[Union[int, str, torch.device]] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> None:
         if int(world_size) <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}.")
@@ -114,6 +115,7 @@ class KunServePyNcclGroup:
             port=int(port),
             rank=self.rank,
             world_size=self.world_size,
+            timeout_seconds=timeout_seconds,
         )
         # Keep graph-captured collectives and normal eager collectives on
         # separate NCCL communicators.  The first post-balloon step can be a
