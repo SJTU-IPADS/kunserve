@@ -378,7 +378,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # autoregressive drift; this does. If layer-0 input abs-mean grows steadily
         # over decode steps -> the residual stream is blowing up (compounding) and we
         # can see WHEN it crosses into garbage. KUNSERVE_DETAIL_LOG-gated.
-        _moe_io = bool(os.environ.get("KUNSERVE_DETAIL_LOG")) and int(getattr(self, "layer_id", -1)) == 0
+        # NOTE: this probe does .item()/.isnan() (D2H sync) which is ILLEGAL during
+        # CUDA graph capture ("operation not permitted when stream is capturing").
+        # forward_deepep runs during the LOCAL graph capture in M2, so we MUST skip
+        # the probe whenever the current stream is capturing.
+        _moe_io = (
+            bool(os.environ.get("KUNSERVE_DETAIL_LOG"))
+            and int(getattr(self, "layer_id", -1)) == 0
+            and not torch.cuda.is_current_stream_capturing()
+        )
         _moe_in_stat = None
         if _moe_io and hidden_states.shape[0] > 0:
             _c = getattr(type(self), "_kun_moe_io_ct", 0) + 1
