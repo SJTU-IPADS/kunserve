@@ -595,7 +595,13 @@ def post_reorder_triton_kernel(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
         for idx in range(topk):
             expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id > 0:
+            # KunServe fix: was `> 0`, which WRONGLY dropped local expert 0's
+            # contribution (StandardDispatcher local_expert_mapping is 0-indexed;
+            # non-local = -1). The gather (standard->deep_gemm post_permute) must
+            # include expert 0 and skip only the -1 non-local sentinels. This is the
+            # real reason "standard->deep_gemm was unsafe for -1": not OOB on -1
+            # (which is <0 and skipped), but a silent drop of expert 0.
+            if expert_id >= 0:
                 dst_idx_int32 = tl.load(src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)

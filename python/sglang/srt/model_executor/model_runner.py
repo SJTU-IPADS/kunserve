@@ -779,7 +779,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # NVSHMEM init (buffer.py:96 gate) so it does NOT double-init with the
             # GLOBAL LL bundle, yet computes correctly. Set =0 to revert to the
             # (broken) Standard+Triton override for A/B.
-            if os.environ.get("KUNSERVE_LOCAL_NORMAL", "1") != "0":
+            # R2 (KUNSERVE_LOCAL_DEEPGEMM=1): StandardDispatcher + deep_gemm runner.
+            # Graph-friendly (fixed shapes) AND fp8-correct (deep_gemm is the proven
+            # path; the standard->deep_gemm -1 bug was post_reorder's `>0` dropping
+            # expert 0, now fixed to `>=0`). This is the route to RESTORE the LOCAL
+            # CUDA graph (no enforce_eager needed), unlike DeepEP-NORMAL (eager-only).
+            if os.environ.get("KUNSERVE_LOCAL_DEEPGEMM", "0") != "0":
+                self._force_local_bundle_to_standard_dispatcher(
+                    runner_backend_name="deep_gemm"
+                )
+            elif os.environ.get("KUNSERVE_LOCAL_NORMAL", "1") != "0":
                 self._force_local_bundle_to_deepep_normal()
             else:
                 self._force_local_bundle_to_standard_dispatcher()
@@ -823,19 +832,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             len(layers),
         )
 
-    def _force_local_bundle_to_standard_dispatcher(self) -> None:
+    def _force_local_bundle_to_standard_dispatcher(
+        self, runner_backend_name: str = "triton"
+    ) -> None:
         """Replace each FusedMoE layer's LOCAL bundle with a StandardDispatcher.
 
         Called when KunServe is in play (SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS=1).
         Standard dispatch keeps fixed shapes (cuda-graph friendly) and runs
-        without NVSHMEM. LOCAL intentionally uses the Triton runner instead of
-        reusing the original DeepGEMM runner: the standard->deep_gemm permute
-        path is unsafe for EP-local execution with -1 non-local expert ids and
-        can corrupt hidden states before any KunServe GLOBAL commit happens.
-        The companion ``reduce_results=True`` flag tells FusedMoE.forward_impl
-        to finish the TP all-reduce internally; qwen3_moe.forward_deepep does
-        not add one on top, and the per-bundle dispatcher abstraction means
-        model-level code does not need to know which mode the layer is using.
+        without NVSHMEM.
+
+        ``runner_backend_name``:
+          - "triton" (legacy): Triton runner. KNOWN to garble fp8 output (the
+            fp8 Triton kernel path), see deepep_docs/deepep_bug_analysis.md.
+          - "deep_gemm" (R2): deep_gemm runner — the proven-correct fp8 path
+            (M1 GLOBAL uses it). The standard->deep_gemm permute was historically
+            "unsafe for -1", but the real bug was post_reorder_triton_kernel's
+            `expert_id > 0` (dropped local expert 0); fixed to `>= 0`. This route
+            is BOTH graph-friendly (fixed shapes) AND fp8-correct, so it can keep
+            the LOCAL CUDA graph (no enforce_eager needed). Selected by
+            KUNSERVE_LOCAL_DEEPGEMM=1.
+        ``reduce_results=True`` tells FusedMoE.forward_impl to finish the TP
+        all-reduce internally (qwen3_moe.forward_deepep does not add one).
         """
         if self.is_draft_worker:
             return
@@ -848,13 +865,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
+        _runner_backend = (
+            MoeRunnerBackend.DEEP_GEMM
+            if str(runner_backend_name).lower() == "deep_gemm"
+            else MoeRunnerBackend.TRITON
+        )
+
         layers = self._iter_fused_moe_layers()
         if not layers:
             return
 
         for layer in layers:
             local_runner = MoeRunner(
-                MoeRunnerBackend.TRITON,
+                _runner_backend,
                 layer.local_bundle.moe_runner_config,
             )
             standard = StandardDispatcher(
@@ -896,8 +919,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # confirm this override actually fired in the previous run.
         _kunserve_ms(
             "[KUNSERVE-MS] forced LOCAL bundle to StandardDispatcher "
-            "+ Triton runner (reduce_results=True) on %d FusedMoE layers; "
+            "+ %s runner (reduce_results=True) on %d FusedMoE layers; "
             "NVSHMEM will only init when the GLOBAL bundle is created.",
+            _runner_backend.name,
             len(layers),
         )
 
