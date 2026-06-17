@@ -123,3 +123,41 @@ deep_ep 文档明确警告：`low_latency_dispatch`/`low_latency_combine` **只�
 判读:
 - **map_max_abs_diff 大 / n_bad>0** → **H1 实锤**:真实 run 里 combine 把 token 映射错了(worst token 的 actual 反推出它实际拿到的是哪些 expert → 错位规律)。
 - **map_max_abs_diff≈0** → combine 映射在真实 run 也对 → bug 只能在"真实 masked GEMM 的 per-token 输出"或"48 层 dispatcher 状态(self.handle/packed_recv_count)跨层错配",转查那条。
+
+---
+
+## 11. ✅ 已解(2026-06-17):真凶 = 强制 LOCAL→Standard+Triton+fp8
+
+### 根因
+M2(LL GLOBAL)要 `SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0`,这会触发 `_force_local_bundle_to_standard_dispatcher()`,把 **LOCAL bundle 强制成 StandardDispatcher + Triton runner + fp8**。**这条路径本身产生乱码**(model_runner.py 该函数上方注释自己记录过 "~25% degenerate outputs"),从 LOCAL decode 第一步就坏 → 整个 M2 输出乱。**之前死磕的 GLOBAL LL combine/dispatch 全是被它带偏的红鲱鱼**(GLOBAL 还没轮到就已经坏了)。
+
+### 干净隔离(2026-06-16)
+| run | LOCAL 路径 | balloon | 结果 |
+|---|---|---|---|
+| `run_deepep_normal_eager_fp8_smoke.sh`(=1) | DeepEP-NORMAL+deep_gemm | 无 | ✅ 全对 |
+| `run_deepep_ll_graph_fp8_smoke.sh`(=0,强制 Standard+Triton) | Standard+Triton+fp8 | 无 | ❌ 8/8 length |
+两者同 fp8、同单实例、都无 balloon,唯一差别 = LOCAL dispatcher/runner。(注:LL 脚本里 `export ...=0` 无条件覆盖,用户 prefix `=1` 被顶掉,导致一直在跑 M2。)
+
+### 修复
+新增 `_force_local_bundle_to_deepep_normal()`(model_runner.py):`GLOBAL_DEEPEP_NORMAL=0` 时,把 LOCAL `MaybeTboDeepEPDispatcher._inners[*].deepep_mode` 设为 `DeepEPMode.NORMAL`(复用已建的 `_normal_dispatcher` + 原 deep_gemm runner = M1 正确路径)。NORMAL 跳过 NVSHMEM(buffer.py:96 gate)→ 不与 GLOBAL LL 双初始化。开关 `KUNSERVE_LOCAL_NORMAL`(默认 1;=0 回退旧 Standard+Triton)。
+**约束**:DeepEP-NORMAL 不是 cuda-graph-safe(capture 时 `DeepEP error: CPU recv timeout` / `Capture must end on the same stream`),所以 **LOCAL=NORMAL 必须 eager**(`ROLLOUT_ENFORCE_EAGER=True`,已设进 LL smoke 默认 + train 脚本接线)。
+
+### 验证
+2026-06-17:`ROLLOUT_ENFORCE_EAGER=True bash run_deepep_ll_graph_fp8_smoke.sh`(LOCAL=NORMAL+eager)→ **输出正确**。
+
+### 遗留(性能/后续)
+1. `enforce_eager=True` 关掉所有 CUDA graph(含 LOCAL 快路径)→ 吞吐降。要恢复性能需要"既正确又 graph-safe 的 LOCAL":要么修 Standard+Triton+fp8 的乱码根因,要么给 DeepEP-NORMAL 做 graph-safe 静态 buffer(类似 dense 后端 Phase-D)。
+2. **GLOBAL LL(balloon)是否真的正确,仍未单独确认**——之前 M2 的 balloon 乱码可能全是 LOCAL 污染所致;现在 LOCAL 干净了,需要一次"真正触发 balloon"的 run 确认 GLOBAL LL 本身对不对(D1–D8 + parity 都指向它正确)。
+
+---
+
+## 12. ✅✅ LL 端到端跑通(2026-06-17, deepep_ll_graph_fp8_20260617_012800)
+
+LOCAL 修好后,首次跑了**会触发 balloon 的 workload**:**balloon 请求 174 stop / 6 abort / 1 length**(ALL: 206 stop / 6 abort / 1 length)。**GLOBAL LL(跨实例 low_latency)+ balloon 端到端正确** —— 这是 M2 的真正验证成功。证实之前所有 GLOBAL LL 的乱码都是 LOCAL Standard+Triton 污染所致(红鲱鱼)。
+
+### 收尾 bug + 修复
+生成成功后,drain 阶段所有 rank 跑 `mode=IDLE, batch_size=0` 的 keepalive GLOBAL forward,把 `low_latency_dispatch` 喂退化 idle shape → `CUDA error: misaligned address`(Phase-E "not done" 的收尾崩)。
+修复:`qwen3_moe.forward_deepep` 顶部加守卫——`forward_mode.is_idle()` 时直接 `return zeros_like(hidden)`,跳过 MoE dispatch。IDLE keepalive 全 rank 同步发(忙 peer 用 mode=DECODE dummy),所以全 rank 一起跳、不进 GLOBAL 集合→不 hang;idle MoE 输出本就无用。开关 `KUNSERVE_SKIP_IDLE_MOE`(默认 1)。
+
+### 当前可跑通配置
+`run_deepep_ll_graph_fp8_smoke.sh` 默认(`KUNSERVE_LOCAL_NORMAL=1` + `ROLLOUT_ENFORCE_EAGER=True` + `KUNSERVE_SKIP_IDLE_MOE=1` + `NVSHMEM_DISABLE_NCCL=1`):LOCAL=DeepEP-NORMAL(eager),GLOBAL=LL,balloon 正确收尾干净。

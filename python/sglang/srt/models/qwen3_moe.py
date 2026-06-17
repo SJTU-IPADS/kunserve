@@ -372,6 +372,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        # Phase-E idle-keepalive guard: when ALL replicas are idle (drain), the
+        # scheduler still issues ForwardMode.IDLE keepalive GLOBAL forwards. Feeding
+        # the DeepEP LL `low_latency_dispatch` a degenerate idle batch (0 / tiny
+        # padded tokens) crashes with `CUDA error: misaligned address` (the documented
+        # "Phase E not done" endgame crash). IDLE keepalives are issued in lockstep on
+        # every rank (a busy peer instead gets a mode=DECODE dummy of target_bs>0), so
+        # skipping the MoE dispatch on IDLE is collective-safe: every rank skips
+        # together, the GLOBAL all-to-all is simply not entered. The idle MoE output is
+        # unused anyway. KUNSERVE_SKIP_IDLE_MOE=0 reverts.
+        if (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_idle()
+            and os.environ.get("KUNSERVE_SKIP_IDLE_MOE", "1") != "0"
+        ):
+            return torch.zeros_like(hidden_states)
         # [MOE-IO] compounding-drift tracker: log layer-0 MoE INPUT/OUTPUT magnitude
         # across the WHOLE run (uncapped, sampled). The per-forward GEMM parity is
         # input-faithful (garbage-in-garbage-out matches), so it cannot see a slow

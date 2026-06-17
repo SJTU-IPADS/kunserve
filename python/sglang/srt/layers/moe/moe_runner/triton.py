@@ -175,6 +175,42 @@ class TritonRunnerCore(MoeRunnerCore):
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
+        # [TRITON-LOCAL] KunServe probe: this Triton runner is the forced LOCAL path
+        # (KUNSERVE_LOCAL_NORMAL=0, Standard+Triton+fp8) that garbles. The leading
+        # suspect is EP non-local expert handling: StandardDispatcher remaps topk to
+        # local ids with non-local = -1 (standard.py:215). Check whether those -1 are
+        # correctly excluded: n_neg = #(-1) in topk; n_oor = #(>=E) out-of-range;
+        # expert_ids range = what moe_align routed the (padded) blocks to. If -1 tokens
+        # leak into a real expert block (expert_ids has no sentinel, or topk has -1 the
+        # kernel indexes), non-local tokens get the WRONG expert -> garbled.
+        # KUNSERVE_DETAIL_LOG-gated; skipped during cuda-graph capture (.item() sync).
+        import os as _os_trl
+        if _os_trl.environ.get("KUNSERVE_DETAIL_LOG") and not torch.cuda.is_current_stream_capturing():
+            _ct = getattr(type(self), "_kun_trl_ct", 0) + 1
+            type(self)._kun_trl_ct = _ct
+            if _ct <= 40:
+                try:
+                    import datetime as _dt_trl
+                    _ti = topk_ids
+                    _eid = expert_ids
+                    with open(_os_trl.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{_dt_trl.datetime.now()} pid={_os_trl.getpid()}] [KUNSERVE-DBG] "
+                            f"[TRITON-LOCAL] ct={_ct} M={M} E={E} topk={tuple(_ti.shape)} "
+                            f"topk_min={int(_ti.min().item())} topk_max={int(_ti.max().item())} "
+                            f"n_neg={int((_ti < 0).sum().item())} n_oor={int((_ti >= E).sum().item())} "
+                            f"expert_ids=({int(_eid.min().item())},{int(_eid.max().item())}) "
+                            f"n_post={int(num_tokens_post_padded.item()) if num_tokens_post_padded is not None else None} "
+                            f"use_fp8={use_fp8_w8a8} block={block_shape} w13={tuple(w13.shape)} "
+                            f"x_abs_mean={hidden_states.float().abs().mean().item():.4f}\n"
+                        )
+                except Exception as _e_trl:
+                    try:
+                        with open(_os_trl.environ.get("KUNSERVE_DETAIL_LOG", "/dev/null"), "a") as _f:
+                            _f.write(f"[KUNSERVE-DBG] [TRITON-LOCAL] ERROR: {_e_trl!r}\n")
+                    except Exception:
+                        pass
+
         intermediate_cache1 = torch.empty(
             (M, topk_ids.shape[1], N),
             device=hidden_states.device,
