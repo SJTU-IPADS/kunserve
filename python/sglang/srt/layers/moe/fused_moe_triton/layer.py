@@ -1540,6 +1540,28 @@ class FusedMoE(torch.nn.Module):
                     except Exception:
                         pass
 
+        # KUNSERVE [EP-REDUCE] probe: the cross-run MOE-IO comparison proved the
+        # forced-Standard LOCAL path returns ~62% of the DeepEP output at layer-0
+        # step-0 (out_max 0.76 vs 1.22, identical for Triton R1 and deep_gemm R2),
+        # i.e. the per-EP-rank partials are NOT being summed. StandardDispatcher's
+        # combine is a no-op, so the only EP aggregation is this reduce_results
+        # all-reduce -- but tensor_model_parallel_all_reduce uses get_tp_group(),
+        # which may not span the moe_ep_group in the deepep/EP config. Dump the
+        # reduce decision + tp/ep world sizes + magnitude before/after so we can
+        # tell exactly why the partials stay un-summed. Layer 0, first few
+        # non-capture calls only (D2H .item() is illegal during capture).
+        _epr_pre = None
+        if (
+            os.environ.get("KUNSERVE_DETAIL_LOG")
+            and int(getattr(self, "layer_id", -1)) == 0
+            and not torch.cuda.is_current_stream_capturing()
+            and getattr(type(self), "_kun_epr_ct", 0) < 6
+        ):
+            try:
+                _epr_pre = float(final_hidden_states.float().abs().max().item())
+            except Exception:
+                _epr_pre = None
+
         if (
             self.reduce_results
             and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
@@ -1552,6 +1574,37 @@ class FusedMoE(torch.nn.Module):
                     )
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if _epr_pre is not None:
+            try:
+                from sglang.srt.distributed.parallel_state import (
+                    get_moe_ep_group as _gep,
+                )
+                from sglang.srt.distributed.parallel_state import get_tp_group as _gtp
+
+                type(self)._kun_epr_ct = getattr(type(self), "_kun_epr_ct", 0) + 1
+                _post = float(final_hidden_states.float().abs().max().item())
+                try:
+                    _epws = _gep().world_size
+                except Exception:
+                    _epws = -1
+                _will = bool(
+                    self.reduce_results
+                    and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
+                    and not kunserve_tp_allreduce_done
+                )
+                with open(os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _fp:
+                    _fp.write(
+                        f"[{datetime.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
+                        f"[EP-REDUCE] disp={type(self.dispatcher).__name__} "
+                        f"reduce_results={self.reduce_results} "
+                        f"moe_tp_size={self.moe_tp_size} moe_ep_size={self.moe_ep_size} "
+                        f"done={kunserve_tp_allreduce_done} will_reduce={_will} "
+                        f"tp_ws={_gtp().world_size} ep_ws={_epws} "
+                        f"pre_max={_epr_pre:.4f} post_max={_post:.4f}\n"
+                    )
+            except Exception:
+                pass
 
         return final_hidden_states
 
