@@ -629,10 +629,72 @@ def post_permute_deep_gemm_to_standard(
         BLOCK_SIZE=512,
     )
 
+    # KUNSERVE [STD-CMB] probe: [EP-REDUCE] proved the reduce is fine and the
+    # summed partials are still ~62% of DeepEP -> experts dropped before reduce.
+    # This combine-side probe (standard->deep_gemm gather) reports, per token:
+    # how many topk experts survived (>=0), the SUM of their topk_weights (over
+    # both EP ranks this must reconstruct ~1.0 if no expert is lost), the gathered
+    # masked-GEMM source magnitude/NaN, and the combine output magnitude BEFORE
+    # and AFTER routed_scaling_factor (a prime "right-content/wrong-scale" suspect).
+    # Capture-illegal D2H, so guard on stream capture; first few calls only.
+    _cmb = None
+    try:
+        import os as _os
+
+        if (
+            _os.environ.get("KUNSERVE_DETAIL_LOG")
+            and not torch.cuda.is_current_stream_capturing()
+            and getattr(post_permute_deep_gemm_to_standard, "_kun_cmb_ct", 0) < 4
+        ):
+            post_permute_deep_gemm_to_standard._kun_cmb_ct = (
+                getattr(post_permute_deep_gemm_to_standard, "_kun_cmb_ct", 0) + 1
+            )
+            _valid_mask = topk_ids >= 0
+            _ntok = int(topk_ids.shape[0]) if topk_ids.dim() >= 1 else -1
+            _surv = int(_valid_mask.sum().item())
+            _surv_w = float((topk_weights * _valid_mask.to(topk_weights.dtype)).sum().item())
+            _all_w = float(topk_weights.sum().item())
+            _src = runner_output.hidden_states
+            _src_max = float(_src.float().abs().max().item()) if _src.numel() else 0.0
+            _src_nan = bool(torch.isnan(_src.float()).any().item()) if _src.numel() else False
+            _out_pre = float(output.float().abs().max().item())
+            _cmb = (
+                _ntok,
+                _surv,
+                _surv_w,
+                _all_w,
+                _src_max,
+                _src_nan,
+                _out_pre,
+            )
+    except Exception:
+        _cmb = None
+
     dispose_tensor(runner_output.hidden_states)
 
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
+
+    if _cmb is not None:
+        try:
+            import datetime as _dt
+            import os as _os
+
+            _ntok, _surv, _surv_w, _all_w, _src_max, _src_nan, _out_pre = _cmb
+            _out_post = float(output.float().abs().max().item())
+            with open(_os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _fp:
+                _fp.write(
+                    f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] [STD-CMB] "
+                    f"top_k={runner_config.top_k} ntok={_ntok} surv={_surv} "
+                    f"surv_per_tok={_surv/max(_ntok,1):.2f} "
+                    f"surv_w_per_tok={_surv_w/max(_ntok,1):.3f} "
+                    f"all_w_per_tok={_all_w/max(_ntok,1):.3f} "
+                    f"src_max={_src_max:.4f} src_nan={_src_nan} "
+                    f"routed_scale={runner_config.routed_scaling_factor} "
+                    f"out_pre={_out_pre:.4f} out_post={_out_post:.4f}\n"
+                )
+        except Exception:
+            pass
 
     return StandardCombineInput(
         hidden_states=output,

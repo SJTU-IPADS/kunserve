@@ -208,6 +208,25 @@ class StandardDispatcher(BaseDispatcher):
         ):
             self._get_or_create_local_expert_mapping(topk_output.topk_ids.device)
 
+        # KUNSERVE [STD-MAP] probe: [EP-REDUCE] proved the all-reduce works
+        # (tp_ws=ep_ws=2, both ranks summed) yet the summed MoE output is still
+        # ~62% of DeepEP's -> experts are DROPPED before the reduce. Prime suspect
+        # is this remap: topk_ids are PHYSICAL (post ExpertLocationDispatchInfo),
+        # and the naive rank*N local_expert_mapping may send experts that ARE local
+        # to -1. Capture the ORIGINAL ids here (pre-remap) so the post-remap block
+        # can report how many survive. D2H .item() is illegal during capture.
+        import os as _os
+
+        _stdmap_orig = None
+        if (
+            _os.environ.get("KUNSERVE_DETAIL_LOG")
+            and not torch.cuda.is_current_stream_capturing()
+            and getattr(type(self), "_kun_stdmap_ct", 0) < 4
+            and self.local_expert_mapping is not None
+            and TopKOutputChecker.format_is_standard(topk_output)
+        ):
+            _stdmap_orig = topk_output.topk_ids
+
         if self.local_expert_mapping is not None and not _use_aiter:
             self._get_or_create_local_expert_mapping(topk_output.topk_ids.device)
             if TopKOutputChecker.format_is_standard(topk_output):
@@ -216,6 +235,43 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                 raise NotImplementedError()
+
+        if _stdmap_orig is not None:
+            try:
+                import datetime as _dt
+
+                type(self)._kun_stdmap_ct = getattr(type(self), "_kun_stdmap_ct", 0) + 1
+                _m = self.local_expert_mapping
+                _ntok = int(_stdmap_orig.shape[0]) if _stdmap_orig.dim() >= 1 else -1
+                _total = int(_stdmap_orig.numel())
+                # rightful-local = original physical id in this rank's owned window
+                _lo = self.moe_ep_rank * self.num_local_routed_experts
+                _hi = _lo + self.num_local_routed_experts
+                _rightful = int(
+                    ((_stdmap_orig >= _lo) & (_stdmap_orig < _hi)).sum().item()
+                )
+                _survive = int((topk_output.topk_ids >= 0).sum().item())
+                _nz = (_m >= 0).nonzero().flatten()
+                _glo_lo = int(_nz.min().item()) if _nz.numel() else -1
+                _glo_hi = int(_nz.max().item()) if _nz.numel() else -1
+                _omin = int(_stdmap_orig.min().item())
+                _omax = int(_stdmap_orig.max().item())
+                with open(
+                    _os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8"
+                ) as _fp:
+                    _fp.write(
+                        f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
+                        f"[STD-MAP] ep_rank={self.moe_ep_rank} num_experts={self.num_experts} "
+                        f"num_local_routed={self.num_local_routed_experts} "
+                        f"map_valid={int((_m >= 0).sum().item())} "
+                        f"map_global_range=[{_glo_lo},{_glo_hi}] "
+                        f"orig_id_range=[{_omin},{_omax}] "
+                        f"rightful_local={_rightful} survive={_survive} total={_total} "
+                        f"ntok={_ntok} survive_per_tok={_survive/max(_ntok,1):.2f} "
+                        f"rightful_per_tok={_rightful/max(_ntok,1):.2f}\n"
+                    )
+            except Exception:
+                pass
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,
