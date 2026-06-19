@@ -256,6 +256,12 @@ class StandardDispatcher(BaseDispatcher):
                 _glo_hi = int(_nz.max().item()) if _nz.numel() else -1
                 _omin = int(_stdmap_orig.min().item())
                 _omax = int(_stdmap_orig.max().item())
+                # Dump the SAME tokens' raw physical topk_ids on every rank: if
+                # rank0 and rank1 disagree on token-0's 8 experts, the topk /
+                # ExpertLocationDispatchInfo routing is rank-inconsistent (each
+                # rank computes a different routing -> all-reduce sums garbage).
+                _t0 = _stdmap_orig[0].tolist() if _ntok > 0 else []
+                _t1 = _stdmap_orig[1].tolist() if _ntok > 1 else []
                 with open(
                     _os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8"
                 ) as _fp:
@@ -268,7 +274,8 @@ class StandardDispatcher(BaseDispatcher):
                         f"orig_id_range=[{_omin},{_omax}] "
                         f"rightful_local={_rightful} survive={_survive} total={_total} "
                         f"ntok={_ntok} survive_per_tok={_survive/max(_ntok,1):.2f} "
-                        f"rightful_per_tok={_rightful/max(_ntok,1):.2f}\n"
+                        f"rightful_per_tok={_rightful/max(_ntok,1):.2f} "
+                        f"orig_tok0={_t0} orig_tok1={_t1}\n"
                     )
             except Exception:
                 pass
