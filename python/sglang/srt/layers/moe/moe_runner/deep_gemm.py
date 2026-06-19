@@ -580,6 +580,75 @@ def pre_permute_standard_to_deep_gemm(
         )
     )
 
+    # KUNSERVE [STD-REF] from-scratch (NON input-faithful) reference. Every
+    # structural check (routing/dispatch/weights/reduce/per-(g,t) GEMM) passed
+    # yet the partials sum to ~62% of DeepEP -> a "verified" component must be
+    # verified on an unrepresentative sample. This computes token0's per-rank
+    # partial (Sum over its LOCAL surviving experts of w_k * down(silu(gate)*up))
+    # FROM THE ORIGINAL bf16 hidden (pre-fp8-quant), using the SAME dequantized
+    # weights the masked GEMM uses. post_permute compares it to output[0] (the
+    # masked path's combine). Big diff => the masked/scatter/quant path corrupts
+    # (the same suspect as the open GLOBAL-LL garbling); ~fp8 noise => masked
+    # compute is fine and the contradiction lies elsewhere.
+    try:
+        import os as _os
+
+        if (
+            _os.environ.get("KUNSERVE_DETAIL_LOG")
+            and not torch.cuda.is_current_stream_capturing()
+            and getattr(pre_permute_standard_to_deep_gemm, "_kun_ref_ct", 0) < 3
+            and hidden_states_ref.dim() == 2
+            and hidden_states_ref.shape[0] > 0
+        ):
+            import torch.nn.functional as _F
+
+            pre_permute_standard_to_deep_gemm._kun_ref_ct = (
+                getattr(pre_permute_standard_to_deep_gemm, "_kun_ref_ct", 0) + 1
+            )
+            _w13 = quant_info.w13_weight  # [E, N=1536, K=2048] fp8
+            _w13s = quant_info.w13_scale  # [E, N//128, K//128]
+            _w2 = quant_info.w2_weight  # [E, N2=2048, K2=768] fp8
+            _w2s = quant_info.w2_scale  # [E, N2//128, K2//128]
+            _x0 = hidden_states_ref[0].float()  # [K] ORIGINAL pre-quant hidden
+            _N, _K = int(_w13.shape[1]), int(_w13.shape[2])
+            _bn, _bk = _N // 128, _K // 128
+            _N2, _K2 = int(_w2.shape[1]), int(_w2.shape[2])
+            _bn2, _bk2 = _N2 // 128, _K2 // 128
+            _ref = torch.zeros(_N2, dtype=torch.float32, device=_x0.device)
+            _ne = 0
+            for _k in range(int(runner_config.top_k)):
+                _e = int(topk_ids[0, _k].item())
+                if _e < 0 or _e >= _w13.shape[0]:
+                    continue
+                _ne += 1
+                _w13e = (
+                    _w13[_e].float().view(_bn, 128, _bk, 128)
+                    * _w13s[_e].float().view(_bn, 1, _bk, 1)
+                ).view(_N, _K)
+                _gu = _x0 @ _w13e.t()  # [N]
+                _half = _N // 2
+                _h = _F.silu(_gu[:_half]) * _gu[_half:]  # [N/2]
+                _w2e = (
+                    _w2[_e].float().view(_bn2, 128, _bk2, 128)
+                    * _w2s[_e].float().view(_bn2, 1, _bk2, 1)
+                ).view(_N2, _K2)
+                _oe = _h @ _w2e.t()  # [N2]
+                _ref += float(topk_weights[0, _k].item()) * _oe
+            running_state["_kun_ref_partial0"] = _ref
+            running_state["_kun_ref_nexp"] = _ne
+            running_state["_kun_ref_x0absmean"] = float(_x0.abs().mean().item())
+    except Exception as _e:
+        running_state.pop("_kun_ref_partial0", None)
+        try:
+            import os as _os2
+
+            with open(
+                _os2.environ.get("KUNSERVE_DETAIL_LOG", "/dev/null"), "a"
+            ) as _f:
+                _f.write(f"[KUNSERVE-DBG] [STD-REF] pre ERROR: {_e!r}\n")
+        except Exception:
+            pass
+
     dispose_tensor(hidden_states_ref)
 
     running_state["topk_ids"] = topk_ids
@@ -628,6 +697,35 @@ def post_permute_deep_gemm_to_standard(
         hidden_states_shape[1],
         BLOCK_SIZE=512,
     )
+
+    # KUNSERVE [STD-REF]: compare the masked path's token0 partial (output[0],
+    # pre routed_scale) against the from-scratch bf16 reference stashed in
+    # pre_permute. Same local experts, same weights, same dequantized weights;
+    # the ONLY difference is masked GEMM/fp8-quant/scatter vs a clean bf16 matmul
+    # on the ORIGINAL hidden. Big diff pins the bug to the masked compute path.
+    _ref0 = running_state.pop("_kun_ref_partial0", None)
+    if _ref0 is not None:
+        try:
+            import datetime as _dt
+            import os as _os
+
+            _act0 = output[0].float()
+            _r = _ref0.float()
+            _d = (_r - _act0).abs()
+            _den = _r.abs().mean().item()
+            with open(_os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _fp:
+                _fp.write(
+                    f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] [STD-REF] "
+                    f"nexp={running_state.get('_kun_ref_nexp')} "
+                    f"x0_absmean={running_state.get('_kun_ref_x0absmean'):.4f} "
+                    f"ref_absmean={_den:.5f} act_absmean={_act0.abs().mean().item():.5f} "
+                    f"ref_max={_r.abs().max().item():.4f} act_max={_act0.abs().max().item():.4f} "
+                    f"max_abs_diff={_d.max().item():.4f} mean_abs_diff={_d.mean().item():.5f} "
+                    f"rel_mean_diff={(_d.mean().item()/max(_den,1e-9)):.3f} "
+                    f"ref[:4]={_r[:4].tolist()} act[:4]={_act0[:4].tolist()}\n"
+                )
+        except Exception:
+            pass
 
     # KUNSERVE [STD-CMB] probe: [EP-REDUCE] proved the reduce is fine and the
     # summed partials are still ~62% of DeepEP -> experts dropped before reduce.
