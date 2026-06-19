@@ -262,12 +262,32 @@ class StandardDispatcher(BaseDispatcher):
                 # rank computes a different routing -> all-reduce sums garbage).
                 _t0 = _stdmap_orig[0].tolist() if _ntok > 0 else []
                 _t1 = _stdmap_orig[1].tolist() if _ntok > 1 else []
+                # global_rank pairs ep0/ep1 into the SAME replica (0,1=replica0;
+                # 2,3=replica1) so we can finally confirm: do the two ranks of ONE
+                # replica see the SAME token0 hidden (replicated -> all_reduce OK)
+                # or DIFFERENT (sharded -> all_reduce sums unrelated tokens = bug)?
+                try:
+                    import torch.distributed as _dist
+
+                    _grank = (
+                        _dist.get_rank()
+                        if _dist.is_available() and _dist.is_initialized()
+                        else -1
+                    )
+                except Exception:
+                    _grank = -1
+                _hid0 = (
+                    [round(float(v), 4) for v in hidden_states[0, :4].tolist()]
+                    if hidden_states.dim() == 2 and hidden_states.shape[0] > 0
+                    else []
+                )
                 with open(
                     _os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8"
                 ) as _fp:
                     _fp.write(
                         f"[{_dt.datetime.now()} pid={_os.getpid()}] [KUNSERVE-DBG] "
-                        f"[STD-MAP] ep_rank={self.moe_ep_rank} num_experts={self.num_experts} "
+                        f"[STD-MAP] grank={_grank} ep_rank={self.moe_ep_rank} "
+                        f"num_experts={self.num_experts} "
                         f"num_local_routed={self.num_local_routed_experts} "
                         f"map_valid={int((_m >= 0).sum().item())} "
                         f"map_global_range=[{_glo_lo},{_glo_hi}] "
@@ -275,7 +295,7 @@ class StandardDispatcher(BaseDispatcher):
                         f"rightful_local={_rightful} survive={_survive} total={_total} "
                         f"ntok={_ntok} survive_per_tok={_survive/max(_ntok,1):.2f} "
                         f"rightful_per_tok={_rightful/max(_ntok,1):.2f} "
-                        f"orig_tok0={_t0} orig_tok1={_t1}\n"
+                        f"orig_tok0={_t0} orig_tok1={_t1} hid0={_hid0}\n"
                     )
             except Exception:
                 pass
