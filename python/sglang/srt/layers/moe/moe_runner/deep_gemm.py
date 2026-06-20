@@ -580,16 +580,13 @@ def pre_permute_standard_to_deep_gemm(
         )
     )
 
-    # KUNSERVE [STD-REF] from-scratch (NON input-faithful) reference. Every
-    # structural check (routing/dispatch/weights/reduce/per-(g,t) GEMM) passed
-    # yet the partials sum to ~62% of DeepEP -> a "verified" component must be
-    # verified on an unrepresentative sample. This computes token0's per-rank
-    # partial (Sum over its LOCAL surviving experts of w_k * down(silu(gate)*up))
-    # FROM THE ORIGINAL bf16 hidden (pre-fp8-quant), using the SAME dequantized
-    # weights the masked GEMM uses. post_permute compares it to output[0] (the
-    # masked path's combine). Big diff => the masked/scatter/quant path corrupts
-    # (the same suspect as the open GLOBAL-LL garbling); ~fp8 noise => masked
-    # compute is fine and the contradiction lies elsewhere.
+    # KUNSERVE [STD-REF] input-faithful reference for Standard+DeepGEMM. It
+    # computes local row 0's per-rank partial from the original bf16 hidden
+    # (pre-fp8 quant) with the same dequantized local weights used by masked GEMM.
+    # post_permute compares it to output[0]. A large diff would pin corruption on
+    # masked/scatter/quant. A small fp8-sized diff only proves deep_gemm faithfully
+    # computed the given local topk; it does not prove that StandardDispatcher's
+    # later all-reduce is valid for the cross-rank token layout.
     try:
         import os as _os
 
@@ -698,11 +695,12 @@ def post_permute_deep_gemm_to_standard(
         BLOCK_SIZE=512,
     )
 
-    # KUNSERVE [STD-REF]: compare the masked path's token0 partial (output[0],
-    # pre routed_scale) against the from-scratch bf16 reference stashed in
-    # pre_permute. Same local experts, same weights, same dequantized weights;
-    # the ONLY difference is masked GEMM/fp8-quant/scatter vs a clean bf16 matmul
-    # on the ORIGINAL hidden. Big diff pins the bug to the masked compute path.
+    # KUNSERVE [STD-REF]: compare the masked path's row-0 partial (output[0],
+    # pre routed_scale) against the bf16 reference stashed in pre_permute. Same
+    # local experts, weights, and dequantized weights; the only difference is
+    # masked GEMM/fp8-quant/scatter versus direct bf16 matmul on the original
+    # hidden. Small diff clears the runner and shifts suspicion to token layout
+    # and the Standard all-reduce contract.
     _ref0 = running_state.pop("_kun_ref_partial0", None)
     if _ref0 is not None:
         try:
@@ -727,11 +725,9 @@ def post_permute_deep_gemm_to_standard(
         except Exception:
             pass
 
-    # KUNSERVE [STD-CMB] probe: [EP-REDUCE] proved the reduce is fine and the
-    # summed partials are still ~62% of DeepEP -> experts dropped before reduce.
-    # This combine-side probe (standard->deep_gemm gather) reports, per token:
-    # how many topk experts survived (>=0), the SUM of their topk_weights (over
-    # both EP ranks this must reconstruct ~1.0 if no expert is lost), the gathered
+    # KUNSERVE [STD-CMB] probe: combine-side diagnostics for the same
+    # Standard+DeepGEMM path. It reports, per local row: how many topk experts
+    # survived (>=0), the SUM of their topk_weights, the gathered
     # masked-GEMM source magnitude/NaN, and the combine output magnitude BEFORE
     # and AFTER routed_scaling_factor (a prime "right-content/wrong-scale" suspect).
     # Capture-illegal D2H, so guard on stream capture; first few calls only.

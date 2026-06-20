@@ -161,3 +161,27 @@ LOCAL 修好后,首次跑了**会触发 balloon 的 workload**:**balloon 请求 
 
 ### 当前可跑通配置
 `run_deepep_ll_graph_fp8_smoke.sh` 默认(`KUNSERVE_LOCAL_NORMAL=1` + `ROLLOUT_ENFORCE_EAGER=True` + `KUNSERVE_SKIP_IDLE_MOE=1` + `NVSHMEM_DISABLE_NCCL=1`):LOCAL=DeepEP-NORMAL(eager),GLOBAL=LL,balloon 正确收尾干净。
+---
+
+## 13. 2026-06-19/20 更新: Standard+DeepGEMM 只能作为诊断路径
+
+新 no-balloon 日志:
+
+- LL: `/workspace/deepep_ll_graph_fp8_20260619_093208`
+- NORMAL: `/workspace/deepep_normal_fp8_20260616_132645`
+
+LL 这次实际不是 `LOCAL=DeepEP-NORMAL`: 运行环境同时带了 `KUNSERVE_LOCAL_NORMAL=1` 和 `KUNSERVE_LOCAL_DEEPGEMM=1`,旧 `model_runner.py` 优先执行了 `KUNSERVE_LOCAL_DEEPGEMM`,日志开头显示 `forced LOCAL bundle to StandardDispatcher + DEEP_GEMM runner`。因此这次乱码证明的是 `StandardDispatcher+DeepGEMM` 的 LOCAL 路径不正确,不是 DeepEP-NORMAL 不正确。
+
+硬证据:
+
+- `[STD-REF]` 的 `rel_mean_diff` 只有 fp8 量级,说明 masked GEMM 忠实计算了给定的 local topk/hidden。
+- `[STD-MAP]` 在同一个 replica 内的 `grank=0/1` 上,local row0 的 `hid0` 和 `orig_tok0` 都不同,说明 EP rank 看到的是不同 token 行。
+- Standard combine 是 no-op,随后依赖 `reduce_results=True` 的 all-reduce 把各 rank 的 row i 相加。这个前提要求 row i 是同一个 token 的不同 expert partial。当前 deepep EP layout 下 row i 是不同 token,所以会得到幅度正常但语义混合的输出,表现为乱码。
+
+结论:
+
+- 正确性默认路径必须是 `KUNSERVE_LOCAL_NORMAL=1` -> `LOCAL=DeepEP-NORMAL+deep_gemm+eager`。
+- 性能实验路径是 `KUNSERVE_LOCAL_LL=1` -> 保留 `LOCAL=DeepEP-AUTO/LL`。先用 no-balloon workload 验证 local-only 正确性/速度;若后续触发 balloon,仍可能遇到 LOCAL LL 与 GLOBAL LL 的 NVSHMEM double-init/context 冲突。
+- `KUNSERVE_LOCAL_DEEPGEMM=1` 只允许配合 `KUNSERVE_LOCAL_NORMAL=0` 做诊断/复现,不能再被当作恢复 LOCAL CUDA graph 的候选正确路径。
+- 要恢复 LOCAL graph/LL 性能,需要继续沿 DeepEP-LL 或保持 token 身份的 graph-safe collective 方向做,不能只把 StandardDispatcher 的 runner 从 Triton 换成 DeepGEMM。
+

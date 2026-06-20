@@ -770,26 +770,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get()
             and not envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
         ):
-            # KUNSERVE_LOCAL_NORMAL (default 1): force LOCAL to DeepEP **NORMAL**
-            # mode (deep_gemm contiguous, the M1-correct LOCAL path) instead of the
-            # StandardDispatcher+Triton path. The Standard+Triton override is known to
-            # produce ~25% degenerate/garbled outputs (see comment above + the
-            # 2026-06-16 isolation: deepep_normal smoke = correct, LL smoke forced
-            # Standard+Triton = 8/8 garbled, both no-balloon/fp8). DeepEP-NORMAL skips
-            # NVSHMEM init (buffer.py:96 gate) so it does NOT double-init with the
-            # GLOBAL LL bundle, yet computes correctly. Set =0 to revert to the
-            # (broken) Standard+Triton override for A/B.
-            # R2 (KUNSERVE_LOCAL_DEEPGEMM=1): StandardDispatcher + deep_gemm runner.
-            # Graph-friendly (fixed shapes) AND fp8-correct (deep_gemm is the proven
-            # path; the standard->deep_gemm -1 bug was post_reorder's `>0` dropping
-            # expert 0, now fixed to `>=0`). This is the route to RESTORE the LOCAL
-            # CUDA graph (no enforce_eager needed), unlike DeepEP-NORMAL (eager-only).
-            if os.environ.get("KUNSERVE_LOCAL_DEEPGEMM", "0") != "0":
+            # LOCAL correctness override:
+            #
+            # KUNSERVE_LOCAL_LL=1 is the performance experiment: keep the
+            # original LOCAL DeepEP AUTO dispatcher, so decode uses low_latency
+            # and prefill uses NORMAL. This is the right direction for speed, but
+            # it can initialize NVSHMEM on the LOCAL TP group before KunServe later
+            # tries to build a GLOBAL LL group; that double-init hazard is why the
+            # default below remains DeepEP-NORMAL. Use LOCAL_LL first for
+            # no-balloon/local-only correctness and performance measurements.
+            #
+            # KUNSERVE_LOCAL_NORMAL=1 (default) keeps the LOCAL DeepEP dispatcher
+            # but forces its inner mode to NORMAL. That path skips NVSHMEM init
+            # (buffer.py gate), keeps the baseline deep_gemm FP8 runner, and is
+            # the only validated LOCAL path when EP ranks hold token-sharded MoE
+            # inputs.
+            #
+            # KUNSERVE_LOCAL_DEEPGEMM=1 is retained only as an explicit
+            # diagnostic path when KUNSERVE_LOCAL_NORMAL=0. The 2026-06-19
+            # no-balloon run showed why it cannot be the default: with
+            # moe_a2a_backend=deepep, rank0/rank1 inside the same replica saw
+            # different hidden_states[0] / topk token rows, but StandardDispatcher
+            # combines by leaving rows in place and relying on reduce_results=True
+            # all-reduce. That sums unrelated token rows and produces plausible
+            # magnitudes with wrong content. deep_gemm can faithfully compute the
+            # given topk ([STD-REF]), but it cannot fix this token-layout mismatch.
+            local_ll = os.environ.get("KUNSERVE_LOCAL_LL", "0") != "0"
+            local_normal = os.environ.get("KUNSERVE_LOCAL_NORMAL", "1") != "0"
+            local_deepgemm = os.environ.get("KUNSERVE_LOCAL_DEEPGEMM", "0") != "0"
+            if local_ll:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] keeping LOCAL DeepEP AUTO/LL dispatcher because "
+                    "KUNSERVE_LOCAL_LL=1; decode will use DeepEP low_latency. "
+                    "This is intended for local-only/no-balloon experiments until "
+                    "LOCAL and GLOBAL LL NVSHMEM contexts can be reconciled."
+                )
+            elif local_normal:
+                if local_deepgemm:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] ignoring KUNSERVE_LOCAL_DEEPGEMM=1 because "
+                        "KUNSERVE_LOCAL_NORMAL=1; LOCAL correctness requires "
+                        "DeepEP-NORMAL under the current token-sharded EP layout. "
+                        "Set KUNSERVE_LOCAL_NORMAL=0 only for StandardDispatcher "
+                        "diagnostics."
+                    )
+                self._force_local_bundle_to_deepep_normal()
+            elif local_deepgemm:
                 self._force_local_bundle_to_standard_dispatcher(
                     runner_backend_name="deep_gemm"
                 )
-            elif os.environ.get("KUNSERVE_LOCAL_NORMAL", "1") != "0":
-                self._force_local_bundle_to_deepep_normal()
             else:
                 self._force_local_bundle_to_standard_dispatcher()
 
@@ -844,13 +873,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ``runner_backend_name``:
           - "triton" (legacy): Triton runner. KNOWN to garble fp8 output (the
             fp8 Triton kernel path), see deepep_docs/deepep_bug_analysis.md.
-          - "deep_gemm" (R2): deep_gemm runner — the proven-correct fp8 path
-            (M1 GLOBAL uses it). The standard->deep_gemm permute was historically
-            "unsafe for -1", but the real bug was post_reorder_triton_kernel's
-            `expert_id > 0` (dropped local expert 0); fixed to `>= 0`. This route
-            is BOTH graph-friendly (fixed shapes) AND fp8-correct, so it can keep
-            the LOCAL CUDA graph (no enforce_eager needed). Selected by
-            KUNSERVE_LOCAL_DEEPGEMM=1.
+          - "deep_gemm": diagnostic runner using the proven FP8 math path. The
+            standard->deep_gemm permute was historically "unsafe for -1", but the
+            real bug was post_reorder_triton_kernel's `expert_id > 0` (dropped
+            local expert 0); fixed to `>= 0`.
+
+            This is NOT an end-to-end-correct substitute for DeepEP-NORMAL under
+            the current deepep EP token layout. StandardDispatcher assumes the
+            same token row exists on every rank before the final all-reduce. The
+            2026-06-19 no-balloon repro showed those rows are token-sharded
+            instead, so all-reduce mixes unrelated tokens. Select this only with
+            KUNSERVE_LOCAL_NORMAL=0 for probes.
         ``reduce_results=True`` tells FusedMoE.forward_impl to finish the TP
         all-reduce internally (qwen3_moe.forward_deepep does not add one).
         """
@@ -906,7 +939,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_tp_rank=layer.local_bundle.moe_tp_rank,
                 num_local_experts=layer.local_bundle.num_local_experts,
                 # Standard dispatch leaves partial sums on each rank, so
-                # FusedMoE.forward_impl must run tp_group all-reduce.
+                # FusedMoE.forward_impl runs the tp_group all-reduce. This is
+                # correct only when each rank's row i is the same token's
+                # partial output. In the DeepEP token-sharded LOCAL layout that
+                # precondition is false, which is why this bundle is a diagnostic
+                # path rather than the correctness path.
                 reduce_results=True,
             )
             # Refresh self.dispatcher / self.reduce_results / etc. on the
@@ -920,7 +957,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         _kunserve_ms(
             "[KUNSERVE-MS] forced LOCAL bundle to StandardDispatcher "
             "+ %s runner (reduce_results=True) on %d FusedMoE layers; "
-            "NVSHMEM will only init when the GLOBAL bundle is created.",
+            "diagnostic only under token-sharded EP layouts; use "
+            "KUNSERVE_LOCAL_NORMAL=1 for the validated DeepEP-NORMAL LOCAL path.",
             _runner_backend.name,
             len(layers),
         )
@@ -1539,11 +1577,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "engine_kwargs.sglang.moe_a2a_backend=deepep and "
                     "engine_kwargs.sglang.moe_runner_backend=deep_gemm, or set "
                     "kunserve_comm_backend='sglang' to use the new "
-                    "CrossReplicaStandardDispatcher. NOTE: the LOCAL bundle is "
-                    "intentionally overridden back to Standard by "
-                    "_force_local_bundle_to_standard_dispatcher (gated on "
-                    "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), so this flag only "
-                    "affects the GLOBAL bundle's default."
+                    "CrossReplicaStandardDispatcher. NOTE: LOCAL defaults to "
+                    "DeepEP-NORMAL via _force_local_bundle_to_deepep_normal when "
+                    "GLOBAL DeepEP LL is enabled. KUNSERVE_LOCAL_LL=1 keeps "
+                    "LOCAL DeepEP low_latency for local-only experiments; "
+                    "KUNSERVE_LOCAL_NORMAL=0 can still force StandardDispatcher "
+                    "for diagnostics, but that is not the validated correctness "
+                    "path under token-sharded EP. This flag only affects the "
+                    "GLOBAL bundle's default."
                 )
             if moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake():
                 # Refactor of the old hard "deepep => deep_gemm" assert into an

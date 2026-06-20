@@ -208,13 +208,13 @@ class StandardDispatcher(BaseDispatcher):
         ):
             self._get_or_create_local_expert_mapping(topk_output.topk_ids.device)
 
-        # KUNSERVE [STD-MAP] probe: [EP-REDUCE] proved the all-reduce works
-        # (tp_ws=ep_ws=2, both ranks summed) yet the summed MoE output is still
-        # ~62% of DeepEP's -> experts are DROPPED before the reduce. Prime suspect
-        # is this remap: topk_ids are PHYSICAL (post ExpertLocationDispatchInfo),
-        # and the naive rank*N local_expert_mapping may send experts that ARE local
-        # to -1. Capture the ORIGINAL ids here (pre-remap) so the post-remap block
-        # can report how many survive. D2H .item() is illegal during capture.
+        # KUNSERVE [STD-MAP] probe: capture the pre-remap topk ids and a small
+        # hidden-state sample for the same local row on each EP rank. This tests
+        # the key StandardDispatcher precondition: row i must be the same token on
+        # every rank before FusedMoE's reduce_results all-reduce. If same-replica
+        # ranks report different hidden_states[0] / topk rows, the batch is
+        # token-sharded and Standard all-reduce will mix unrelated token outputs.
+        # D2H .item() is illegal during capture, so log only outside CUDA graph.
         import os as _os
 
         _stdmap_orig = None
@@ -256,10 +256,9 @@ class StandardDispatcher(BaseDispatcher):
                 _glo_hi = int(_nz.max().item()) if _nz.numel() else -1
                 _omin = int(_stdmap_orig.min().item())
                 _omax = int(_stdmap_orig.max().item())
-                # Dump the SAME tokens' raw physical topk_ids on every rank: if
-                # rank0 and rank1 disagree on token-0's 8 experts, the topk /
-                # ExpertLocationDispatchInfo routing is rank-inconsistent (each
-                # rank computes a different routing -> all-reduce sums garbage).
+                # Dump local row 0/1 raw physical topk ids on every rank. If
+                # rank0 and rank1 disagree for row 0 and hid0 also differs, the
+                # rows are different tokens, not merely different expert routing.
                 _t0 = _stdmap_orig[0].tolist() if _ntok > 0 else []
                 _t1 = _stdmap_orig[1].tolist() if _ntok > 1 else []
                 # global_rank pairs ep0/ep1 into the SAME replica (0,1=replica0;
