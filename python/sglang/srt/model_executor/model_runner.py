@@ -71,7 +71,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
-from sglang.srt.kunserve_forward_timing import kunserve_timing_log, kunserve_timing_scope
+from sglang.srt.kunserve_forward_timing import (
+    kunserve_phase_e_log,
+    kunserve_timing_log,
+    kunserve_timing_scope,
+)
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -1048,7 +1052,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     int(local_padded),
                 )
             )
+            # Phase E timing (profiling-only, gated by KUNSERVE_PHASE_E_TIMING):
+            # bracket the step's FIRST cross-replica rendezvous with host-side
+            # CUDA events.  Its dur ~= tiny real comm (a few int32) + lockstep
+            # wait on the slowest peer, so it isolates how much of the black
+            # "lockstep-wait" is spent here vs the 48 per-layer dispatch
+            # all_gathers.  This collective is OUTSIDE the CUDA graph (host
+            # eager) and the existing .cpu() sync below makes the read free.
+            pe_timing = getattr(self, "_kunserve_phase_e_timing", None)
+            if pe_timing is None:
+                pe_timing = os.environ.get("KUNSERVE_PHASE_E_TIMING", "0") not in (
+                    "0",
+                    "",
+                    "false",
+                    "False",
+                    "no",
+                    "off",
+                )
+                self._kunserve_phase_e_timing = pe_timing
+            pe_start = pe_end = None
+            if pe_timing:
+                pe_start = getattr(self, "_kunserve_pe_start_evt", None)
+                if pe_start is None:
+                    pe_start = self._kunserve_pe_start_evt = torch.cuda.Event(
+                        enable_timing=True
+                    )
+                    pe_end = self._kunserve_pe_end_evt = torch.cuda.Event(
+                        enable_timing=True
+                    )
+                else:
+                    pe_end = self._kunserve_pe_end_evt
+                try:
+                    pe_start.record()
+                except Exception:
+                    pe_start = pe_end = None
             self._kunserve_all_gather_into_tensor(runtime_group, all_t, local_t)
+            if pe_end is not None:
+                try:
+                    pe_end.record()
+                except Exception:
+                    pe_end = None
             _kun_wd("[KUNSERVE-WD] neg_EXIT n=%d" % (self._kun_wd_negct,))
             all_t = all_t.view(world, payload_len)
             raw_values = all_t[:, 0]
@@ -1069,6 +1112,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     int(eager_values.max().item()),
                 )
             )
+            if pe_start is not None and pe_end is not None:
+                # .cpu() above already synced the stream, so pe_end is complete.
+                try:
+                    pe_gpu_ms = float(pe_start.elapsed_time(pe_end))
+                except Exception:
+                    pe_gpu_ms = None
+                if pe_gpu_ms is not None:
+                    kunserve_phase_e_log(
+                        "phase_e_negotiate",
+                        gpu_ms=round(pe_gpu_ms, 3),
+                        n=int(self._kun_wd_negct),
+                        raw_bs=int(local_raw_bs),
+                        padded_bs=int(local_padded),
+                        raw_max=int(raw_values.max().item()),
+                        raw_min=int(raw_values.min().item()),
+                        world=int(world),
+                    )
             return (
                 int(padded_values.max().item()),
                 int(padded_values.min().item()),

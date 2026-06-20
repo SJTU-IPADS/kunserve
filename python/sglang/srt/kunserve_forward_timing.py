@@ -147,11 +147,7 @@ def _nvtx_message(event: str, fields: Dict[str, Any]) -> str:
     )
 
 
-def kunserve_timing_log(event: str, **fields: Any) -> None:
-    path = _enabled_path()
-    if not path:
-        return
-
+def _write_timing_record(path: str, event: str, fields: Dict[str, Any]) -> None:
     record: Dict[str, Any] = {
         "ts": time.time(),
         "perf_ns": time.perf_counter_ns(),
@@ -162,13 +158,44 @@ def kunserve_timing_log(event: str, **fields: Any) -> None:
         "event": event,
     }
     record.update({str(k): _json_safe(v) for k, v in fields.items()})
-
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def kunserve_timing_log(event: str, **fields: Any) -> None:
+    path = _enabled_path()
+    if not path:
+        return
+    _write_timing_record(path, event, fields)
+
+
+def _phase_e_path() -> Optional[str]:
+    """Independent log path for Phase E timing.
+
+    Deliberately NOT routed through _enabled_path()/kunserve_timing_enabled() so
+    that enabling KUNSERVE_PHASE_E_TIMING does NOT switch on kunserve_timing_scope
+    host logging (which would pollute the very gap we are measuring).
+    """
+    if os.environ.get("KUNSERVE_PHASE_E_TIMING", "0") in _FALSE_VALUES:
+        return None
+    path = os.environ.get("KUNSERVE_FORWARD_TIMING_LOG", "").strip()
+    if path:
+        return path
+    out_dir = os.environ.get("SGLANG_KUNSERVE_OUTPUT_DIR", "").strip()
+    if out_dir:
+        return os.path.join(out_dir, "kunserve_forward_timing.jsonl")
+    return None
+
+
+def kunserve_phase_e_log(event: str, **fields: Any) -> None:
+    path = _phase_e_path()
+    if not path:
+        return
+    _write_timing_record(path, event, fields)
 
 
 _CUDA_GRAPH_TIMING_CAPTURE_KEY: Optional[str] = None
