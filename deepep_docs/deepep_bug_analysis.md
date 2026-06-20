@@ -185,3 +185,36 @@ LL 这次实际不是 `LOCAL=DeepEP-NORMAL`: 运行环境同时带了 `KUNSERVE_
 - `KUNSERVE_LOCAL_DEEPGEMM=1` 只允许配合 `KUNSERVE_LOCAL_NORMAL=0` 做诊断/复现,不能再被当作恢复 LOCAL CUDA graph 的候选正确路径。
 - 要恢复 LOCAL graph/LL 性能,需要继续沿 DeepEP-LL 或保持 token 身份的 graph-safe collective 方向做,不能只把 StandardDispatcher 的 runner 从 Triton 换成 DeepGEMM。
 
+---
+
+## 14. 2026-06-20 更新: `093409` 不是输出乱码,而是 KunServe PG 初始化/清理失败
+
+日志: `/workspace/deepep_ll_graph_fp8_20260620_093409`。
+
+已确认上一轮 LOCAL LL 修复生效:
+- `kunserve_sglang_detail.log` 显示 `KUNSERVE_LOCAL_LL=1` 保留 LOCAL DeepEP AUTO/LL。
+- 同一日志显示 `skip LOCAL cuda graph capture`，所以这次没有再走 `low_latency_dispatch` 的 cuda graph capture 失败路径。
+
+这次先失败在 KunServe manager 启动 cross-replica update group:
+- manager 第一次选 `master=192.168.1.6:36969`。
+- replica0 rank0 建 TCPStore 立刻报 `EADDRINUSE`。
+- 其他 rank 等 TCPStore,60s 后 timeout。
+- 清理/恢复阶段 `resume_memory_occupation(tags=["weights", ...])` 在某些 rank 上遇到 `offload_tags` 里没有 `weights`,原代码 `remove()` 直接 `KeyError: 'weights'`,把 scheduler 打死。后续 manager 第二次 PG init 只能看到 `Server disconnected`。
+
+根因判断:
+- manager 原来用 `bind(0)`/`get_free_port()` 获取随机空闲端口,这是 kernel ephemeral range。
+- 它释放该端口后马上用 aiohttp 向两个 replica 发 HTTP RPC;内核可能把刚释放的端口分配给 outbound HTTP connection 的本地 source port。
+- 远端 rank0 随后 bind 同一个端口作为 TCPStore server,就会 `EADDRINUSE`。`36969` 和第二次的 `58925` 都落在常见 ephemeral range 内,符合这个模式。
+
+修复:
+1. `kunserve_manager/controller.py`: manager PG 端口改成固定低位扫描段,默认 `KUNSERVE_MANAGER_PG_PORT_BASE=24000`, `STRIDE=64`, `TRIES=64`,避免 primary path 使用 ephemeral port;global group 和 lane subgroup 都走同一选择器。
+2. `scheduler_update_weights_mixin.py`: `resume_memory_occupation` 改成幂等,只 resume 当前确实 offloaded 的 tag,对 missing tag 打 warning 后返回,不再 `KeyError` 杀 scheduler。
+3. `model_runner.py`: `destroy_weights_update_group` 对不存在的 group 视为已销毁,方便 failed-init cleanup 后 retry。
+4. `kunserve_manager/client.py`: HTTP 400 先读 response body 再抛错,manager 日志会直接包含 SGLang 返回的具体失败 message。
+5. `run_deepep_ll_graph_fp8_smoke.sh` + verl env pass-through: 默认透传 `KUNSERVE_MANAGER_PG_PORT_*` 和 `KUNSERVE_PG_INIT_TIMEOUT_SEC=20`,让坏 rendezvous 快速 retry。
+
+判读下一轮:
+- manager 日志应看到 `master=192.168.1.6:24000` 或相邻端口,而不是 3xxxx/5xxxx ephemeral 端口。
+- 不应再出现 `KeyError: 'weights'`。
+- 如果 PG ready 后仍输出乱码,那才回到 LOCAL LL/DeepEP 正确性路径继续查;`093409` 还没走到这个阶段。
+

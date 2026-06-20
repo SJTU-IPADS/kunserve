@@ -194,8 +194,15 @@ class KunServeHttpReplicaClient:
                 async with self._get_session(timeout=timeout) as session:
                     if method.upper() == "GET":
                         async with session.get(url) as response:
-                            response.raise_for_status()
                             result = await _read_async_response(response)
+                            if response.status >= 400:
+                                raise aiohttp.ClientResponseError(
+                                    response.request_info,
+                                    response.history,
+                                    status=response.status,
+                                    message=f"{response.reason}: {result}",
+                                    headers=response.headers,
+                                )
                             if should_trace:
                                 print(
                                     f"[KunServeHttpReplicaClient:{self.name}] {endpoint} response={result}",
@@ -203,8 +210,15 @@ class KunServeHttpReplicaClient:
                                 )
                             return result
                     async with session.post(url, json=payload or {}) as response:
-                        response.raise_for_status()
                         result = await _read_async_response(response)
+                        if response.status >= 400:
+                            raise aiohttp.ClientResponseError(
+                                response.request_info,
+                                response.history,
+                                status=response.status,
+                                message=f"{response.reason}: {result}",
+                                headers=response.headers,
+                            )
                         if should_trace:
                             print(
                                 f"[KunServeHttpReplicaClient:{self.name}] {endpoint} response={result}",

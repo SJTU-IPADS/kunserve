@@ -4833,7 +4833,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     torch.distributed.destroy_process_group(pg)
                 return True, "Succeeded to destroy custom process group."
             else:
-                return False, "The group to be destroyed does not exist."
+                # Idempotent destroy is important for KunServe retry cleanup:
+                # a failed init may not create the group on every TP rank, but
+                # best-effort cleanup should still let the controller retry
+                # with a fresh group name and port.
+                return True, "Process group does not exist; treated as destroyed."
         except Exception as e:
             message = f"Failed to destroy custom process group: {e}."
             logger.error(message)

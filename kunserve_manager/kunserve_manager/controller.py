@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import socket
 import threading
 import time
 from pathlib import Path
@@ -159,6 +160,48 @@ class KunServeController:
                 )
             )
         return " ".join(parts)
+
+    def _tcp_port_available(self, host: str, port: int) -> bool:
+        family = socket.AF_INET6 if ":" in str(host or "") else socket.AF_INET
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.bind((host or "", int(port)))
+                return True
+        except OSError:
+            return False
+
+    def _choose_pg_master_port(self, master_address: str, *, slot: int) -> int:
+        # Do not use bind(0) as the primary strategy here. bind(0) returns a
+        # kernel ephemeral port; immediately after releasing it, this manager
+        # opens outbound HTTP connections to the replicas, and the kernel can
+        # reuse that same port as the local source port. The remote rank-0
+        # TCPStore then fails with EADDRINUSE. Use a low fixed scan range by
+        # default and leave explicit env knobs for crowded hosts.
+        base = int(os.environ.get("KUNSERVE_MANAGER_PG_PORT_BASE", "24000"))
+        stride = int(os.environ.get("KUNSERVE_MANAGER_PG_PORT_STRIDE", "64"))
+        max_tries = int(os.environ.get("KUNSERVE_MANAGER_PG_PORT_TRIES", "64"))
+        start = base + max(0, int(slot)) * max(1, stride)
+        for offset in range(max(1, max_tries)):
+            port = start + offset
+            if port < 1024 or port > 65535:
+                break
+            if self._tcp_port_available(master_address, port):
+                return port
+
+        try:
+            master_port, _ = get_free_port(master_address)
+            logger.warning(
+                "[KunServeController] PG port scan exhausted; falling back to ephemeral port %d",
+                master_port,
+            )
+            return master_port
+        except OSError:
+            master_port = random.randint(40000, 60000)
+            logger.warning(
+                "[KunServeController] PG port scan and bind(0) failed; falling back to random ephemeral port %d",
+                master_port,
+            )
+            return master_port
 
     @classmethod
     def from_server_addresses(
@@ -859,22 +902,21 @@ class KunServeController:
 
         # Each retry uses a fresh master_port AND a fresh group_name suffix.
         # Background:
-        #  - get_free_port() closes the probe socket before the HTTP RPC
-        #    reaches the replica, so the port can be stolen in between
-        #    (TOCTOU). When that happens we get EADDRINUSE on the rank-0 side.
         #  - torch.distributed registers groups by name globally; a partially
         #    failed init may leave stale state under the same name, so reusing
         #    the old name on retry tends to fail the same way.
+        #  - the port selector deliberately avoids bind(0) ephemeral ports as
+        #    the primary path, because this manager immediately opens outbound
+        #    HTTP connections that can reuse the same ephemeral local port and
+        #    make rank-0 TCPStore fail with EADDRINUSE.
         # Reusing a fresh (port, group_name) pair sidesteps both.
         last_errors: list[str] = []
         attempts = max(1, self._pg_init_max_attempts)
         for attempt in range(attempts):
-            try:
-                # Prefer kernel-reported free port; fall back to a wide random
-                # range when the address cannot be bound from this process.
-                master_port, _ = get_free_port(master_address)
-            except OSError:
-                master_port = random.randint(40000, 60000)
+            master_port = self._choose_pg_master_port(
+                master_address,
+                slot=attempt,
+            )
             attempt_group_name = (
                 f"{self._base_group_name}_v{int(time.time())}_{attempt}"
             )
@@ -1040,13 +1082,16 @@ class KunServeController:
             for lane_idx in range(local_ep_size):
                 last_failures: list[str] = []
                 for attempt in range(attempts):
-                    # Allocate a fresh port and group name per retry.  Lane
-                    # subgroup init has the same TOCTOU risk as the global
-                    # PG, and stale partial groups must not be reused.
-                    try:
-                        lane_port, _ = get_free_port(master_address)
-                    except OSError:
-                        lane_port = random.randint(40000, 60000)
+                    # Allocate a fresh non-ephemeral port and group name per
+                    # retry.  This keeps the upstream lane retry behavior while
+                    # avoiding bind(0) ephemeral ports that can be stolen by the
+                    # manager's own outbound HTTP RPC source port.
+                    lane_port = self._choose_pg_master_port(
+                        master_address,
+                        slot=max(1, self._pg_init_max_attempts)
+                        + lane_idx * attempts
+                        + attempt,
+                    )
                     lane_group_name = (
                         f"kunserve_lane{lane_idx}_{base_suffix}_a{attempt}"
                     )

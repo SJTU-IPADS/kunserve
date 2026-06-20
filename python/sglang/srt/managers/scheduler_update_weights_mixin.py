@@ -165,11 +165,18 @@ class SchedulerUpdateWeightsMixin:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        # Be idempotent. The control plane can issue resume during failure
+        # cleanup even if release_memory_occupation never completed on this
+        # scheduler rank, or after another path already resumed the same tag.
+        # Raising here kills the scheduler and prevents retrying the original
+        # failure (for KunServe this is often a transient PG init failure such
+        # as EADDRINUSE on the rendezvous port).
+        requested_tags = list(tags)
         active_tags = []
         missing_tags = []
-        for tag in tags:
+        for tag in requested_tags:
             if tag in self.offload_tags:
-                self.offload_tags.remove(tag)
+                self.offload_tags.discard(tag)
                 active_tags.append(tag)
             else:
                 missing_tags.append(tag)
