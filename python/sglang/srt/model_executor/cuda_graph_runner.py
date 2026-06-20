@@ -540,9 +540,11 @@ class CudaGraphRunner:
 
         runtime_variant = self.model_runner.get_cuda_graph_runtime_variant()
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        graph_selected_bs = None
         if self.disable_padding:
             graph_key = self._graph_key(runtime_variant, cuda_graph_bs, stream_idx)
             is_bs_supported = graph_key in self.graphs
+            graph_selected_bs = cuda_graph_bs
         else:
             index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
             if index >= len(self.capture_bs):
@@ -550,11 +552,25 @@ class CudaGraphRunner:
             else:
                 padded_bs = self.capture_bs[index]
                 graph_key = self._graph_key(runtime_variant, padded_bs, stream_idx)
+                graph_selected_bs = padded_bs
                 is_bs_supported = graph_key in self.graphs
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
+        if is_bs_supported and runtime_variant == "global" and graph_selected_bs is not None:
+            validator = getattr(
+                self.model_runner, "validate_balloon_graph_replay_guard", None
+            )
+            if validator is not None:
+                is_bs_supported = bool(
+                    validator(
+                        graph_bs=int(graph_selected_bs),
+                        raw_bs=int(getattr(forward_batch, "batch_size", 0) or 0),
+                        graph_key=str(graph_key),
+                        raise_on_error=True,
+                    )
+                )
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
         # because the full_text_row_masked_out_mask tensor will always be ones
@@ -1239,6 +1255,18 @@ class CudaGraphRunner:
             runtime_variant_for_log = self.model_runner.get_cuda_graph_runtime_variant()
         except Exception:
             runtime_variant_for_log = None
+        if runtime_variant_for_log == "global":
+            validator = getattr(
+                self.model_runner, "validate_balloon_graph_replay_guard", None
+            )
+            if validator is not None:
+                validator(
+                    graph_bs=int(self.bs),
+                    raw_bs=int(self.raw_bs),
+                    graph_key=str(graph_key),
+                    raise_on_error=True,
+                )
+
         if runtime_variant_for_log == "global":
             replay_log_ct = int(getattr(self, "_kunserve_global_replay_log_ct", 0)) + 1
             self._kunserve_global_replay_log_ct = replay_log_ct

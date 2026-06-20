@@ -10,11 +10,30 @@ import torch
 
 
 _FALSE_VALUES = {"0", "false", "False", "no", "off", ""}
+_TRUE_VALUES = {"1", "true", "True", "yes", "on", "ON"}
 _PID = os.getpid()
 
 
+def _nvtx_enabled() -> bool:
+    return (
+        os.environ.get("KUNSERVE_NVTX_STAGE_PROFILE", "0") in _TRUE_VALUES
+        or os.environ.get("KUNSERVE_STAGE_NVTX", "0") in _TRUE_VALUES
+        or os.environ.get("KUNSERVE_NSYS_STAGE_PROFILE", "0") in _TRUE_VALUES
+        or os.environ.get("PROFILE_BACKEND", "").lower() == "nsys"
+    )
+
+
 def _enabled_path() -> Optional[str]:
-    if os.environ.get("KUNSERVE_FORWARD_TIMING", "1") in _FALSE_VALUES:
+    # Keep ordinary compare/smoke runs clean.  The compare scripts always pass
+    # a candidate output path, but timing should only be active for an explicit
+    # profiling request.
+    explicit_on = (
+        os.environ.get("KUNSERVE_FORWARD_TIMING", "0") not in _FALSE_VALUES
+        or os.environ.get("KUNSERVE_STAGE_PROFILE", "0") not in _FALSE_VALUES
+        or os.environ.get("KUNSERVE_FORWARD_TIMING_DETAIL", "0") not in _FALSE_VALUES
+        or os.environ.get("KUNSERVE_GRAPH_INTERNAL_TIMING", "0") not in _FALSE_VALUES
+    )
+    if not explicit_on:
         return None
 
     path = os.environ.get("KUNSERVE_FORWARD_TIMING_LOG", "").strip()
@@ -53,6 +72,8 @@ def kunserve_stage_profile_enabled() -> bool:
 
 
 def kunserve_detailed_timing_enabled() -> bool:
+    if _nvtx_enabled():
+        return True
     # stage-profile activates the scopes (but with host logging suppressed,
     # see kunserve_timing_scope) so it can record the graph CUDA events.
     if kunserve_stage_profile_enabled():
@@ -100,11 +121,33 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-def kunserve_timing_log(event: str, **fields: Any) -> None:
-    path = _enabled_path()
-    if not path:
-        return
+def _field_value(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float, str)):
+        text = str(value)
+    else:
+        text = str(value)
+    return text.replace("|", "/").replace("=", ":").replace(" ", "_")
 
+
+def _nvtx_message(event: str, fields: Dict[str, Any]) -> str:
+    base: Dict[str, Any] = {
+        "event": event,
+        "pid": _PID,
+        "rank": os.environ.get("RANK", ""),
+        "local_rank": os.environ.get("LOCAL_RANK", ""),
+        "replica_rank": os.environ.get("SGLANG_REPLICA_RANK", ""),
+    }
+    base.update({str(k): v for k, v in fields.items()})
+    return "ks_stage|" + "|".join(
+        f"{k}={_field_value(v)}" for k, v in base.items()
+    )
+
+
+def _write_timing_record(path: str, event: str, fields: Dict[str, Any]) -> None:
     record: Dict[str, Any] = {
         "ts": time.time(),
         "perf_ns": time.perf_counter_ns(),
@@ -115,13 +158,44 @@ def kunserve_timing_log(event: str, **fields: Any) -> None:
         "event": event,
     }
     record.update({str(k): _json_safe(v) for k, v in fields.items()})
-
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def kunserve_timing_log(event: str, **fields: Any) -> None:
+    path = _enabled_path()
+    if not path:
+        return
+    _write_timing_record(path, event, fields)
+
+
+def _phase_e_path() -> Optional[str]:
+    """Independent log path for Phase E timing.
+
+    Deliberately NOT routed through _enabled_path()/kunserve_timing_enabled() so
+    that enabling KUNSERVE_PHASE_E_TIMING does NOT switch on kunserve_timing_scope
+    host logging (which would pollute the very gap we are measuring).
+    """
+    if os.environ.get("KUNSERVE_PHASE_E_TIMING", "0") in _FALSE_VALUES:
+        return None
+    path = os.environ.get("KUNSERVE_FORWARD_TIMING_LOG", "").strip()
+    if path:
+        return path
+    out_dir = os.environ.get("SGLANG_KUNSERVE_OUTPUT_DIR", "").strip()
+    if out_dir:
+        return os.path.join(out_dir, "kunserve_forward_timing.jsonl")
+    return None
+
+
+def kunserve_phase_e_log(event: str, **fields: Any) -> None:
+    path = _phase_e_path()
+    if not path:
+        return
+    _write_timing_record(path, event, fields)
 
 
 _CUDA_GRAPH_TIMING_CAPTURE_KEY: Optional[str] = None
@@ -311,14 +385,24 @@ def kunserve_accumulate_cuda_graph_stage_events(
 
 @contextlib.contextmanager
 def kunserve_timing_scope(event: str, **fields: Any) -> Iterator[None]:
-    if not kunserve_timing_enabled():
+    timing_enabled = kunserve_timing_enabled()
+    nvtx_enabled = _nvtx_enabled()
+    if not timing_enabled and not nvtx_enabled:
         yield
         return
 
     start_ns = time.perf_counter_ns()
+    nvtx_pushed = False
+    if nvtx_enabled:
+        try:
+            torch.cuda.nvtx.range_push(_nvtx_message(event, fields))
+            nvtx_pushed = True
+        except Exception:
+            nvtx_pushed = False
     cuda_stage_record = _record_cuda_graph_stage_begin(event, fields)
     emit_host_log = (
-        not kunserve_stage_profile_enabled()
+        timing_enabled
+        and not kunserve_stage_profile_enabled()
         and (
             _CUDA_GRAPH_TIMING_CAPTURE_KEY is None
             or os.environ.get("KUNSERVE_GRAPH_CAPTURE_HOST_TIMING", "0")
@@ -331,6 +415,11 @@ def kunserve_timing_scope(event: str, **fields: Any) -> Iterator[None]:
         yield
     finally:
         _record_cuda_graph_stage_end(cuda_stage_record)
+        if nvtx_pushed:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
         if emit_host_log:
             elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
             kunserve_timing_log(

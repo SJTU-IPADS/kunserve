@@ -284,7 +284,13 @@ class KunServeHttpReplicaClient:
     async def init_weights_update_group(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        return await self._request("init_weights_update_group", payload)
+        # Lane subgroup init can wait for the participating TP rank to finish
+        # TCPStore rendezvous and broadcast its result back to TP0. Use the
+        # longer control-plane timeout so the manager sees the real PG result
+        # instead of an HTTP timeout during a retryable rendezvous failure.
+        return await self._request(
+            "init_weights_update_group", payload, timeout=self.warmup_timeout
+        )
 
     async def destroy_weights_update_group(self, group_name: str) -> dict[str, Any]:
         return await self._request(

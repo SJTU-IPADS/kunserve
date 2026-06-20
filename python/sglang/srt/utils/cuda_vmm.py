@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Iterable, Optional, Sequence
@@ -11,6 +14,30 @@ from torch.utils.cpp_extension import load_inline
 
 logger = logging.getLogger(__name__)
 _CUDA_VMM_AVAILABLE: Optional[bool] = None
+
+
+def emit_vmm_timing(event: str, **fields) -> None:
+    path = os.environ.get("KUNSERVE_VMM_TIMING_LOG") or os.environ.get(
+        "SGLANG_VMM_TIMING_LOG"
+    )
+    if not path:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        record = {
+            "ts": time.time(),
+            "event": event,
+            "pid": os.getpid(),
+        }
+        if torch.cuda.is_available():
+            record["cuda_device"] = torch.cuda.current_device()
+        record.update(fields)
+        with open(path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    except Exception:
+        logger.debug("Failed to emit CUDA VMM timing event=%s", event, exc_info=True)
 
 _CPP_SRC = r"""
 #include <torch/extension.h>
@@ -230,6 +257,8 @@ def get_granularity() -> int:
     return int(_get_ext().vmm_granularity())
 
 
+
+
 def round_up_to_granularity(value: int, granularity: Optional[int] = None) -> int:
     g = granularity or get_granularity()
     return ((int(value) + g - 1) // g) * g
@@ -365,14 +394,24 @@ class DonorLedger:
 class VmmRegion:
     def __init__(self, reserve_size_bytes: int, label: str = ""):
         self.label = label
+        reserve_t0 = time.perf_counter()
         self.granularity = get_granularity()
         self.reserve_size_bytes = round_up_to_granularity(
             reserve_size_bytes, self.granularity
         )
         self.va = int(_get_ext().vmm_reserve(self.reserve_size_bytes))
+        reserve_elapsed_s = time.perf_counter() - reserve_t0
         self._mappings: list[RegionMapping] = []
         self._owned_handles: list[VmmPhysicalHandle] = []
         self._released = False
+        emit_vmm_timing(
+            "vmm_region_reserve",
+            label=self.label,
+            reserve_size_bytes=self.reserve_size_bytes,
+            requested_size_bytes=int(reserve_size_bytes),
+            granularity=self.granularity,
+            elapsed_s=reserve_elapsed_s,
+        )
 
     def create_physical(self, size_bytes: int, label: str = "") -> VmmPhysicalHandle:
         size_bytes = round_up_to_granularity(size_bytes, self.granularity)
@@ -408,6 +447,7 @@ class VmmRegion:
             raise ValueError(
                 f"Mapping [{handle_offset_bytes}, {handle_offset_bytes + size_bytes}) exceeds physical.size_bytes={physical.size_bytes}"
             )
+        map_t0 = time.perf_counter()
         _get_ext().vmm_map_with_offset(
             self.va,
             va_offset_bytes,
@@ -415,6 +455,8 @@ class VmmRegion:
             handle_offset_bytes,
             size_bytes,
         )
+        map_elapsed_s = time.perf_counter() - map_t0
+        self._last_map_existing_elapsed_s = map_elapsed_s
         mapping = RegionMapping(
             va_offset_bytes=va_offset_bytes,
             size_bytes=size_bytes,
@@ -435,8 +477,11 @@ class VmmRegion:
         size_bytes: int,
         label: str = "",
     ) -> RegionMapping:
+        total_t0 = time.perf_counter()
+        create_t0 = total_t0
         physical = self.create_physical(size_bytes, label=label)
-        return self.map_existing(
+        create_elapsed_s = time.perf_counter() - create_t0
+        mapping = self.map_existing(
             physical,
             va_offset_bytes=va_offset_bytes,
             size_bytes=physical.size_bytes,
@@ -444,6 +489,15 @@ class VmmRegion:
             label=label,
             borrowed=False,
         )
+        map_elapsed_s = getattr(self, "_last_map_existing_elapsed_s", 0.0)
+        total_elapsed_s = time.perf_counter() - total_t0
+        self._last_map_new_stats = {
+            "create_elapsed_s": create_elapsed_s,
+            "map_elapsed_s": map_elapsed_s,
+            "total_elapsed_s": total_elapsed_s,
+            "size_bytes": physical.size_bytes,
+        }
+        return mapping
 
     def unmap(self, *, va_offset_bytes: int, size_bytes: int) -> None:
         ensure_granularity_aligned(va_offset_bytes, self.granularity)
@@ -706,6 +760,18 @@ class ExpandableVmmTensor:
         donor_segments: Optional[Iterable[DonorSegment]] = None,
         allow_donor_split: bool = True,
     ) -> list[DonorSegment]:
+        ensure_t0 = time.perf_counter()
+        old_active_rows = self._active_rows
+        old_mapped_bytes = self._mapped_bytes
+        new_map_calls = 0
+        new_map_bytes = 0
+        new_map_create_elapsed_s = 0.0
+        new_map_map_elapsed_s = 0.0
+        new_map_total_elapsed_s = 0.0
+        donor_map_calls = 0
+        donor_map_bytes = 0
+        donor_map_elapsed_s = 0.0
+        returned_bytes = 0
         target_rows = int(target_rows)
         if target_rows < 0 or target_rows > self.reserve_rows:
             raise ValueError(
@@ -719,14 +785,22 @@ class ExpandableVmmTensor:
             raise RuntimeError(
                 "ensure_active_rows only supports prefix-managed mappings."
             )
-        aligned_row_chunk_bytes: Optional[int] = None
-        if self.row_bytes % self.region.granularity != 0:
-            aligned_row_chunk_bytes = (
-                min_granularity_aligned_row_count(
-                    self.row_bytes, self.region.granularity
-                )
-                * self.row_bytes
+        rows_per_mapping = min_granularity_aligned_row_count(
+            self.row_bytes, self.region.granularity
+        )
+        map_chunk_bytes = rows_per_mapping * self.row_bytes
+        chunk_mb = int(os.environ.get("SGLANG_EXPERIMENTAL_VMM_MAP_CHUNK_MB", "0") or 0)
+        is_moe_weight = self.label.startswith("moe_layer_") and (
+            self.label.endswith("_w13_weight") or self.label.endswith("_w2_weight")
+        )
+        if chunk_mb > 0 and not is_moe_weight:
+            requested_chunk_bytes = round_up_to_granularity(
+                chunk_mb * 1024 * 1024, self.region.granularity
             )
+            rows_per_mapping *= max(
+                1, math.ceil(requested_chunk_bytes / map_chunk_bytes)
+            )
+            map_chunk_bytes = rows_per_mapping * self.row_bytes
         if target_prefix_bytes > self._mapped_bytes:
             cursor = self._mapped_bytes
             remaining = target_prefix_bytes - self._mapped_bytes
@@ -748,6 +822,7 @@ class ExpandableVmmTensor:
                             )
                         donor, remainder = donor.split_prefix(remaining)
                         donors.insert(0, remainder)
+                    donor_map_t0 = time.perf_counter()
                     self.region.map_existing(
                         donor.physical,
                         va_offset_bytes=cursor,
@@ -757,21 +832,28 @@ class ExpandableVmmTensor:
                         borrowed=True,
                         source_segment=donor,
                     )
+                    donor_map_elapsed_s += time.perf_counter() - donor_map_t0
+                    donor_map_calls += 1
+                    donor_map_bytes += donor.size_bytes
                     cursor += donor.size_bytes
                     remaining -= donor.size_bytes
                 else:
-                    if aligned_row_chunk_bytes is None:
-                        mapping_size_bytes = self.row_bytes
-                    else:
-                        # Keep sub-granularity rows grouped into borrowable chunks so
-                        # later donor borrows can unmap whole mappings instead of
-                        # carving a suffix out of one giant region.
-                        mapping_size_bytes = min(remaining, aligned_row_chunk_bytes)
+                    # Map in chunks that are both CUDA-VMM-granularity aligned and
+                    # row-boundary aligned. Keep MoE expert weights at their
+                    # original per-row/per-granularity chunking so expert donor
+                    # borrows can unmap whole mappings during balloon commit.
+                    mapping_size_bytes = min(remaining, map_chunk_bytes)
                     mapping = self.region.map_new(
                         va_offset_bytes=cursor,
                         size_bytes=mapping_size_bytes,
                         label=self.label,
                     )
+                    stats = getattr(self.region, "_last_map_new_stats", None) or {}
+                    new_map_calls += 1
+                    new_map_bytes += mapping.size_bytes
+                    new_map_create_elapsed_s += float(stats.get("create_elapsed_s", 0.0))
+                    new_map_map_elapsed_s += float(stats.get("map_elapsed_s", 0.0))
+                    new_map_total_elapsed_s += float(stats.get("total_elapsed_s", 0.0))
                     cursor += mapping.size_bytes
                     remaining -= mapping.size_bytes
             self._mapped_bytes = target_prefix_bytes
@@ -781,9 +863,39 @@ class ExpandableVmmTensor:
                 owner={"label": self.label, "kind": "kv_tail"},
             )
             returned_segments.append(tail_to_return)
+            returned_bytes += tail_to_return.size_bytes
             self._mapped_bytes = target_prefix_bytes
         self._active_rows = target_rows
+        refresh_t0 = time.perf_counter()
         self._refresh_wrapped_tensor()
+        refresh_elapsed_s = time.perf_counter() - refresh_t0
+        if target_prefix_bytes != old_mapped_bytes:
+            emit_vmm_timing(
+                "expandable_vmm_ensure_active_rows",
+                label=self.label,
+                dtype=str(self.dtype),
+                row_bytes=self.row_bytes,
+                reserve_rows=self.reserve_rows,
+                old_active_rows=old_active_rows,
+                target_rows=target_rows,
+                old_mapped_bytes=old_mapped_bytes,
+                target_prefix_bytes=target_prefix_bytes,
+                mapped_bytes=self._mapped_bytes,
+                new_map_calls=new_map_calls,
+                new_map_bytes=new_map_bytes,
+                new_map_create_elapsed_s=new_map_create_elapsed_s,
+                new_map_map_elapsed_s=new_map_map_elapsed_s,
+                new_map_total_elapsed_s=new_map_total_elapsed_s,
+                donor_map_calls=donor_map_calls,
+                donor_map_bytes=donor_map_bytes,
+                donor_map_elapsed_s=donor_map_elapsed_s,
+                returned_bytes=returned_bytes,
+                refresh_elapsed_s=refresh_elapsed_s,
+                elapsed_s=time.perf_counter() - ensure_t0,
+                granularity=self.region.granularity,
+                map_chunk_bytes=map_chunk_bytes,
+                wrap_full_tensor=self.wrap_full_tensor,
+            )
         return returned_segments
 
     def borrow_tail_bytes(

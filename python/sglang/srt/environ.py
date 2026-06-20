@@ -469,7 +469,7 @@ class Envs:
     SGLANG_KUNSERVE_GROUP_NAME = EnvStr("kunserve_global_ep")
     SGLANG_KUNSERVE_BACKEND = EnvStr("nccl")
     SGLANG_KUNSERVE_ENABLE_RESTORE = EnvBool(False)
-    SGLANG_KUNSERVE_EAGER_WARMUP = EnvBool(True)
+    SGLANG_KUNSERVE_EAGER_WARMUP = EnvBool(False)
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)

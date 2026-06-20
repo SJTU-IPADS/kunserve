@@ -161,6 +161,7 @@ def _group_unique_name(group: Any) -> Optional[str]:
     return str(value) if value is not None else None
 
 
+
 class CrossReplicaStandardDispatcher(BaseDispatcher):
     """KunServe GLOBAL dispatcher implemented with dense collectives.
 
@@ -843,9 +844,24 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         with _detail_scope(
             detail_timing, "kunserve_dispatch_dynamic_all_gather", **timing_fields
         ):
-            gathered_hidden = self._all_gather_padded(padded_hidden)
-            gathered_topk_ids = self._all_gather_padded(padded_topk_ids)
-            gathered_topk_weights = self._all_gather_padded(padded_topk_weights)
+            with _detail_scope(
+                detail_timing,
+                "kunserve_dispatch_dynamic_all_gather_hidden",
+                **timing_fields,
+            ):
+                gathered_hidden = self._all_gather_padded(padded_hidden)
+            with _detail_scope(
+                detail_timing,
+                "kunserve_dispatch_dynamic_all_gather_topk_ids",
+                **timing_fields,
+            ):
+                gathered_topk_ids = self._all_gather_padded(padded_topk_ids)
+            with _detail_scope(
+                detail_timing,
+                "kunserve_dispatch_dynamic_all_gather_topk_weights",
+                **timing_fields,
+            ):
+                gathered_topk_weights = self._all_gather_padded(padded_topk_weights)
 
         with _detail_scope(
             detail_timing, "kunserve_dispatch_dynamic_lane_select", **timing_fields
@@ -868,9 +884,8 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 padded_router_logits = self._pad_dim0(
                     router_logits, max_m=max_m, pad_value=0
                 )
-                router_logits = self._select_lane_segments(
-                    self._all_gather_padded(padded_router_logits)
-                )
+                gathered_router_logits = self._all_gather_padded(padded_router_logits)
+                router_logits = self._select_lane_segments(gathered_router_logits)
 
         self._last_local_m = local_m
         self._last_max_m = max_m
@@ -1053,7 +1068,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         start = int(self._last_slice_start)
         end = start + int(self._last_local_m)
         with _detail_scope(detail_timing, "kunserve_combine_dynamic_slice", **timing_fields):
-            return hidden_states[start:end].contiguous()
+            result = hidden_states[start:end].contiguous()
+        self._combine_call_count = call
+        return result
 
     # ------------------------------------------------------------------
     # static (graph-safe) path - the actual Phase D contribution
@@ -1079,6 +1096,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "capacity_m": int(capacity_m),
             "phase_f": bool(self.phase_f_enabled),
         }
+        call = self._dispatch_call_count + 1
         if M not in self._static_dispatch_m_logged:
             self._probe_log(
                 f"static_dispatch_enter rank={self.global_rank} replica={self.replica_rank} "
@@ -1197,21 +1215,36 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     ]
                 )
             else:
-                _all_gather_into_tensor(
-                    gather_group,
-                    gathered_hidden,
-                    padded_hidden,
-                )
-                _all_gather_into_tensor(
-                    gather_group,
-                    gathered_topk_ids,
-                    padded_topk_ids,
-                )
-                _all_gather_into_tensor(
-                    gather_group,
-                    gathered_topk_weights,
-                    padded_topk_weights,
-                )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_dispatch_static_all_gather_hidden",
+                    **timing_fields,
+                ):
+                    _all_gather_into_tensor(
+                        gather_group,
+                        gathered_hidden,
+                        padded_hidden,
+                    )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_dispatch_static_all_gather_topk_ids",
+                    **timing_fields,
+                ):
+                    _all_gather_into_tensor(
+                        gather_group,
+                        gathered_topk_ids,
+                        padded_topk_ids,
+                    )
+                with _detail_scope(
+                    detail_timing,
+                    "kunserve_dispatch_static_all_gather_topk_weights",
+                    **timing_fields,
+                ):
+                    _all_gather_into_tensor(
+                        gather_group,
+                        gathered_topk_weights,
+                        padded_topk_weights,
+                    )
 
         # 3) Lane select.  Skipped in Phase F because the lane-subgroup
         #    gather already produced the union directly into
@@ -1314,9 +1347,11 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     torch.where(valid, looked, self._neg_one_int32)
                 )
 
+
         self._last_local_m = local_m
         self._last_max_m = M
         self._last_slice_start = self.replica_rank * M
+        self._dispatch_call_count = call
 
         return StandardDispatchOutput(
             hidden_states=union_hidden,
@@ -1346,6 +1381,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "max_m": int(self._last_max_m or 0),
             "phase_f": bool(self.phase_f_enabled),
         }
+        call = self._combine_call_count + 1
 
         if not self._static_combine_logged:
             self._probe_log(
@@ -1479,6 +1515,7 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                         result._kunserve_tp_allreduce_done = True
                     except Exception:
                         pass
+                    self._combine_call_count = call
                     return result
 
                 with _detail_scope(
@@ -1493,7 +1530,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 with _detail_scope(
                     detail_timing, "kunserve_combine_static_slice", **timing_fields
                 ):
-                    return local_slice[: int(self._last_local_m)].contiguous()
+                    result = local_slice[: int(self._last_local_m)].contiguous()
+                self._combine_call_count = call
+                return result
 
             self._require_static_graph_collective_group(self.lane_group, "all_reduce")
             with _detail_scope(
@@ -1507,7 +1546,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             with _detail_scope(
                 detail_timing, "kunserve_combine_static_slice", **timing_fields
             ):
-                return hidden_states[start:end].contiguous()
+                result = hidden_states[start:end].contiguous()
+            self._combine_call_count = call
+            return result
 
         # Phase D fallback: global all_reduce + slice.  Each (variant,
         # bs) graph allocates its own partial-output tensor in the
@@ -1524,7 +1565,9 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         start = self.replica_rank * int(self._last_max_m)
         end = start + int(self._last_local_m)
         with _detail_scope(detail_timing, "kunserve_combine_static_slice", **timing_fields):
-            return hidden_states[start:end].contiguous()
+            result = hidden_states[start:end].contiguous()
+        self._combine_call_count = call
+        return result
 
     # ------------------------------------------------------------------
     # Phase B.2 helpers: chunked combine with overlap

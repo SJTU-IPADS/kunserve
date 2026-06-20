@@ -45,7 +45,7 @@ class KunServeController:
         enable_restore: bool = False,
         pg_init_max_attempts: int = 8,
         pg_init_retry_delay: float = 1.0,
-        eager_warmup: bool = True,
+        eager_warmup: bool = False,
         output_dir: Optional[str] = None,
         write_bw_log: Optional[bool] = None,
     ):
@@ -127,6 +127,10 @@ class KunServeController:
         ] = None
         self._tick_count = 0
         self._last_decision: Optional[str] = None
+        self._stale_decode_warn_seconds = float(
+            os.environ.get("KUNSERVE_STALE_DECODE_WARN_SECONDS", "30")
+        )
+        self._decode_progress_state: dict[int, tuple[int, float, float]] = {}
 
     def _emit(self, message: str) -> None:
         print(f"[KunServeController] {message}", flush=True)
@@ -136,7 +140,8 @@ class KunServeController:
         parts = []
         for idx, status in enumerate(statuses):
             parts.append(
-                "r%d(state=%s variant=%s expand=%s running=%s waiting=%s offloaded=%s slots=%s)"
+                "r%d(state=%s variant=%s expand=%s running=%s waiting=%s "
+                "offloaded=%s slots=%s fwd=%s cur=%s/%s last=%s/%s)"
                 % (
                     idx,
                     status.get("state"),
@@ -146,6 +151,11 @@ class KunServeController:
                     status.get("num_waiting_requests"),
                     status.get("offloaded_local_experts"),
                     status.get("added_kv_slots"),
+                    status.get("scheduler_forward_ct"),
+                    status.get("scheduler_cur_batch_mode"),
+                    status.get("scheduler_cur_batch_size"),
+                    status.get("scheduler_last_batch_mode"),
+                    status.get("scheduler_last_batch_size"),
                 )
             )
         return " ".join(parts)
@@ -338,6 +348,7 @@ class KunServeController:
     async def tick(self) -> list[dict[str, Any]]:
         statuses = await self._fetch_statuses()
         self._tick_count += 1
+        self._check_stale_decode_statuses(statuses)
         self._write_bw_status_sample(statuses)
         status_summary = self._summarize_statuses(statuses)
         if self._tick_count <= 5 or self._tick_count % 30 == 0:
@@ -418,10 +429,75 @@ class KunServeController:
                 )
                 row[f"state_{suffix}"] = status.get("state")
                 row[f"variant_{suffix}"] = status.get("runtime_variant")
+                row[f"forward_ct_{suffix}"] = status.get("scheduler_forward_ct")
+                row[f"cur_batch_{suffix}"] = status.get("scheduler_cur_batch_mode")
+                row[f"last_batch_{suffix}"] = status.get(
+                    "scheduler_last_batch_mode"
+                )
+                row[f"health_code_{suffix}"] = status.get("kunserve_health_code")
             with self._bw_log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         except Exception:
             logger.debug("failed to write bw status sample", exc_info=True)
+
+    def _check_stale_decode_statuses(self, statuses: Sequence[dict[str, Any]]) -> None:
+        if self._stale_decode_warn_seconds <= 0:
+            return
+
+        now = time.time()
+        active_indices = set()
+        for idx, status in enumerate(statuses):
+            try:
+                running = int(status.get("num_running_requests", 0) or 0)
+                forward_ct = int(status.get("scheduler_forward_ct"))
+            except (TypeError, ValueError):
+                self._decode_progress_state.pop(idx, None)
+                continue
+
+            is_active_decode = status.get("state") == "balloon" and running > 0
+            if not is_active_decode:
+                self._decode_progress_state.pop(idx, None)
+                continue
+
+            active_indices.add(idx)
+            prev = self._decode_progress_state.get(idx)
+            if prev is None or prev[0] != forward_ct:
+                self._decode_progress_state[idx] = (forward_ct, now, 0.0)
+                status["kunserve_health_code"] = "OK"
+                continue
+
+            _, unchanged_since, last_emit = prev
+            unchanged_for = now - unchanged_since
+            if unchanged_for < self._stale_decode_warn_seconds:
+                status["kunserve_health_code"] = "OK"
+                continue
+
+            status["kunserve_health_code"] = "KUNSERVE_STALE_DECODE"
+            status["kunserve_stale_decode_seconds"] = round(unchanged_for, 3)
+            if last_emit <= 0 or now - last_emit >= self._stale_decode_warn_seconds:
+                self._decode_progress_state[idx] = (forward_ct, unchanged_since, now)
+                self._emit(
+                    "KUNSERVE_STALE_DECODE replica=%d unchanged_for=%.1fs "
+                    "forward_ct=%d running=%s waiting=%s state=%s variant=%s "
+                    "cur=%s/%s last=%s/%s"
+                    % (
+                        idx,
+                        unchanged_for,
+                        forward_ct,
+                        status.get("num_running_requests"),
+                        status.get("num_waiting_requests"),
+                        status.get("state"),
+                        status.get("runtime_variant"),
+                        status.get("scheduler_cur_batch_mode"),
+                        status.get("scheduler_cur_batch_size"),
+                        status.get("scheduler_last_batch_mode"),
+                        status.get("scheduler_last_batch_size"),
+                    )
+                )
+
+        for idx in list(self._decode_progress_state.keys()):
+            if idx not in active_indices:
+                self._decode_progress_state.pop(idx, None)
 
     def _log_asymmetric_balloon_risk(self, statuses: Sequence[dict[str, Any]]) -> None:
         if not self._balloon_active:
@@ -857,11 +933,13 @@ class KunServeController:
                 # Phase F: also build lane subgroups for the sglang
                 # backend.  These are NCCL groups of size num_replicas
                 # whose members are [replica0_tp_rank=L, replica1_tp_rank=L]
-                # for each L in 0..local_ep_size-1.  Failure is a warning
-                # (not fatal) because the dispatcher falls back to the
-                # existing global-group path when lane groups are
-                # missing.  Only meaningful for the sglang comm backend;
-                # the DeepEP path does its own dispatch coordination.
+                # for each L in 0..local_ep_size-1.  By default failure is
+                # fatal because silently falling back to the global group makes
+                # perf traces look valid while they are not using the Phase F
+                # lane path.  Set KUNSERVE_ALLOW_GLOBAL_GROUP_FALLBACK=1 only
+                # for explicit fallback debugging.  Only meaningful for the
+                # sglang comm backend; the DeepEP path does its own dispatch
+                # coordination.
                 if self.runtime_backend.comm_backend == "sglang" and not (
                     os.environ.get("KUNSERVE_DISABLE_LANE_SUBGROUPS", "")
                     in ("1", "true", "True", "yes")
@@ -873,12 +951,25 @@ class KunServeController:
                             base_suffix=attempt_group_name,
                         )
                     except Exception as exc:
-                        logger.warning(
-                            "[KUNSERVE-MS] Phase F lane subgroup init failed: "
-                            "%r -- falling back to global-group dispatch/combine",
-                            exc,
-                        )
-                        self.lane_group_names = {}
+                        if os.environ.get(
+                            "KUNSERVE_ALLOW_GLOBAL_GROUP_FALLBACK", ""
+                        ) in ("1", "true", "True", "yes"):
+                            logger.warning(
+                                "[KUNSERVE-MS] Phase F lane subgroup init failed: "
+                                "%r -- falling back to global-group dispatch/combine",
+                                exc,
+                            )
+                            self.lane_group_names = {}
+                        else:
+                            logger.error(
+                                "[KUNSERVE-MS] Phase F lane subgroup init failed: "
+                                "%r -- aborting global PG bring-up. Set "
+                                "KUNSERVE_ALLOW_GLOBAL_GROUP_FALLBACK=1 to use "
+                                "the older global-group fallback path.",
+                                exc,
+                            )
+                            await self._destroy_process_group(force=True)
+                            raise
                 return
 
             last_errors = attempt_errors
@@ -944,85 +1035,124 @@ class KunServeController:
                 f"num_replicas={num_replicas}"
             )
         new_lane_names: dict[int, str] = {}
-        for lane_idx in range(local_ep_size):
-            # Allocate a fresh port per lane.  Pattern mirrors the global
-            # group init: get_free_port may TOCTOU steal the port but
-            # rendezvous on the worker side surfaces the error and we
-            # surface as a non-fatal warning above.
-            try:
-                lane_port, _ = get_free_port(master_address)
-            except OSError:
-                lane_port = random.randint(40000, 60000)
-            lane_group_name = f"kunserve_lane{lane_idx}_{base_suffix}"
-            logger.info(
-                "[KunServeController] init lane subgroup lane=%d: "
-                "master=%s:%d world=%d group=%s backend=%s",
-                lane_idx,
-                master_address,
-                lane_port,
-                num_replicas,
-                lane_group_name,
-                self.backend,
-            )
-            init_results = await asyncio.gather(
-                *[
-                    replica.init_weights_update_group(
-                        {
-                            "master_address": master_address,
-                            "master_port": lane_port,
-                            # rank_offset is unused for lane init because
-                            # explicit_group_rank is set; left as 0 for
-                            # clarity.
-                            "rank_offset": 0,
-                            "world_size": num_replicas,
-                            "group_name": lane_group_name,
-                            "backend": self.backend,
-                            # Only the matching tp_rank actually
-                            # rendezvouses on this lane.
-                            "lane_only_tp_rank": int(lane_idx),
-                            # The participating worker's rank inside the
-                            # 2-rank lane subgroup equals its replica
-                            # index (0 for replica0, 1 for replica1).
-                            "explicit_group_rank": int(replica_idx),
-                        }
+        attempts = max(1, self._pg_init_max_attempts)
+        try:
+            for lane_idx in range(local_ep_size):
+                last_failures: list[str] = []
+                for attempt in range(attempts):
+                    # Allocate a fresh port and group name per retry.  Lane
+                    # subgroup init has the same TOCTOU risk as the global
+                    # PG, and stale partial groups must not be reused.
+                    try:
+                        lane_port, _ = get_free_port(master_address)
+                    except OSError:
+                        lane_port = random.randint(40000, 60000)
+                    lane_group_name = (
+                        f"kunserve_lane{lane_idx}_{base_suffix}_a{attempt}"
                     )
-                    for replica_idx, replica in enumerate(self._replicas)
-                ],
-                return_exceptions=True,
-            )
-            failures: list[str] = []
-            for idx, result in enumerate(init_results):
-                if isinstance(result, Exception):
-                    failures.append(f"{self._replicas[idx].name}: {result!r}")
-                    continue
-                if not bool(result.get("success")):
-                    failures.append(
-                        f"{self._replicas[idx].name}: "
-                        f"{result.get('message', 'unknown error')}"
+                    logger.info(
+                        "[KunServeController] init lane subgroup lane=%d "
+                        "attempt=%d/%d: master=%s:%d world=%d group=%s "
+                        "backend=%s",
+                        lane_idx,
+                        attempt + 1,
+                        attempts,
+                        master_address,
+                        lane_port,
+                        num_replicas,
+                        lane_group_name,
+                        self.backend,
                     )
-            if failures:
-                # Best-effort destroy then bubble up.
+                    init_results = await asyncio.gather(
+                        *[
+                            replica.init_weights_update_group(
+                                {
+                                    "master_address": master_address,
+                                    "master_port": lane_port,
+                                    # rank_offset is unused for lane init
+                                    # because explicit_group_rank is set.
+                                    "rank_offset": 0,
+                                    "world_size": num_replicas,
+                                    "group_name": lane_group_name,
+                                    "backend": self.backend,
+                                    # Only the matching tp_rank actually
+                                    # rendezvouses on this lane.
+                                    "lane_only_tp_rank": int(lane_idx),
+                                    # The participating worker's rank inside
+                                    # the 2-rank lane subgroup equals its
+                                    # replica index.
+                                    "explicit_group_rank": int(replica_idx),
+                                }
+                            )
+                            for replica_idx, replica in enumerate(self._replicas)
+                        ],
+                        return_exceptions=True,
+                    )
+                    failures: list[str] = []
+                    for idx, result in enumerate(init_results):
+                        if isinstance(result, Exception):
+                            failures.append(
+                                f"{self._replicas[idx].name}: {result!r}"
+                            )
+                            continue
+                        message = str(result.get("message", "unknown error"))
+                        if not bool(result.get("success")):
+                            failures.append(
+                                f"{self._replicas[idx].name}: {message}"
+                            )
+                        elif "Skipped non-participating" in message:
+                            failures.append(
+                                f"{self._replicas[idx].name}: lane {lane_idx} "
+                                f"returned a non-participating TP result: {message}"
+                            )
+                    if not failures:
+                        new_lane_names[lane_idx] = lane_group_name
+                        logger.warning(
+                            "[KUNSERVE-MS] Phase F lane subgroup ready lane=%d "
+                            "group=%s world=%d master=%s:%d attempts=%d",
+                            lane_idx,
+                            lane_group_name,
+                            num_replicas,
+                            master_address,
+                            lane_port,
+                            attempt + 1,
+                        )
+                        break
+
+                    last_failures = failures
+                    logger.warning(
+                        "[KUNSERVE-MS] Phase F lane subgroup lane=%d "
+                        "attempt=%d/%d failed: %s",
+                        lane_idx,
+                        attempt + 1,
+                        attempts,
+                        "; ".join(failures),
+                    )
+                    await asyncio.gather(
+                        *[
+                            replica.destroy_weights_update_group(lane_group_name)
+                            for replica in self._replicas
+                        ],
+                        return_exceptions=True,
+                    )
+                    if attempt < attempts - 1:
+                        await asyncio.sleep(self._pg_init_retry_delay)
+                else:
+                    raise RuntimeError(
+                        f"lane {lane_idx} subgroup init failed after "
+                        f"{attempts} attempts: {'; '.join(last_failures)}"
+                    )
+        except Exception:
+            if new_lane_names:
                 await asyncio.gather(
                     *[
                         replica.destroy_weights_update_group(lane_group_name)
                         for replica in self._replicas
+                        for lane_group_name in new_lane_names.values()
                     ],
                     return_exceptions=True,
                 )
-                raise RuntimeError(
-                    f"lane {lane_idx} subgroup init failed: "
-                    f"{'; '.join(failures)}"
-                )
-            new_lane_names[lane_idx] = lane_group_name
-            logger.warning(
-                "[KUNSERVE-MS] Phase F lane subgroup ready lane=%d group=%s "
-                "world=%d master=%s:%d",
-                lane_idx,
-                lane_group_name,
-                num_replicas,
-                master_address,
-                lane_port,
-            )
+            raise
         self.lane_group_names = new_lane_names
 
     async def _destroy_process_group(self, *, force: bool = False) -> None:

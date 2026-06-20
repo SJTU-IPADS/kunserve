@@ -33,6 +33,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
+from sglang.srt.kunserve_forward_timing import (
+    kunserve_detailed_timing_enabled,
+    kunserve_timing_scope,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -827,7 +831,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if kunserve_detailed_timing_enabled():
+                    with kunserve_timing_scope(
+                        "qwen3_moe_attn_tp_all_reduce",
+                        num_tokens=int(hidden_states.shape[0]),
+                        hidden_dim=int(hidden_states.shape[-1])
+                        if hidden_states.dim() > 1
+                        else 1,
+                        batch_size=int(getattr(forward_batch, "batch_size", 0) or 0),
+                        kv_tokens=int(getattr(forward_batch, "seq_lens_sum", 0) or 0),
+                        mode=str(getattr(forward_batch, "forward_mode", "unknown")),
+                    ):
+                        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -866,7 +883,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         scattered_states += residual
-        residual = tensor_model_parallel_all_reduce(hidden_states)
+        if kunserve_detailed_timing_enabled():
+            with kunserve_timing_scope(
+                "qwen3_moe_attn_tp_all_reduce",
+                num_tokens=int(hidden_states.shape[0]),
+                hidden_dim=int(hidden_states.shape[-1]) if hidden_states.dim() > 1 else 1,
+            ):
+                residual = tensor_model_parallel_all_reduce(hidden_states)
+        else:
+            residual = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = layernorm(residual)
         return hidden_states, residual
 
