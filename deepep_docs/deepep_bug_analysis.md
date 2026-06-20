@@ -181,7 +181,7 @@ LL 这次实际不是 `LOCAL=DeepEP-NORMAL`: 运行环境同时带了 `KUNSERVE_
 结论:
 
 - 正确性默认路径必须是 `KUNSERVE_LOCAL_NORMAL=1` -> `LOCAL=DeepEP-NORMAL+deep_gemm+eager`。
-- 性能实验路径是 `KUNSERVE_LOCAL_LL=1` -> 保留 `LOCAL=DeepEP-AUTO/LL`。先用 no-balloon workload 验证 local-only 正确性/速度;若后续触发 balloon,仍可能遇到 LOCAL LL 与 GLOBAL LL 的 NVSHMEM double-init/context 冲突。
+- 性能实验路径是 `KUNSERVE_LOCAL_LL=1` -> 保留 `LOCAL=DeepEP-AUTO/LL`。先用 no-balloon workload 验证 local-only 正确性/速度;若后续触发 balloon,仍可能遇到 LOCAL LL 与 GLOBAL LL 的 NVSHMEM double-init/context 冲突。2026-06-20 进一步确认: `LOCAL LL + CUDA graph capture` 会在启动捕获期因 `low_latency_dispatch` 触发 `cudaErrorStreamCaptureInvalidated`,所以默认跳过 LOCAL graph capture;`KUNSERVE_LOCAL_LL_ALLOW_CUDA_GRAPH=1` 仅用于复现/调试该 capture 失败。
 - `KUNSERVE_LOCAL_DEEPGEMM=1` 只允许配合 `KUNSERVE_LOCAL_NORMAL=0` 做诊断/复现,不能再被当作恢复 LOCAL CUDA graph 的候选正确路径。
 - 要恢复 LOCAL graph/LL 性能,需要继续沿 DeepEP-LL 或保持 token 身份的 graph-safe collective 方向做,不能只把 StandardDispatcher 的 runner 从 Triton 换成 DeepGEMM。
 

@@ -5237,6 +5237,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
+        if (
+            self.device != "cpu"
+            and os.environ.get("KUNSERVE_LOCAL_LL", "0") != "0"
+            and os.environ.get("KUNSERVE_LOCAL_LL_ALLOW_CUDA_GRAPH", "0") == "0"
+        ):
+            # DeepEP low_latency is correct in eager on this path, but its
+            # low_latency_dispatch host/NVSHMEM call invalidates PyTorch CUDA
+            # graph capture during startup. Keep LOCAL LL usable and fail open to
+            # eager unless an explicit debug run asks to reproduce the capture
+            # failure.
+            _kunserve_ms(
+                "[KUNSERVE-MS] skip LOCAL cuda graph capture because "
+                "KUNSERVE_LOCAL_LL=1 and DeepEP low_latency_dispatch is not "
+                "capture-safe in this path; set "
+                "KUNSERVE_LOCAL_LL_ALLOW_CUDA_GRAPH=1 only to debug capture."
+            )
+            return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         graph_backend = defaultdict(
