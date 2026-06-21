@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -40,4 +48,11 @@ class KunServeRuntimeBackendConfig:
             # capture_policy=fixed_padded.  auto/<unset> stays eager to
             # preserve historical correctness-first behavior.
             return self.capture_policy == "fixed_padded"
+        if not _env_flag("SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL", default=True):
+            # DeepEP LOW_LATENCY initializes its C++ Buffer/NVSHMEM runtime on
+            # the GLOBAL path. The current LL capture fails at deep_ep.cpp with
+            # "operation not permitted when stream is capturing", then poisons
+            # the CUDA graph mempool. Keep auto correctness-first and require
+            # an explicit opt-in only for reproducing or testing a future fix.
+            return _env_flag("KUNSERVE_ALLOW_DEEPEP_CUDAGRAPH", default=False)
         return True

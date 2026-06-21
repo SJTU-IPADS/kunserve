@@ -585,6 +585,21 @@ class KunServeController:
         effective_capture_cuda_graph = bool(
             capture_cuda_graph and self.runtime_backend.should_capture_global_graph()
         )
+        if (
+            capture_cuda_graph
+            and not effective_capture_cuda_graph
+            and self.runtime_backend.comm_backend == "deepep"
+            and os.environ.get("SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL", "1")
+            .strip()
+            .lower()
+            in ("0", "false", "no", "off")
+        ):
+            logger.warning(
+                "[KUNSERVE-MS] GLOBAL DeepEP LL cuda graph capture disabled: "
+                "capture_policy=%s allow_deepep_graph=%s",
+                self.runtime_backend.capture_policy,
+                os.environ.get("KUNSERVE_ALLOW_DEEPEP_CUDAGRAPH", "0"),
+            )
         backend_config = {
             "exchange_mode": self.runtime_backend.exchange_mode,
             "local_ep_size": plan.local_ep_size,
