@@ -410,18 +410,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        # Phase-E idle-keepalive guard: when ALL replicas are idle (drain), the
-        # scheduler still issues ForwardMode.IDLE keepalive GLOBAL forwards. Feeding
-        # the DeepEP LL `low_latency_dispatch` a degenerate idle batch (0 / tiny
-        # padded tokens) crashes with `CUDA error: misaligned address` (the documented
-        # "Phase E not done" endgame crash). IDLE keepalives are issued in lockstep on
-        # every rank (a busy peer instead gets a mode=DECODE dummy of target_bs>0), so
-        # skipping the MoE dispatch on IDLE is collective-safe: every rank skips
-        # together, the GLOBAL all-to-all is simply not entered. The idle MoE output is
-        # unused anyway. KUNSERVE_SKIP_IDLE_MOE=0 reverts.
+        # Phase-E idle-keepalive guard: a truly empty IDLE batch means all
+        # replicas are drained, so no rank should enter DeepEP's GLOBAL MoE
+        # collective.  A non-empty IDLE batch is different: it is the dummy
+        # keepalive used when this replica is idle and a peer is still decoding.
+        # That batch must participate in dispatch/combine so the busy peer has a
+        # matching collective partner; its output is ignored by the scheduler.
+        # KUNSERVE_SKIP_IDLE_MOE=0 reverts to entering DeepEP even for empty IDLE.
         if (
             forward_batch is not None
             and forward_batch.forward_mode.is_idle()
+            and int(hidden_states.shape[0]) == 0
             and os.environ.get("KUNSERVE_SKIP_IDLE_MOE", "1") != "0"
         ):
             return torch.zeros_like(hidden_states)

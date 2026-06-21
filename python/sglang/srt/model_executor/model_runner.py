@@ -743,6 +743,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # graph bucket for this step; cuda_graph_runner validates it before
         # launching captured collectives.
         self._balloon_step_graph_guard: Optional[Dict[str, Any]] = None
+        # DeepEP Phase E: scheduler-level cross-replica negotiation result for
+        # this step.  None means the scheduler did not run the DeepEP-aware
+        # protocol and the model runner must fall back to its local all-gather.
+        self._balloon_deepep_step_any_extend: Optional[bool] = None
         # Phase E keepalive KV scratch slot.  Allocated once at
         # commit_balloon time so the keepalive batch's out_cache_loc
         # points at a dedicated dummy slot instead of slot 0.  Without
@@ -1140,7 +1144,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if str(self._balloon_state) != "balloon":
             return local_result()
-        if str(self._balloon_kunserve_comm_backend or "").lower() != "sglang":
+        if str(self._balloon_kunserve_comm_backend or "").lower() not in (
+            "sglang",
+            "deepep",
+        ):
             return local_result()
         try:
             runtime_group = self._resolve_balloon_process_group(
@@ -1337,6 +1344,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             local_extend = bool(get_is_extend_in_batch())
+            negotiated_from_scheduler = getattr(
+                self, "_balloon_deepep_step_any_extend", None
+            )
+            if negotiated_from_scheduler is not None:
+                any_extend = bool(negotiated_from_scheduler)
+                set_is_extend_in_batch(any_extend)
+                ct = int(getattr(self, "_deepep_extend_neg_ct", 0)) + 1
+                self._deepep_extend_neg_ct = ct
+                if ct <= 30 or any_extend:
+                    _kunserve_ms(
+                        "[KUNSERVE-DBG] deepep is_extend phase-e ct=%d "
+                        "fwd_id=%s local=%s negotiated=%s -> mode=%s",
+                        ct,
+                        int(getattr(self, "forward_pass_id", -1)),
+                        local_extend,
+                        any_extend,
+                        "NORMAL" if any_extend else "LOW_LATENCY",
+                    )
+                return
+
             device = torch.device("cuda", torch.cuda.current_device())
             local_t = torch.tensor(
                 [1 if local_extend else 0], dtype=torch.int32, device=device
@@ -1650,6 +1677,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_step_force_eager = bool(force)
         self._balloon_step_graph_bs_override = None
         self._balloon_step_graph_guard = None
+
+    def set_balloon_deepep_step_any_extend(self, value: Optional[bool]) -> None:
+        """Phase E hook for DeepEP NORMAL/LL mode alignment.
+
+        DeepEP LL and NORMAL use different runtime.sync/dispatch arguments.  In
+        GLOBAL mode all replica ranks must agree before the first MoE
+        collective.  The scheduler performs the lockstep negotiation because it
+        can also build idle keepalive batches; the model runner only consumes
+        the result.
+        """
+        self._balloon_deepep_step_any_extend = (
+            None if value is None else bool(value)
+        )
 
     def set_balloon_step_graph_guard(
         self,

@@ -1311,8 +1311,8 @@ class Scheduler(
                 loop="normal",
             )
 
-            # Phase E (sglang backend only): negotiate the per-step bs
-            # across the cross-replica runtime_group so all 4 ranks enter
+            # Phase E: negotiate the per-step bs/mode across the
+            # cross-replica runtime_group so all 4 ranks enter
             # forward with the same ``local_m``.  Without this, the peer
             # replica's captured GLOBAL graph would replay with a fixed
             # bs while the idle local rank tries to all_gather an empty
@@ -1433,6 +1433,11 @@ class Scheduler(
                     mr = getattr(self.tp_worker, "model_runner", None)
                     if mr is not None:
                         mr.set_balloon_step_force_eager(False)
+                        deepep_setter = getattr(
+                            mr, "set_balloon_deepep_step_any_extend", None
+                        )
+                        if callable(deepep_setter):
+                            deepep_setter(None)
                     self._kunserve_scheduler_gap_log(
                         "scheduler_gap_phase_e_clear_decision_end",
                         stage_ns,
@@ -1503,8 +1508,8 @@ class Scheduler(
                 loop="overlap",
             )
 
-            # Phase E (sglang backend only): negotiate per-step bs with
-            # peer replicas BEFORE deciding overlap & launching.  See the
+            # Phase E: negotiate per-step bs/mode with peer replicas BEFORE
+            # deciding overlap & launching.  See the
             # non-overlap loop above for the rationale.  We do the sync
             # here even when ``batch is not None`` so the active replica
             # advertises its bs to peers, which lets an idle peer build a
@@ -1659,6 +1664,11 @@ class Scheduler(
                     mr = getattr(self.tp_worker, "model_runner", None)
                     if mr is not None:
                         mr.set_balloon_step_force_eager(False)
+                        deepep_setter = getattr(
+                            mr, "set_balloon_deepep_step_any_extend", None
+                        )
+                        if callable(deepep_setter):
+                            deepep_setter(None)
                     phase_e_force_eager_set = False
                     self._kunserve_scheduler_gap_log(
                         "scheduler_gap_phase_e_clear_decision_end",
@@ -1752,6 +1762,11 @@ class Scheduler(
                             mr2 = getattr(self.tp_worker, "model_runner", None)
                             if mr2 is not None:
                                 mr2.set_balloon_step_force_eager(False)
+                                deepep_setter = getattr(
+                                    mr2, "set_balloon_deepep_step_any_extend", None
+                                )
+                                if callable(deepep_setter):
+                                    deepep_setter(None)
                             self._kunserve_scheduler_gap_log(
                                 "scheduler_gap_phase_e_clear_decision_end",
                                 stage_ns,
@@ -3919,8 +3934,8 @@ class Scheduler(
     def _kunserve_phase_e_active(self) -> bool:
         """Whether Phase E cross-replica bs sync should run this step.
 
-        For the sglang GLOBAL backend every rank must enter the MoE collective
-        path on every decode step.  Fixed-padded CUDA graph replay additionally
+        For GLOBAL backends with cross-replica MoE collectives every rank must
+        enter the MoE path on every decode step.  Fixed-padded CUDA graph replay additionally
         needs matching padded bs values, but eager GLOBAL still needs a
         non-empty keepalive when a peer replica is busy.  Otherwise an idle
         replica sends an empty IDLE batch through Qwen3 prepare_mlp / global
@@ -3934,7 +3949,7 @@ class Scheduler(
         backend = str(
             getattr(model_runner, "_balloon_kunserve_comm_backend", "deepep") or ""
         ).lower()
-        if backend != "sglang":
+        if backend not in ("sglang", "deepep"):
             return False
         try:
             variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
@@ -4689,6 +4704,16 @@ class Scheduler(
             )
         try:
             model_runner.set_balloon_step_force_eager(force_eager)
+            deepep_setter = getattr(
+                model_runner, "set_balloon_deepep_step_any_extend", None
+            )
+            if callable(deepep_setter):
+                backend = str(
+                    getattr(model_runner, "_balloon_kunserve_comm_backend", "") or ""
+                ).lower()
+                deepep_setter(
+                    bool(negotiated_any_force_eager) if backend == "deepep" else None
+                )
             if not force_eager:
                 model_runner.set_balloon_step_graph_bs_override(graph_bs_override)
             guard_setter = getattr(model_runner, "set_balloon_step_graph_guard", None)
@@ -4811,9 +4836,8 @@ class Scheduler(
     ) -> ScheduleBatch:
         """Phase E: build an IDLE batch shaped to a peer-negotiated bs.
 
-        ``target_bs == 0`` is the historical empty-batch behavior (used by
-        DeepEP backend and by transient DeepEP path-corruption mitigation
-        before Phase D).  ``target_bs > 0`` is the Phase E flow: the
+        ``target_bs == 0`` is the historical empty-batch behavior used when
+        every replica is idle.  ``target_bs > 0`` is the Phase E flow: the
         keepalive batch carries that many dummy decode tokens so the
         cross-replica all_gather_into_tensor / all_reduce inside the
         captured GLOBAL graph see the matching ``local_m`` on every rank.
@@ -4877,9 +4901,9 @@ class Scheduler(
             )
             keepalive_batch.global_num_tokens = [effective]
             keepalive_batch.global_num_tokens_for_logprob = [effective]
-            keepalive_batch.is_extend_in_batch = False
             keepalive_batch.global_forward_mode = ForwardMode.IDLE
-            keepalive_batch.can_run_dp_cuda_graph = False
+        keepalive_batch.is_extend_in_batch = False
+        keepalive_batch.can_run_dp_cuda_graph = False
         return keepalive_batch
 
     def _maybe_get_balloon_keepalive_batch(
