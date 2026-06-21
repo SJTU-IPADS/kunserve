@@ -1524,8 +1524,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     self._update_live_expert_location_metadata(previous_metadata)
 
+    def _kunserve_skip_local_cuda_graph_capture(self) -> bool:
+        if self.device == "cpu":
+            return False
+        if os.environ.get("KUNSERVE_LOCAL_NORMAL", "0") != "0" and os.environ.get(
+            "KUNSERVE_LOCAL_NORMAL_ALLOW_CUDA_GRAPH", "0"
+        ) == "0":
+            return True
+        if os.environ.get("KUNSERVE_LOCAL_LL", "0") != "0" and os.environ.get(
+            "KUNSERVE_LOCAL_LL_ALLOW_CUDA_GRAPH", "0"
+        ) == "0":
+            return True
+        return False
+
     def get_cuda_graph_capture_variants(self) -> List[str]:
-        variants = ["local"]
+        variants: List[str] = []
+        if not self._kunserve_skip_local_cuda_graph_capture():
+            variants.append("local")
+        else:
+            ct = int(getattr(self, "_kunserve_skip_local_graph_capture_log_ct", 0)) + 1
+            self._kunserve_skip_local_graph_capture_log_ct = ct
+            if ct <= 4:
+                _kunserve_ms(
+                    "[KUNSERVE-MS] skip LOCAL cuda graph capture: "
+                    "local_normal=%s local_ll=%s; GLOBAL variant can still be "
+                    "captured later after balloon prepare/commit.",
+                    os.environ.get("KUNSERVE_LOCAL_NORMAL", "0"),
+                    os.environ.get("KUNSERVE_LOCAL_LL", "0"),
+                )
         fused_layers = self._iter_fused_moe_layers()
         if fused_layers and all(
             getattr(layer, "global_bundle", None) is not None for layer in fused_layers

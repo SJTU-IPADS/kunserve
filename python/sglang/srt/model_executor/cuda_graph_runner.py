@@ -652,6 +652,11 @@ class CudaGraphRunner:
             profile_context = self._init_profile_context_and_memory_record()
         capture_variants = variants or self.model_runner.get_cuda_graph_capture_variants()
         capture_variants = [self._normalize_runtime_variant(variant) for variant in capture_variants]
+        if not capture_variants:
+            _kunserve_graph_log(
+                "capture skipped: no cuda graph variants requested"
+            )
+            return
 
         def _capture_one_stream(
             variant: str, stream_idx: Optional[int] = None
