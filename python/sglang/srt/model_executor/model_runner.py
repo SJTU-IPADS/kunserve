@@ -1298,6 +1298,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
         if str(self._balloon_kunserve_comm_backend or "").lower() != "deepep":
             return
+        # Empty IDLE keepalives can be issued by only the drained replica during
+        # tail cleanup.  They do not enter DeepEP MoE dispatch, so entering a
+        # 4-rank negotiation collective here can deadlock against peers that
+        # have already stopped forwarding.  Non-empty IDLE keepalives still
+        # participate so they can align with a peer's real DECODE step.
+        try:
+            input_ids = getattr(forward_batch, "input_ids", None)
+            input_tokens = int(input_ids.numel()) if input_ids is not None else 0
+        except Exception:
+            input_tokens = -1
+        if input_tokens == 0:
+            ct = int(getattr(self, "_deepep_extend_neg_skip_zero_ct", 0)) + 1
+            self._deepep_extend_neg_skip_zero_ct = ct
+            if ct <= 16 or ct % 1000 == 0:
+                _kunserve_ms(
+                    "[KUNSERVE-DBG] deepep is_extend negotiate skip zero-token "
+                    "ct=%d fwd_id=%s mode=%s batch_size=%s global_num_tokens=%s",
+                    ct,
+                    int(getattr(self, "forward_pass_id", -1)),
+                    getattr(forward_batch, "forward_mode", None),
+                    getattr(forward_batch, "batch_size", None),
+                    getattr(forward_batch, "global_num_tokens_cpu", None),
+                )
+            return
         try:
             runtime_group = self._resolve_balloon_process_group(
                 self._balloon_process_group_name
