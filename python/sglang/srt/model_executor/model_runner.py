@@ -772,6 +772,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_added_slots = 0
         self._balloon_offloaded_local_experts = 0
         self._balloon_last_error = None
+        self._balloon_global_cuda_graph_capture_failed = False
         self._balloon_process_group_name = None
         self._balloon_kunserve_comm_backend = "deepep"
         self._balloon_capture_policy = "auto"
@@ -2755,6 +2756,117 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         return offload_modes
 
+    def _iter_deepep_low_latency_dispatchers(self, dispatcher):
+        """Yield DeepEP LOW_LATENCY inner dispatchers below a bundle dispatcher.
+
+        KunServe GLOBAL uses MaybeTboDeepEPDispatcher, which owns one or two
+        DeepEPDispatcher instances depending on TBO.  Each DeepEPDispatcher
+        owns the actual _DeepEPDispatcherImplLowLatency where _get_buffer()
+        initializes the DeepEP/NVSHMEM Buffer.  CUDA graph capture must not be
+        the first caller of that initialization path.
+        """
+        if dispatcher is None:
+            return
+        visited = set()
+        stack = [dispatcher]
+        while stack:
+            current = stack.pop()
+            if current is None:
+                continue
+            obj_id = id(current)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            low_latency = getattr(current, "_low_latency_dispatcher", None)
+            if low_latency is not None:
+                yield low_latency
+
+            if (
+                "LowLatency" in type(current).__name__
+                and callable(getattr(current, "_get_buffer", None))
+            ):
+                yield current
+
+            inners = getattr(current, "_inners", None)
+            if inners is None:
+                continue
+            try:
+                stack.extend(list(inners))
+            except TypeError:
+                stack.append(inners)
+
+    def _prewarm_deepep_global_low_latency_buffers(self, fused_layers) -> None:
+        """Create GLOBAL DeepEP LL buffers before CUDA graph capture.
+
+        The first observed DeepEP LL graph failure happened exactly between
+        [M1-BUF] pre-Buffer and POST Buffer(), meaning Buffer construction was
+        still inside torch.cuda.CUDAGraph capture.  Prewarming only creates the
+        group-level DeepEP LL Buffer; the real dispatch/combine path is still
+        captured afterwards.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DeepEP LL buffer prewarm must run outside CUDA graph capture"
+            )
+
+        seen_impls = set()
+        buffer_ids = set()
+        group_ids = set()
+        warmed = 0
+        scanned_layers = 0
+        for layer in fused_layers:
+            bundle = getattr(layer, "global_bundle", None)
+            dispatcher = getattr(bundle, "dispatcher", None)
+            if dispatcher is None:
+                continue
+            scanned_layers += 1
+            for impl in self._iter_deepep_low_latency_dispatchers(dispatcher):
+                impl_id = id(impl)
+                if impl_id in seen_impls:
+                    continue
+                seen_impls.add(impl_id)
+                get_buffer = getattr(impl, "_get_buffer", None)
+                if not callable(get_buffer):
+                    continue
+                layer_id = getattr(layer, "layer_id", None)
+                group = getattr(impl, "group", None)
+                if group is not None:
+                    group_ids.add(id(group))
+                buffer = get_buffer()
+                buffer_ids.add(id(buffer))
+                warmed += 1
+                if warmed <= 4:
+                    _kunserve_ms(
+                        "[KUNSERVE-MS] DeepEP LL prewarm buffer OK: "
+                        "layer=%s impl=%s group_size=%s group_rank=%s "
+                        "buffer_id=%s",
+                        layer_id,
+                        type(impl).__name__,
+                        (group.size() if group is not None else None),
+                        (group.rank() if group is not None else None),
+                        id(buffer),
+                    )
+
+        if warmed == 0:
+            _kunserve_ms(
+                "[KUNSERVE-MS] DeepEP LL prewarm found no low-latency "
+                "dispatchers: scanned_layers=%d",
+                scanned_layers,
+            )
+            return
+
+        torch.cuda.synchronize()
+        _kunserve_ms(
+            "[KUNSERVE-MS] DeepEP LL prewarm COMPLETE before GLOBAL "
+            "cuda graph capture: scanned_layers=%d impls=%d unique_buffers=%d "
+            "unique_groups=%d",
+            scanned_layers,
+            warmed,
+            len(buffer_ids),
+            len(group_ids),
+        )
+
     def _warmup_balloon_global_runtime(
         self,
         *,
@@ -2912,7 +3024,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             "DeepEP NORMAL uses a dynamic-shape eager "
                             "communication path"
                         )
+            if (
+                not skip_capture
+                and target_variant == "global"
+                and backend_lower == "deepep"
+                and bool(
+                    getattr(
+                        self,
+                        "_balloon_global_cuda_graph_capture_failed",
+                        False,
+                    )
+                )
+            ):
+                skip_capture = True
+                skip_capture_reason = (
+                    "DeepEP LL GLOBAL cuda graph capture already failed once "
+                    "in this process; skip retry to avoid leaving PyTorch's "
+                    "CUDA graph allocator in an unrecoverable recording state"
+                )
             if not skip_capture:
+                if target_variant == "global" and backend_lower == "deepep":
+                    try:
+                        self._prewarm_deepep_global_low_latency_buffers(fused_layers)
+                    except Exception as exc:
+                        self._balloon_global_cuda_graph_capture_failed = True
+                        self._balloon_global_cuda_graph_captured = False
+                        self._balloon_last_error = (
+                            "DeepEP LL GLOBAL cuda graph prewarm failed before "
+                            f"capture: {exc}"
+                        )
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] DeepEP LL prewarm FAILED before "
+                            "GLOBAL cuda graph capture: %r",
+                            exc,
+                        )
+                        raise
                 # NCCL communicator preheat for the sglang fixed_padded
                 # path.  The static CrossReplicaStandardDispatcher uses
                 # all_gather / all_reduce on either the lane groups (Phase F)
@@ -3229,7 +3375,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     target_variant,
                     os.getpid(),
                 )
-                self.ensure_cuda_graph_variant_captured(target_variant)
+                try:
+                    self.ensure_cuda_graph_variant_captured(target_variant)
+                except Exception as exc:
+                    if target_variant == "global" and backend_lower == "deepep":
+                        self._balloon_global_cuda_graph_capture_failed = True
+                        self._balloon_global_cuda_graph_captured = False
+                        self._balloon_last_error = (
+                            "DeepEP LL GLOBAL cuda graph capture failed after "
+                            f"prewarm: {exc}"
+                        )
+                        _kunserve_ms(
+                            "[KUNSERVE-MS] GLOBAL cuda graph capture FAILED "
+                            "for DeepEP LL after prewarm; future prepare "
+                            "attempts in this process will skip graph capture: %r",
+                            exc,
+                        )
+                    raise
                 if target_variant == "global":
                     graph_runner = getattr(self, "graph_runner", None)
                     self._balloon_global_cuda_graph_captured = bool(
@@ -3237,6 +3399,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         and hasattr(graph_runner, "has_captured_variant")
                         and graph_runner.has_captured_variant(target_variant)
                     )
+                    if self._balloon_global_cuda_graph_captured:
+                        self._balloon_global_cuda_graph_capture_failed = False
                 _kunserve_ms(
                     "[KUNSERVE-MS] GLOBAL cuda graph capture COMPLETE "
                     "(variant=%s pid=%d) — GPU is now free; FSDP NCCL "
@@ -4015,6 +4179,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "graph_replay_enabled": self.is_cuda_graph_replay_enabled(),
             "capture_variants": self.get_cuda_graph_capture_variants(),
             "captured_graph_variants": captured_variants,
+            "global_cuda_graph_capture_failed": bool(
+                getattr(self, "_balloon_global_cuda_graph_capture_failed", False)
+            ),
             "max_total_num_tokens": int(self.max_total_num_tokens),
             "allocator_capacity": int(self.token_to_kv_pool_allocator.size),
             "kv_cache_capacity": int(self._get_balloon_kv_cache().size),
