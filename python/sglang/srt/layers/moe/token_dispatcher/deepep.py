@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -690,6 +691,38 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
+    def _ll_async_finish(self) -> bool:
+        """Return the async_finish value for DeepEP LL dispatch/combine."""
+        if self.return_recv_hook:
+            return False
+
+        override = os.environ.get("KUNSERVE_DEEPEP_LL_ASYNC_FINISH")
+        if override is not None and override.strip() != "":
+            return override.strip().lower() not in ("0", "false", "no", "off")
+
+        # DeepEP low_latency_dispatch creates/returns a DeepEP event when
+        # async_finish=True. That path invalidates PyTorch CUDA graph capture in
+        # GLOBAL LL warmup on H20. Keep eager behavior unchanged, but use the
+        # synchronous DeepEP path while the stream is being captured so we can
+        # test whether the event/async layer is the graph blocker.
+        try:
+            if (
+                os.environ.get("KUNSERVE_DEEPEP_LL_GRAPH_SYNC", "1") != "0"
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    def _wait_ll_recv(self, event, hook) -> None:
+        if self.return_recv_hook:
+            hook()
+            return
+        if event is not None and getattr(event, "event", None) is not None:
+            event.current_stream_wait()
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -748,7 +781,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             except Exception:
                 pass
 
-        hook() if self.return_recv_hook else event.current_stream_wait()
+        self._wait_ll_recv(event, hook)
 
         if _dbg and _ct <= 40:
             try:
@@ -794,6 +827,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
+        ll_async_finish = self._ll_async_finish()
 
         # Path-B instrumentation: dump the exact LL dispatch inputs + bracket the
         # call so a hang shows as pre with no post (and we see the topk routing).
@@ -820,6 +854,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         f"topk_min={_tmin} topk_max={_tmax} n_neg={_nneg} "
                         f"n_oor={_noor} num_max={self.num_max_dispatch_tokens_per_rank} "
                         f"num_experts={self.num_experts} use_fp8={use_fp8} "
+                        f"async_finish={ll_async_finish} "
                         f"return_recv_hook={self.return_recv_hook}\n"
                     )
             except Exception:
@@ -869,7 +904,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     if input_global_scale is not None
                     else dict()
                 ),
-                async_finish=not self.return_recv_hook,
+                async_finish=ll_async_finish,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
@@ -966,7 +1001,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
-        hook() if self.return_recv_hook else event.current_stream_wait()
+        self._wait_ll_recv(event, hook)
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
@@ -1057,6 +1092,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
         else:
             overlap_args_dict = {}
+        ll_async_finish = self._ll_async_finish()
 
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
@@ -1064,7 +1100,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_idx=topk_ids,
                 topk_weights=topk_weights,
                 handle=self.handle,
-                async_finish=not self.return_recv_hook,
+                async_finish=ll_async_finish,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
             )
