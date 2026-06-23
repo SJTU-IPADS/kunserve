@@ -4035,12 +4035,15 @@ class Scheduler(
         if running_batch is None or running_batch.is_empty():
             return False
 
+        # This check is local to one scheduler.  In KunServe GLOBAL mode a
+        # single rank deferring prefill while peers enter EXTEND can deadlock
+        # collective/lockstep progress, so keep it opt-in until it is negotiated.
         try:
             min_free_gb = float(
-                os.environ.get("KUNSERVE_BALLOON_PREFILL_MIN_FREE_GB", "1.0")
+                os.environ.get("KUNSERVE_BALLOON_PREFILL_MIN_FREE_GB", "0.0")
             )
         except Exception:
-            min_free_gb = 1.0
+            min_free_gb = 0.0
         if min_free_gb <= 0:
             return False
 
