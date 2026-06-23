@@ -850,8 +850,6 @@ class Scheduler(
         self._kunserve_prefill_blocked_full_log_ct: int = 0
         self._kunserve_graph_prefill_defer_log_ct: int = 0
         self._kunserve_phase_e_prefill_defer_log_ct: int = 0
-        self._kunserve_balloon_prefill_mem_defer_log_ct: int = 0
-        self._kunserve_balloon_prefill_budget_log_ct: int = 0
         # Phase E negotiation is a lockstep collective.  A rank cannot safely
         # decide to negotiate only because its own local batch changed; peers
         # that reuse a cached decision would deadlock.  The cache therefore
@@ -2698,9 +2696,6 @@ class Scheduler(
             )
             return None
 
-        if self._kunserve_should_defer_prefill_for_balloon_memory():
-            return None
-
         if (
             self.chunked_req is None
             and self._kunserve_should_defer_prefill_for_global_graph()
@@ -2810,12 +2805,6 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
-        max_prefill_tokens, chunked_prefill_size = (
-            self._kunserve_effective_prefill_budget_for_balloon(
-                self.max_prefill_tokens, chunked_prefill_size
-            )
-        )
-
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2823,7 +2812,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            max_prefill_tokens,
+            self.max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -2914,7 +2903,7 @@ class Scheduler(
             waiting_before=len(self.waiting_queue),
             chunked_req=self.chunked_req is not None,
             log_input_tokens=int(adder.log_input_tokens),
-            max_prefill_tokens=int(max_prefill_tokens),
+            max_prefill_tokens=int(self.max_prefill_tokens),
             chunked_prefill_size=(
                 int(chunked_prefill_size) if chunked_prefill_size is not None else None
             ),
@@ -3930,166 +3919,6 @@ class Scheduler(
                 return False
         return True
 
-    def _kunserve_balloon_global_runtime_active(self) -> bool:
-        model_runner = getattr(self.tp_worker, "model_runner", None)
-        if model_runner is None:
-            return False
-        if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
-            return False
-        try:
-            variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
-            runtime_variant = str(variant_getter())
-        except Exception:
-            runtime_variant = str(
-                getattr(model_runner, "_balloon_runtime_variant", "local")
-            )
-        return runtime_variant == "global"
-
-    def _kunserve_align_prefill_budget(self, value: int) -> int:
-        value = max(int(value), int(self.page_size))
-        return max(int(self.page_size), (value // int(self.page_size)) * int(self.page_size))
-
-    def _kunserve_effective_prefill_budget_for_balloon(
-        self,
-        max_prefill_tokens: int,
-        chunked_prefill_size: Optional[int],
-    ) -> Tuple[int, Optional[int]]:
-        """Limit eager EXTEND token count after GLOBAL balloon.
-
-        Decode replay is graph-captured, but a waiting/retracted request still
-        enters as EXTEND and therefore runs eager.  Under GLOBAL dispatch that
-        eager step pads/gathers by token count across replicas, so a very large
-        re-prefill can allocate hundreds of MiB of temporary MoE/dispatch
-        buffers while graph private pools and the expanded KV pool are resident.
-        Keep the cap local to balloon/global so baseline and local KunServe
-        startup prefill keep the configured large prefill budget.
-        """
-        if not self._kunserve_balloon_global_runtime_active():
-            return int(max_prefill_tokens), chunked_prefill_size
-
-        max_cap = get_int_env_var("KUNSERVE_BALLOON_MAX_PREFILL_TOKENS", 8192)
-        chunk_cap = get_int_env_var(
-            "KUNSERVE_BALLOON_CHUNKED_PREFILL_SIZE",
-            max_cap if max_cap > 0 else 8192,
-        )
-
-        effective_max = int(max_prefill_tokens)
-        if max_cap > 0:
-            effective_max = min(
-                effective_max, self._kunserve_align_prefill_budget(max_cap)
-            )
-
-        effective_chunk = chunked_prefill_size
-        if chunk_cap > 0:
-            aligned_chunk = self._kunserve_align_prefill_budget(chunk_cap)
-            effective_chunk = (
-                aligned_chunk
-                if effective_chunk is None
-                else min(int(effective_chunk), aligned_chunk)
-            )
-
-        changed = (
-            int(effective_max) != int(max_prefill_tokens)
-            or effective_chunk != chunked_prefill_size
-        )
-        if changed:
-            self._kunserve_balloon_prefill_budget_log_ct += 1
-            log_ct = self._kunserve_balloon_prefill_budget_log_ct
-            if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
-                _kunserve_ms(
-                    "[KUNSERVE-MS] balloon prefill budget cap: count=%d "
-                    "max_prefill=%d->%d chunk=%s->%s running=%d waiting=%d",
-                    log_ct,
-                    int(max_prefill_tokens),
-                    int(effective_max),
-                    str(chunked_prefill_size),
-                    str(effective_chunk),
-                    len(self.running_batch.reqs),
-                    len(self.waiting_queue),
-                )
-            kunserve_timing_log(
-                "scheduler_balloon_prefill_budget_cap",
-                count=int(log_ct),
-                max_prefill_tokens=int(max_prefill_tokens),
-                effective_max_prefill_tokens=int(effective_max),
-                chunked_prefill_size=(
-                    int(chunked_prefill_size)
-                    if chunked_prefill_size is not None
-                    else None
-                ),
-                effective_chunked_prefill_size=(
-                    int(effective_chunk) if effective_chunk is not None else None
-                ),
-                running=len(self.running_batch.reqs),
-                waiting=len(self.waiting_queue),
-            )
-
-        return int(effective_max), effective_chunk
-
-    def _kunserve_should_defer_prefill_for_balloon_memory(self) -> bool:
-        if not self._kunserve_balloon_global_runtime_active():
-            return False
-        if len(self.waiting_queue) == 0 and self.chunked_req is None:
-            return False
-        running_batch = getattr(self, "running_batch", None)
-        if running_batch is None or running_batch.is_empty():
-            return False
-
-        # This check is local to one scheduler.  In KunServe GLOBAL mode a
-        # single rank deferring prefill while peers enter EXTEND can deadlock
-        # collective/lockstep progress, so keep it opt-in until it is negotiated.
-        try:
-            min_free_gb = float(
-                os.environ.get("KUNSERVE_BALLOON_PREFILL_MIN_FREE_GB", "0.0")
-            )
-        except Exception:
-            min_free_gb = 0.0
-        if min_free_gb <= 0:
-            return False
-
-        try:
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-        except Exception:
-            return False
-        min_free_bytes = int(min_free_gb * (1024**3))
-        if int(free_bytes) >= min_free_bytes:
-            self._kunserve_balloon_prefill_mem_defer_log_ct = 0
-            return False
-
-        self._kunserve_balloon_prefill_mem_defer_log_ct += 1
-        log_ct = self._kunserve_balloon_prefill_mem_defer_log_ct
-        try:
-            available_tokens = self.token_to_kv_pool_allocator.available_size()
-        except Exception:
-            available_tokens = -1
-        if log_ct in (1, 10, 100) or log_ct % 1000 == 0:
-            _kunserve_ms(
-                "[KUNSERVE-MS] defer balloon prefill for cuda headroom: "
-                "count=%d free_gb=%.3f threshold_gb=%.3f running=%d waiting=%d "
-                "chunked=%s available_tokens=%d max_total=%d",
-                log_ct,
-                float(free_bytes) / (1024**3),
-                float(min_free_gb),
-                len(self.running_batch.reqs),
-                len(self.waiting_queue),
-                self.chunked_req is not None,
-                int(available_tokens),
-                int(self.max_total_num_tokens),
-            )
-        kunserve_timing_log(
-            "scheduler_prefill_deferred_balloon_memory",
-            count=int(log_ct),
-            free_bytes=int(free_bytes),
-            total_bytes=int(total_bytes),
-            threshold_bytes=int(min_free_bytes),
-            running=len(self.running_batch.reqs),
-            waiting=len(self.waiting_queue),
-            chunked=self.chunked_req is not None,
-            available_tokens=int(available_tokens),
-            max_total=int(self.max_total_num_tokens),
-        )
-        return True
-
     def _kunserve_should_defer_prefill_for_global_graph(self) -> bool:
         """Legacy conservative gate for keeping graph replay decode-only.
 
@@ -4114,7 +3943,20 @@ class Scheduler(
         ):
             return False
 
-        if not self._kunserve_balloon_global_runtime_active():
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return False
+        if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
+            return False
+
+        try:
+            variant_getter = getattr(model_runner, "get_cuda_graph_runtime_variant")
+            runtime_variant = str(variant_getter())
+        except Exception:
+            runtime_variant = str(
+                getattr(model_runner, "_balloon_runtime_variant", "local")
+            )
+        if runtime_variant != "global":
             return False
 
         return self._kunserve_global_graph_replay_active()
