@@ -723,6 +723,124 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if event is not None and getattr(event, "event", None) is not None:
             event.current_stream_wait()
 
+    def _ll_numeric_guard_enabled(self) -> bool:
+        if not os.environ.get("KUNSERVE_DETAIL_LOG"):
+            return False
+        return os.environ.get("KUNSERVE_LL_NUMERIC_GUARD", "0").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        )
+
+    def _ll_numeric_guard(
+        self,
+        tag: str,
+        tensor: Optional[torch.Tensor],
+        call_idx: int,
+        valid_rows: Optional[torch.Tensor] = None,
+    ) -> None:
+        if tensor is None or not self._ll_numeric_guard_enabled():
+            return
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+        except Exception:
+            pass
+        try:
+            limit = int(os.environ.get("KUNSERVE_LL_NUMERIC_GUARD_LIMIT", "256"))
+        except Exception:
+            limit = 256
+        if call_idx > limit:
+            return
+
+        try:
+            x = tensor.float()
+            valid_head = None
+            if (
+                valid_rows is not None
+                and x.dim() >= 3
+                and valid_rows.numel() == x.shape[0]
+            ):
+                rows = valid_rows.to(device=x.device, dtype=torch.long)
+                mask = (
+                    torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+                    < rows.unsqueeze(1)
+                )
+                x = x[mask]
+                valid_head = rows[:8].detach().cpu().tolist()
+
+            if x.numel() == 0:
+                return
+
+            flat = x.reshape(-1)
+            finite = torch.isfinite(flat)
+            all_finite = bool(finite.all().item())
+            if all_finite:
+                abs_flat = flat.abs()
+                max_abs = float(abs_flat.max().item())
+                mean_abs = float(abs_flat.mean().item())
+                bad_count = 0
+                first_bad = -1
+            else:
+                bad = (~finite).nonzero(as_tuple=False).flatten()
+                bad_count = int(bad.numel())
+                first_bad = int(bad[0].item()) if bad_count else -1
+                finite_flat = flat[finite]
+                if finite_flat.numel():
+                    abs_flat = finite_flat.abs()
+                    max_abs = float(abs_flat.max().item())
+                    mean_abs = float(abs_flat.mean().item())
+                else:
+                    max_abs = float("nan")
+                    mean_abs = float("nan")
+
+            try:
+                max_abs_threshold = float(
+                    os.environ.get("KUNSERVE_LL_NUMERIC_GUARD_MAX_ABS", "100.0")
+                )
+            except Exception:
+                max_abs_threshold = 100.0
+
+            verbose = os.environ.get(
+                "KUNSERVE_LL_NUMERIC_GUARD_VERBOSE", "0"
+            ) not in ("0", "false", "False", "")
+            anomalous = (not all_finite) or max_abs >= max_abs_threshold
+            if not anomalous and not verbose:
+                return
+
+            anom_idx = getattr(type(self), "_kun_ll_numeric_guard_ct", 0) + 1
+            type(self)._kun_ll_numeric_guard_ct = anom_idx
+            if anom_idx > 160 and not verbose:
+                return
+
+            import datetime as _dt
+
+            sample = flat[:4].detach().cpu().tolist()
+            with open(os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{_dt.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
+                    f"[LL-NUMERIC] tag={tag} call={call_idx} rank={self.group.rank()} "
+                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"checked_elems={flat.numel()} valid_rows_head={valid_head} "
+                    f"all_finite={all_finite} bad_count={bad_count} "
+                    f"first_bad_flat={first_bad} mean_abs={mean_abs:.6g} "
+                    f"max_abs={max_abs:.6g} sample[:4]={sample}\n"
+                )
+
+            if anomalous and os.environ.get(
+                "KUNSERVE_LL_NUMERIC_GUARD_FAIL", "0"
+            ) not in ("0", "false", "False", ""):
+                raise RuntimeError(
+                    f"DeepEP LL numeric guard tripped: tag={tag} "
+                    f"call={call_idx} all_finite={all_finite} max_abs={max_abs}"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -803,6 +921,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states_scale = None
+
+        self._ll_numeric_guard("dispatch_recv_hidden", hidden_states, _ct, masked_m)
+        self._ll_numeric_guard("dispatch_recv_scale", hidden_states_scale, _ct, masked_m)
 
         deepep_output = DeepEPLLDispatchOutput(
             hidden_states,
@@ -970,6 +1091,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             except Exception:
                 pass
 
+        self._ll_numeric_guard(
+            "combine_input_hidden",
+            hidden_states,
+            _cmbct,
+            getattr(self, "packed_recv_count", None),
+        )
+        self._ll_numeric_guard("combine_topk_weights", topk_weights, _cmbct)
+
         # [LL-MARKER] 方案 A: 诊断 run（KUNSERVE_MARKER=1，会破坏本次生成）。把 combine
         # 输入每个 local group g 全写成它的 global dispatch_id = ep_rank*num_local + g，
         # 那么 combine 正确时 out[t][c] == Σ_{topk_ids[t,k]>=0} topk_weights[t,k]*topk_ids[t,k]。
@@ -1013,6 +1142,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         _dbg = _os.environ.get("KUNSERVE_DETAIL_LOG")
         _oct = getattr(type(self), "_kun_ll_cmbout_ct", 0) + 1
         type(self)._kun_ll_cmbout_ct = _oct
+        self._ll_numeric_guard("combine_output_hidden", hidden_states, _oct)
         if _dbg and _oct <= 20:
             try:
                 import datetime as _dt
@@ -1145,6 +1275,7 @@ class DeepEPDispatcher(BaseDispatcher):
     ):
         super().__init__()
 
+        self.group = group
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
@@ -1228,8 +1359,72 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
 
+    def _truthy_env(self, name: str, default: str = "0") -> bool:
+        return os.environ.get(name, default).lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        )
+
+    def _resolve_auto_extend_flag(self, is_extend_in_batch: bool) -> bool:
+        if self.deepep_mode != DeepEPMode.AUTO:
+            return is_extend_in_batch
+
+        synced_extend = is_extend_in_batch
+        sync_enabled = self._truthy_env("KUNSERVE_DEEPEP_AUTO_SYNC_EXTEND")
+        if sync_enabled:
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    sync_enabled = False
+            except Exception:
+                pass
+
+        sync_error = None
+        if sync_enabled:
+            try:
+                flag = torch.tensor(
+                    [1 if is_extend_in_batch else 0],
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                    dtype=torch.int32,
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.group)
+                synced_extend = bool(flag.item())
+            except Exception as exc:
+                sync_error = repr(exc)
+                synced_extend = is_extend_in_batch
+
+        detail_log = os.environ.get("KUNSERVE_DETAIL_LOG")
+        if detail_log:
+            try:
+                log_count = getattr(type(self), "_kun_deepep_auto_ct", 0) + 1
+                type(self)._kun_deepep_auto_ct = log_count
+                should_log = (
+                    log_count <= 64
+                    or is_extend_in_batch
+                    or synced_extend
+                    or sync_error is not None
+                )
+                if should_log:
+                    import datetime as _dt
+
+                    with open(detail_log, "a", encoding="utf-8") as f:
+                        f.write(
+                            f"[{_dt.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
+                            f"[DEEPEP-AUTO] ct={log_count} stage={self._stage.name} "
+                            f"group_rank={self.group.rank()} group_size={self.group.size()} "
+                            f"local_extend={is_extend_in_batch} synced_extend={synced_extend} "
+                            f"sync_enabled={sync_enabled} sync_error={sync_error} "
+                            f"mode={'normal' if synced_extend else 'low_latency'}\n"
+                        )
+            except Exception:
+                pass
+
+        return synced_extend
+
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
-        is_extend_in_batch = get_is_extend_in_batch()
+        is_extend_in_batch = self._resolve_auto_extend_flag(get_is_extend_in_batch())
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher

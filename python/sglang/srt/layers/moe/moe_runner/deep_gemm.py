@@ -406,17 +406,36 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 _half = down_input.shape[2]                 # 768
                 _bkd = _half // 128                          # 6
                 # logical index [g,0]; log scale shape so a column-major mismatch is visible
-                _din_dq = (down_input[_g2, 0].float().view(_bkd, 128)
-                           * down_input_scale[_g2, 0].float().view(_bkd, 1)).view(_half)
+                _din_raw = down_input[_g2, 0].float()
+                _scale_raw = down_input_scale[_g2, 0].float()
+                _din_dq = (_din_raw.view(_bkd, 128) * _scale_raw.view(_bkd, 1)).view(_half)
                 _dd5 = (_rdin.float() - _din_dq).abs()
+                _din_flat = _din_dq.reshape(-1)
+                _din_finite = torch.isfinite(_din_flat)
+                _din_all_finite = bool(_din_finite.all().item())
+                _din_bad = (~_din_finite).nonzero(as_tuple=False).flatten()
+                _din_bad_count = int(_din_bad.numel())
+                _din_first_bad = int(_din_bad[0].item()) if _din_bad_count else -1
+                _scale_flat = _scale_raw.reshape(-1)
+                _scale_finite = torch.isfinite(_scale_flat)
+                _scale_all_finite = bool(_scale_finite.all().item())
+                _scale_bad = (~_scale_finite).nonzero(as_tuple=False).flatten()
+                _scale_bad_count = int(_scale_bad.numel())
+                _scale_first_bad = int(_scale_bad[0].item()) if _scale_bad_count else -1
+                _masked_m_g = int(masked_m[_g2].item())
                 with open(os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _f:
                     _f.write(
                         f"[{_dt.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
-                        f"[MASKED-REF-DIN] g={_g2} t=0 din_shape={tuple(down_input.shape)} "
-                        f"din_scale_shape={tuple(down_input_scale.shape)} "
+                        f"[MASKED-REF-DIN] g={_g2} t=0 masked_m_g={_masked_m_g} "
+                        f"din_shape={tuple(down_input.shape)} din_scale_shape={tuple(down_input_scale.shape)} "
+                        f"din_all_finite={_din_all_finite} din_bad_count={_din_bad_count} "
+                        f"din_first_bad={_din_first_bad} scale_all_finite={_scale_all_finite} "
+                        f"scale_bad_count={_scale_bad_count} scale_first_bad={_scale_first_bad} "
                         f"din_max_abs_diff={_dd5.max().item():.4f} din_mean_abs_diff={_dd5.mean().item():.5f} "
                         f"ref_mean_abs={_rdin.float().abs().mean().item():.4f} "
                         f"act_mean_abs={_din_dq.abs().mean().item():.4f} "
+                        f"scale[:4]={_scale_raw[:4].tolist()} "
+                        f"raw[:4]={_din_raw[:4].tolist()} "
                         f"ref[:4]={_rdin[:4].float().tolist()} act[:4]={_din_dq[:4].tolist()}\n"
                     )
         except Exception as _e:
@@ -811,6 +830,97 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
+
+    # DeepEP LL correctness triage. This is deliberately env-gated because the
+    # finite/max checks synchronize with the GPU. It checks only valid packed
+    # expert rows ([0, masked_m[g])) so padding garbage from torch.empty is not
+    # mistaken for a real activation bug. If this trips before [MASKED-REF-DIN],
+    # the corruption is already present in DeepEP LL dispatch output; otherwise
+    # the activation quant / masked GEMM path is the next suspect.
+    try:
+        if (
+            os.environ.get("KUNSERVE_DETAIL_LOG")
+            and os.environ.get("KUNSERVE_LL_NUMERIC_GUARD", "0").lower()
+            not in ("0", "false", "no", "off", "")
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _ct = getattr(pre_permute_deepep_ll_to_deep_gemm, "_kun_ll_dg_ct", 0) + 1
+            pre_permute_deepep_ll_to_deep_gemm._kun_ll_dg_ct = _ct
+            _limit = int(os.environ.get("KUNSERVE_LL_NUMERIC_GUARD_LIMIT", "256"))
+            if _ct <= _limit:
+                _rows = masked_m.to(device=hidden_states.device, dtype=torch.long)
+                _mask = (
+                    torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+                    < _rows.unsqueeze(1)
+                )
+
+                def _valid_stats(_x):
+                    if _x is None:
+                        return None
+                    _v = _x.float()[_mask].reshape(-1)
+                    if _v.numel() == 0:
+                        return (True, 0, -1, 0.0, 0.0)
+                    _finite = torch.isfinite(_v)
+                    _all = bool(_finite.all().item())
+                    if _all:
+                        _abs = _v.abs()
+                        return (True, 0, -1, float(_abs.mean().item()), float(_abs.max().item()))
+                    _bad = (~_finite).nonzero(as_tuple=False).flatten()
+                    _fv = _v[_finite]
+                    if _fv.numel():
+                        _abs = _fv.abs()
+                        _mean = float(_abs.mean().item())
+                        _mx = float(_abs.max().item())
+                    else:
+                        _mean = float("nan")
+                        _mx = float("nan")
+                    return (False, int(_bad.numel()), int(_bad[0].item()), _mean, _mx)
+
+                _hs = _valid_stats(hidden_states)
+                _sc = _valid_stats(hidden_states_scale)
+                _thr = float(os.environ.get("KUNSERVE_LL_NUMERIC_GUARD_MAX_ABS", "100.0"))
+                _verbose = os.environ.get("KUNSERVE_LL_NUMERIC_GUARD_VERBOSE", "0") not in (
+                    "0",
+                    "false",
+                    "False",
+                    "",
+                )
+                _anom = (
+                    (_hs is not None and ((not _hs[0]) or _hs[4] >= _thr))
+                    or (_sc is not None and ((not _sc[0]) or _sc[4] >= _thr))
+                )
+                _hs_mean = f"{_hs[3]:.6g}" if _hs else "None"
+                _hs_max = f"{_hs[4]:.6g}" if _hs else "None"
+                _sc_mean = f"{_sc[3]:.6g}" if _sc else "None"
+                _sc_max = f"{_sc[4]:.6g}" if _sc else "None"
+                if _anom or _verbose:
+                    import datetime as _dt
+
+                    with open(os.environ["KUNSERVE_DETAIL_LOG"], "a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"[{_dt.datetime.now()} pid={os.getpid()}] [KUNSERVE-DBG] "
+                            f"[LL-DG-PRE] ct={_ct} hs_shape={tuple(hidden_states.shape)} "
+                            f"hs_dtype={hidden_states.dtype} scale_shape="
+                            f"{tuple(hidden_states_scale.shape) if hidden_states_scale is not None else None} "
+                            f"masked_m_sum={int(masked_m.sum().item())} "
+                            f"masked_m_head={_rows[:8].detach().cpu().tolist()} "
+                            f"hs_all_finite={_hs[0] if _hs else None} "
+                            f"hs_bad_count={_hs[1] if _hs else None} "
+                            f"hs_first_bad={_hs[2] if _hs else None} "
+                            f"hs_mean_abs={_hs_mean} "
+                            f"hs_max_abs={_hs_max} "
+                            f"scale_all_finite={_sc[0] if _sc else None} "
+                            f"scale_bad_count={_sc[1] if _sc else None} "
+                            f"scale_first_bad={_sc[2] if _sc else None} "
+                            f"scale_mean_abs={_sc_mean} "
+                            f"scale_max_abs={_sc_max}\n"
+                        )
+    except Exception as _e:
+        try:
+            with open(os.environ.get("KUNSERVE_DETAIL_LOG", "/dev/null"), "a", encoding="utf-8") as _f:
+                _f.write(f"[KUNSERVE-DBG] [LL-DG-PRE] ERROR: {_e!r}\n")
+        except Exception:
+            pass
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
