@@ -2860,6 +2860,14 @@ class Scheduler(
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
+            if getattr(req, "req_pool_idx", None) is None:
+                pending_new_req_slots = sum(
+                    1
+                    for can_run_req in adder.can_run_list
+                    if getattr(can_run_req, "req_pool_idx", None) is None
+                )
+                if pending_new_req_slots >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.

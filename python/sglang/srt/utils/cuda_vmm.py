@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -15,29 +14,6 @@ from torch.utils.cpp_extension import load_inline
 logger = logging.getLogger(__name__)
 _CUDA_VMM_AVAILABLE: Optional[bool] = None
 
-
-def emit_vmm_timing(event: str, **fields) -> None:
-    path = os.environ.get("KUNSERVE_VMM_TIMING_LOG") or os.environ.get(
-        "SGLANG_VMM_TIMING_LOG"
-    )
-    if not path:
-        return
-    try:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        record = {
-            "ts": time.time(),
-            "event": event,
-            "pid": os.getpid(),
-        }
-        if torch.cuda.is_available():
-            record["cuda_device"] = torch.cuda.current_device()
-        record.update(fields)
-        with open(path, "a", encoding="utf-8") as fout:
-            fout.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-    except Exception:
-        logger.debug("Failed to emit CUDA VMM timing event=%s", event, exc_info=True)
 
 _CPP_SRC = r"""
 #include <torch/extension.h>
@@ -394,24 +370,14 @@ class DonorLedger:
 class VmmRegion:
     def __init__(self, reserve_size_bytes: int, label: str = ""):
         self.label = label
-        reserve_t0 = time.perf_counter()
         self.granularity = get_granularity()
         self.reserve_size_bytes = round_up_to_granularity(
             reserve_size_bytes, self.granularity
         )
         self.va = int(_get_ext().vmm_reserve(self.reserve_size_bytes))
-        reserve_elapsed_s = time.perf_counter() - reserve_t0
         self._mappings: list[RegionMapping] = []
         self._owned_handles: list[VmmPhysicalHandle] = []
         self._released = False
-        emit_vmm_timing(
-            "vmm_region_reserve",
-            label=self.label,
-            reserve_size_bytes=self.reserve_size_bytes,
-            requested_size_bytes=int(reserve_size_bytes),
-            granularity=self.granularity,
-            elapsed_s=reserve_elapsed_s,
-        )
 
     def create_physical(self, size_bytes: int, label: str = "") -> VmmPhysicalHandle:
         size_bytes = round_up_to_granularity(size_bytes, self.granularity)
@@ -866,36 +832,7 @@ class ExpandableVmmTensor:
             returned_bytes += tail_to_return.size_bytes
             self._mapped_bytes = target_prefix_bytes
         self._active_rows = target_rows
-        refresh_t0 = time.perf_counter()
         self._refresh_wrapped_tensor()
-        refresh_elapsed_s = time.perf_counter() - refresh_t0
-        if target_prefix_bytes != old_mapped_bytes:
-            emit_vmm_timing(
-                "expandable_vmm_ensure_active_rows",
-                label=self.label,
-                dtype=str(self.dtype),
-                row_bytes=self.row_bytes,
-                reserve_rows=self.reserve_rows,
-                old_active_rows=old_active_rows,
-                target_rows=target_rows,
-                old_mapped_bytes=old_mapped_bytes,
-                target_prefix_bytes=target_prefix_bytes,
-                mapped_bytes=self._mapped_bytes,
-                new_map_calls=new_map_calls,
-                new_map_bytes=new_map_bytes,
-                new_map_create_elapsed_s=new_map_create_elapsed_s,
-                new_map_map_elapsed_s=new_map_map_elapsed_s,
-                new_map_total_elapsed_s=new_map_total_elapsed_s,
-                donor_map_calls=donor_map_calls,
-                donor_map_bytes=donor_map_bytes,
-                donor_map_elapsed_s=donor_map_elapsed_s,
-                returned_bytes=returned_bytes,
-                refresh_elapsed_s=refresh_elapsed_s,
-                elapsed_s=time.perf_counter() - ensure_t0,
-                granularity=self.region.granularity,
-                map_chunk_bytes=map_chunk_bytes,
-                wrap_full_tensor=self.wrap_full_tensor,
-            )
         return returned_segments
 
     def borrow_tail_bytes(

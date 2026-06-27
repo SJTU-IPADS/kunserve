@@ -110,9 +110,23 @@ class SchedulerRuntimeCheckerMixin:
             mamba_available_size,
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
+        mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+        kunserve_reserved_full = 0
+        kunserve_reserved_mamba = 0
+        kunserve_dummy_kv_slot = None
+        if mr is not None and getattr(
+            mr, "_kunserve_keepalive_dummy_kv_slot", None
+        ) is not None:
+            kunserve_reserved_full = 1
+            kunserve_dummy_kv_slot = int(mr._kunserve_keepalive_dummy_kv_slot)
+
+        full_delta = full_num_used - self.tree_cache.full_protected_size()
+        mamba_delta = mamba_num_used - self.tree_cache.mamba_protected_size()
         memory_leak = (
-            full_num_used != self.tree_cache.full_protected_size()
-            or mamba_num_used != self.tree_cache.mamba_protected_size()
+            full_delta < 0
+            or full_delta > kunserve_reserved_full
+            or mamba_delta < 0
+            or mamba_delta > kunserve_reserved_mamba
         )
         if memory_leak:
             free_full_pages = set(
@@ -126,6 +140,8 @@ class SchedulerRuntimeCheckerMixin:
             leaked_full_pages = (
                 expected_full_pages - free_full_pages - cached_full_pages
             )
+            if kunserve_dummy_kv_slot is not None:
+                leaked_full_pages.discard(kunserve_dummy_kv_slot)
             free_mamba_pages = set(
                 self.req_to_token_pool.mamba_pool.free_slots.tolist()
             )
@@ -136,14 +152,15 @@ class SchedulerRuntimeCheckerMixin:
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
+            leaked_mamba_pages.discard(0)
             token_msg = (
-                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
+                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}, kunserve_reserved_full={kunserve_reserved_full}, full_delta={full_delta}\n"
+                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, kunserve_reserved_mamba={kunserve_reserved_mamba}, mamba_delta={mamba_delta}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
             )
         else:
             token_msg = (
-                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
+                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}, kunserve_reserved_full={kunserve_reserved_full}, full_delta={full_delta}\n"
+                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, kunserve_reserved_mamba={kunserve_reserved_mamba}, mamba_delta={mamba_delta}\n"
             )
         return memory_leak, token_msg
 

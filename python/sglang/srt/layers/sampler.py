@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -59,6 +60,63 @@ class Sampler(nn.Module):
         self.sanitize_nonfinite_sampling = get_bool_env_var(
             "SGLANG_SANITIZE_NONFINITE_SAMPLING"
         )
+        try:
+            self._invalid_sampling_log_limit = int(
+                os.getenv("KUNSERVE_SAMPLER_DEBUG_MAX_LOGS", "16")
+            )
+        except ValueError:
+            self._invalid_sampling_log_limit = 16
+        self._invalid_sampling_log_count = 0
+
+    def _log_invalid_sampling_tensor(
+        self,
+        tensor: torch.Tensor,
+        tensor_name: str,
+        invalid_mask: torch.Tensor,
+    ) -> None:
+        if self._invalid_sampling_log_count >= self._invalid_sampling_log_limit:
+            return
+        self._invalid_sampling_log_count += 1
+
+        with torch.no_grad():
+            nan_count = int(torch.isnan(tensor).sum().item())
+            inf_count = int(torch.isinf(tensor).sum().item())
+            neg_count = int((tensor < 0).sum().item())
+            invalid_count = int(invalid_mask.sum().item())
+            row_indices = []
+            row_sums = []
+            if tensor.ndim >= 2:
+                bad_rows = invalid_mask.any(dim=-1).nonzero().flatten()
+                if bad_rows.numel() > 0:
+                    sample_rows = bad_rows[:4]
+                    row_indices = sample_rows.detach().cpu().tolist()
+                    finite_nonneg = torch.where(
+                        torch.isfinite(tensor) & (tensor > 0),
+                        tensor,
+                        torch.zeros_like(tensor),
+                    )
+                    row_sums = (
+                        finite_nonneg.sum(dim=-1)[sample_rows]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .tolist()
+                    )
+
+        logger.warning(
+            "Invalid sampling tensor in %s: shape=%s dtype=%s device=%s "
+            "invalid=%d nan=%d inf=%d neg=%d bad_rows=%s finite_pos_row_sums=%s",
+            tensor_name,
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            invalid_count,
+            nan_count,
+            inf_count,
+            neg_count,
+            row_indices,
+            row_sums,
+        )
 
     def _sanitize_nonfinite_tensor(
         self, tensor: torch.Tensor, tensor_name: str, fill_value: float = -1e5
@@ -70,6 +128,7 @@ class Sampler(nn.Module):
         if torch.all(finite_mask):
             return tensor
 
+        self._log_invalid_sampling_tensor(tensor, tensor_name, ~finite_mask)
         logger.warning(
             "Detected non-finite values during sampling in %s; sanitizing. shape=%s",
             tensor_name,
@@ -87,6 +146,7 @@ class Sampler(nn.Module):
         if torch.all(valid_mask):
             return probs
 
+        self._log_invalid_sampling_tensor(probs, "probabilities", ~valid_mask)
         logger.warning(
             "Detected invalid probabilities during sampling; sanitizing. shape=%s",
             tuple(probs.shape),
