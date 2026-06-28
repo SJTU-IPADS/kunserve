@@ -239,6 +239,36 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+def _kunserve_detail_log_verbose() -> bool:
+    return os.environ.get("KUNSERVE_DETAIL_LOG_VERBOSE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _kunserve_detail_log_is_milestone(rendered: str) -> bool:
+    if _kunserve_detail_log_verbose():
+        return True
+    lower = rendered.lower()
+    return any(
+        key in lower
+        for key in (
+            "prepare start",
+            "commit done",
+            "donors collected",
+            "kv expanded",
+            "restore done",
+            "balloon",
+            "variant switched",
+            "capacity grew",
+            "dummy kv slot",
+            "phantom",
+        )
+    )
+
+
 def _kunserve_ms(message: str, *args) -> None:
     """Mirror of model_runner._kunserve_ms for the scheduler subprocess.
 
@@ -254,6 +284,8 @@ def _kunserve_ms(message: str, *args) -> None:
         rendered = message % args if args else message
     except Exception:
         rendered = message
+    if not _kunserve_detail_log_is_milestone(rendered):
+        return
     try:
         import datetime as _dt
 
@@ -269,6 +301,12 @@ def _kun_wd(message: str) -> None:
     """[KUNSERVE-WD] lockstep watchdog probe -> KUNSERVE_DETAIL_LOG only (no
     logger spam). Each line is flushed to disk so it survives a hang. TEMPORARY
     debug instrumentation for the cross-replica negotiate lockstep divergence."""
+    if not (
+        _kunserve_detail_log_verbose()
+        or os.environ.get("KUNSERVE_WD_DEBUG", "0").lower()
+        in ("1", "true", "yes", "on")
+    ):
+        return
     path = os.environ.get("KUNSERVE_DETAIL_LOG")
     if not path:
         return

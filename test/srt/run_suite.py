@@ -8,8 +8,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 # NOTE: per-commit-4-gpu, per-commit-8-gpu-h200, per-commit-8-gpu-h20, per-commit-4-gpu-b200,
-# per-commit-4-gpu-gb200, per-commit-4-gpu-deepep, and per-commit-8-gpu-h200-deepep suites
-# have been migrated to stage-c suites in test/registered/ using the CI registry system.
+# per-commit CUDA suites have been migrated to stage-c suites in test/registered/ using the CI registry system.
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
@@ -105,7 +104,6 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 3600),
         # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],

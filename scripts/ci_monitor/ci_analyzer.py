@@ -122,10 +122,6 @@ class SGLangCIAnalyzer:
             "mla-test": [
                 "sgl-kernel-mla-test",
             ],
-            "deepep": [
-                "unit-test-deepep-4-gpu",
-                "unit-test-deepep-8-gpu",
-            ],
             "per-commit": [
                 "per-commit-8-gpu-h20",
             ],
@@ -224,8 +220,6 @@ class SGLangCIAnalyzer:
                     "performance-test-2-gpu",
                     "accuracy-test-1-gpu",
                     "accuracy-test-2-gpu",
-                    "unit-test-deepep-4-gpu",
-                    "unit-test-deepep-8-gpu",
                     "unit-test-backend-8-gpu-deepseek-v32",
                     "unit-test-backend-4-gpu-b200",
                     "unit-test-backend-4-gpu-gb200",
@@ -352,8 +346,6 @@ class SGLangCIAnalyzer:
                     stats["failure_patterns"]["Accuracy Test Failure"] += 1
                 elif "mla" in job_name.lower():
                     stats["failure_patterns"]["MLA Test Failure"] += 1
-                elif "deepep" in job_name.lower():
-                    stats["failure_patterns"]["DeepEP Test Failure"] += 1
                 elif "nightly" in job_name.lower():
                     stats["failure_patterns"]["Nightly Test Failure"] += 1
                 elif "notebook" in job_name.lower():

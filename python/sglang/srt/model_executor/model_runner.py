@@ -258,6 +258,38 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+
+def _kunserve_detail_log_verbose() -> bool:
+    return os.environ.get("KUNSERVE_DETAIL_LOG_VERBOSE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _kunserve_detail_log_is_milestone(rendered: str) -> bool:
+    if _kunserve_detail_log_verbose():
+        return True
+    lower = rendered.lower()
+    return any(
+        key in lower
+        for key in (
+            "prepare start",
+            "commit done",
+            "donors collected",
+            "kv expanded",
+            "restore done",
+            "balloon",
+            "variant switched",
+            "capacity grew",
+            "dummy kv slot",
+            "phantom",
+        )
+    )
+
+
 def _kunserve_ms(message: str, *args) -> None:
     """Emit a [KUNSERVE-MS] milestone line.
 
@@ -278,6 +310,8 @@ def _kunserve_ms(message: str, *args) -> None:
         rendered = message % args if args else message
     except Exception:
         rendered = message
+    if not _kunserve_detail_log_is_milestone(rendered):
+        return
     try:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         line = f"[{ts} pid={os.getpid()}] {rendered}\n"
@@ -297,6 +331,12 @@ def _kun_wd(message: str) -> None:
     it is flushed to disk and survives a hang. TEMPORARY debug instrumentation
     to locate the cross-replica negotiate/collective lockstep divergence.
     """
+    if not (
+        _kunserve_detail_log_verbose()
+        or os.environ.get("KUNSERVE_WD_DEBUG", "0").lower()
+        in ("1", "true", "yes", "on")
+    ):
+        return
     path = os.environ.get("KUNSERVE_DETAIL_LOG")
     if not path:
         return

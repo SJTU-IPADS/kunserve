@@ -748,9 +748,17 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         """
         if not self._probe_detail_log_path:
             return
+        import os as _os
+        verbose = _os.environ.get("KUNSERVE_DETAIL_LOG_VERBOSE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not (self._probe_enabled or verbose):
+            return
         try:
             import datetime as _dt
-            import os as _os
             ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
             line = f"[{ts} pid={_os.getpid()}] [KUNSERVE-DBG] {message}\n"
             with open(self._probe_detail_log_path, "a", encoding="utf-8") as fh:
