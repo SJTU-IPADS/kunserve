@@ -1,4 +1,3 @@
-import datetime
 import logging
 import os
 from dataclasses import dataclass
@@ -98,21 +97,8 @@ logger = logging.getLogger(__name__)
 
 
 def _kunserve_runtime_log(message: str, *args) -> None:
-    # Best-effort direct file log for scheduler subprocess diagnostics.
-    path = os.environ.get("KUNSERVE_DETAIL_LOG")
     try:
         logger.info(message, *args)
-    except Exception:
-        pass
-    if not path:
-        return
-    try:
-        rendered = message % args if args else message
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(
-                f"[{ts} pid={os.getpid()}] [KUNSERVE-DBG] {rendered}\n"
-            )
     except Exception:
         pass
 
@@ -490,45 +476,6 @@ class FusedMoE(torch.nn.Module):
             if tensor is None:
                 continue
             active_tensors[tensor_name] = tensor.narrow(0, start, length)
-
-        # KUNSERVE-DBG weight provenance probe: log a cheap checksum of the
-        # narrowed slice (rows [start, start+length)) AND of the alternate
-        # rows [start^32 .. ] so we can detect whether two ranks actually
-        # share identical weight bytes (which would prove the sglang
-        # active_mapping override is reading the wrong half of each rank's
-        # weight tensor on replica 1).  Fires once per layer per process.
-        try:
-            import os as _os
-            if _os.environ.get("KUNSERVE_WEIGHT_PROBE", "") in ("1", "true", "True", "yes"):
-                w13 = getattr(self, "w13_weight", None)
-                detail_log = _os.environ.get("KUNSERVE_DETAIL_LOG", "")
-                layer_id = getattr(self, "layer_id", -1)
-                if w13 is not None and detail_log:
-                    import datetime as _dt
-                    full_rows = int(w13.shape[0])
-                    # Slice (start, start+length): the rows the runner will use
-                    sl = w13[start:start + length]
-                    sl_sum = float(sl.detach().float().abs().sum().item())
-                    sl_max = float(sl.detach().float().abs().max().item()) if sl.numel() else 0.0
-                    # Alternate slice: if start==0 try rows 32..63, if start==32 try rows 0..31
-                    alt_start = (start + 32) % 64 if full_rows >= 64 else 0
-                    if alt_start + length <= full_rows:
-                        alt = w13[alt_start:alt_start + length]
-                        alt_sum = float(alt.detach().float().abs().sum().item())
-                    else:
-                        alt_sum = float("nan")
-                    ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                    line = (
-                        f"[{ts} pid={_os.getpid()}] [KUNSERVE-DBG] weight_probe "
-                        f"layer_id={layer_id} w13.shape={tuple(w13.shape)} "
-                        f"start={start} length={length} "
-                        f"sl_abs_sum={sl_sum:.6e} sl_absmax={sl_max:.4e} "
-                        f"alt_start={alt_start} alt_abs_sum={alt_sum:.6e}\n"
-                    )
-                    with open(detail_log, "a", encoding="utf-8") as fh:
-                        fh.write(line)
-        except Exception:
-            pass
 
         return active_tensors
 

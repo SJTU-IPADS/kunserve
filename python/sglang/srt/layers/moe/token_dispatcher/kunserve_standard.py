@@ -283,19 +283,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._last_max_m: Optional[int] = None
         self._last_slice_start: Optional[int] = None
         self._logged_shape: bool = False
-        # KUNSERVE-DBG probe: per-dispatcher call counter so we can sample
-        # numerical stats at logarithmic intervals (call 1, 5, 20, ...)
-        # without spamming the log.  Enabled by env var KUNSERVE_DISPATCH_PROBE=1.
-        # IMPORTANT: scheduler subprocess's logger.warning is invisible from
-        # the Ray driver capture; we must append to KUNSERVE_DETAIL_LOG file
-        # directly (same trick as _kunserve_ms in model_runner.py).
-        import os as _os
-        self._probe_enabled: bool = _os.environ.get(
-            "KUNSERVE_DISPATCH_PROBE", ""
-        ) in ("1", "true", "True", "yes")
-        self._probe_detail_log_path: Optional[str] = _os.environ.get(
-            "KUNSERVE_DETAIL_LOG"
-        )
         self._dispatch_call_count: int = 0
         self._combine_call_count: int = 0
         self._static_dispatch_logged: bool = False
@@ -306,7 +293,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         self._static_combine_mode_logged: bool = False
         self._static_combine_m_logged = set()
         self._static_mapping_mismatch_logged: bool = False
-        self._probe_milestones = {1, 5, 20, 100, 500, 2000}
         static_combine_mode = str(
             _os.environ.get("KUNSERVE_STATIC_COMBINE_MODE", "reduce_scatter")
         ).strip().lower()
@@ -386,20 +372,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "KUNSERVE_COMBINE_CHUNKED", "0"
         ) in ("1", "true", "True", "yes", "on")
         self._combine_chunked_logged: bool = False
-        # One-shot init diagnostic so we can confirm env-var propagation
-        # to the scheduler subprocess from the file content.
-        self._probe_log(
-            f"probe_init enabled={self._probe_enabled} "
-            f"detail_log={self._probe_detail_log_path!r} "
-            f"rank={self.global_rank} replica={self.replica_rank} "
-            f"lane={self.lane_rank} phase_f={self.phase_f_enabled} "
-            f"dispatch_ncclgroup={self._dispatch_ncclgroup_enabled} "
-            f"combine_alt_stream={self._combine_alt_stream_enabled} "
-            f"combine_chunked={self._combine_chunked_enabled} "
-            f"remap_fused={self._remap_fused_enabled} "
-            f"pad_skip_when_full={self._pad_skip_when_full_enabled}"
-        )
-
         # Static buffers for the fixed-padded capture path.  We pre-allocate
         # in the constructor (default cuda pool, not the cuda graph private
         # pool) so the addresses are stable across multiple
@@ -449,12 +421,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 device=device, non_blocking=True
             )
             self.active_local_expert_mapping = self.local_expert_mapping
-            self._probe_log(
-                f"mapping_moved rank={self.global_rank} replica={self.replica_rank} "
-                f"lane={self.lane_rank} old_device={old_device} "
-                f"new_device={self.local_expert_mapping.device} "
-                f"mapping={_tensor_meta(self.local_expert_mapping)}"
-            )
         return self.local_expert_mapping
 
     def _allocate_static_buffers(self) -> None:
@@ -571,16 +537,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                 self._remap_fused_enabled = False
 
         self._static_buffers_ready = True
-        self._probe_log(
-            f"static_buffers_ready rank={self.global_rank} replica={self.replica_rank} "
-            f"lane={self.lane_rank} capture_max_m={M} hidden={H} top_k={K} "
-            f"world={W} num_replicas={NR} phase_f={self.phase_f_enabled} "
-            f"padded_hidden={_tensor_meta(self._buf_padded_hidden)} "
-            f"gathered_hidden={_tensor_meta(self._buf_gathered_hidden)} "
-            f"union_hidden={_tensor_meta(self._buf_union_hidden)} "
-            f"mapping={_tensor_meta(self.local_expert_mapping)} "
-            f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
-        )
         logger.info(
             "[KUNSERVE-MS] CrossReplicaStandardDispatcher static buffers ready: "
             "capture_max_m=%d hidden=%d top_k=%d world=%d num_replicas=%d "
@@ -737,70 +693,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             remapped[valid] = mapping[topk_ids[valid].to(dtype=torch.long)]
         return remapped
 
-    def _probe_log(self, message: str) -> None:
-        """Append a probe line directly to KUNSERVE_DETAIL_LOG.
-
-        We can't rely on logger.warning here because dispatcher code runs
-        inside the SGLang scheduler subprocess, whose stdout/stderr is not
-        captured by Ray.  Mirror the _kunserve_ms file-append trick from
-        model_runner.py so probe events actually land in
-        ``kunserve_sglang_detail.log``.  Never raises.
-        """
-        if not self._probe_detail_log_path:
-            return
-        import os as _os
-        verbose = _os.environ.get("KUNSERVE_DETAIL_LOG_VERBOSE", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        if not (self._probe_enabled or verbose):
-            return
-        try:
-            import datetime as _dt
-            ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-            line = f"[{ts} pid={_os.getpid()}] [KUNSERVE-DBG] {message}\n"
-            with open(self._probe_detail_log_path, "a", encoding="utf-8") as fh:
-                fh.write(line)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _stats(t: torch.Tensor) -> str:
-        """Cheap numerical fingerprint for probe logs.  Includes mean/max/min,
-        finite-only mean (to detect nan/inf masking real values), nan/inf
-        counts.  Synchronous to ensure values are read after the previous
-        collective completes -- only call in probe paths."""
-        try:
-            tf = t.detach().float()
-            n_nan = int(torch.isnan(tf).sum().item())
-            n_inf = int(torch.isinf(tf).sum().item())
-            finite = tf[torch.isfinite(tf)]
-            if finite.numel() > 0:
-                return (
-                    f"shape={tuple(t.shape)} dtype={t.dtype} "
-                    f"mean={finite.mean().item():.4e} "
-                    f"absmax={finite.abs().max().item():.4e} "
-                    f"nan={n_nan} inf={n_inf}"
-                )
-            return f"shape={tuple(t.shape)} dtype={t.dtype} all_non_finite nan={n_nan} inf={n_inf}"
-        except Exception as exc:
-            return f"shape={tuple(t.shape)} dtype={t.dtype} stats_err={exc!r}"
-
-    def _should_log_dynamic_path(self, local_m: int, call: int) -> bool:
-        if not self._probe_detail_log_path:
-            return False
-        capture_m = int(self._capture_max_m or 0)
-        # Always log the large eager path that cannot be represented by the
-        # fixed-padded decode graph, plus a few early/milestone calls so the
-        # next failure log shows whether we reached dispatch/combine/reduce.
-        return (
-            int(local_m) > max(capture_m, 1024)
-            or call <= 3
-            or call in self._probe_milestones
-        )
-
     def _dispatch_dynamic(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput, local_m: int
     ) -> StandardDispatchOutput:
@@ -821,24 +713,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             sizes = self._all_gather_sizes(local_m, hidden_states.device)
         max_m = int(sizes.max().item()) if sizes.numel() > 0 else local_m
         timing_fields["max_m"] = int(max_m)
-        log_dynamic = self._should_log_dynamic_path(local_m, call)
-        if log_dynamic:
-            try:
-                sizes_text = sizes.detach().cpu().tolist()
-            except Exception as exc:
-                sizes_text = f"<sizes_err:{exc!r}>"
-            self._probe_log(
-                f"dynamic_dispatch_enter call={call} rank={self.global_rank} "
-                f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"state={_capture_state_text()} phase_f={self.phase_f_enabled} "
-                f"local_m={local_m} max_m={max_m} sizes={sizes_text} "
-                f"capture_max_m={self._capture_max_m} "
-                f"hidden={_tensor_meta(hidden_states)} "
-                f"topk_ids={_tensor_meta(topk_output.topk_ids)} "
-                f"topk_weights={_tensor_meta(topk_output.topk_weights)} "
-                f"router_logits={_tensor_meta(topk_output.router_logits)} "
-                f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
-            )
 
         with _detail_scope(detail_timing, "kunserve_dispatch_dynamic_pad", **timing_fields):
             padded_hidden = self._pad_dim0(hidden_states, max_m=max_m, pad_value=0)
@@ -921,57 +795,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             remapped_topk = self._remap_topk_ids(union_topk_ids)
 
         self._dispatch_call_count = call
-        if log_dynamic:
-            self._probe_log(
-                f"dynamic_dispatch_after_gather call={call} rank={self.global_rank} "
-                f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"state={_capture_state_text()} local_m={local_m} max_m={max_m} "
-                f"padded_hidden={_tensor_meta(padded_hidden)} "
-                f"union_hidden={_tensor_meta(union_hidden)} "
-                f"union_topk_ids={_tensor_meta(union_topk_ids)} "
-                f"union_topk_weights={_tensor_meta(union_topk_weights)} "
-                f"remapped_topk={_tensor_meta(remapped_topk)} "
-                f"router_logits={_tensor_meta(router_logits)}"
-            )
-        if self._probe_enabled and self._dispatch_call_count in self._probe_milestones:
-            # Histogram of remapped_topk: how many tokens have a valid local
-            # row index (0..num_local-1) vs invalid (-1).  If too few valid
-            # tokens, the topk routing is mismatched with what this rank
-            # actually holds.
-            try:
-                rt = remapped_topk.detach().to(torch.int64)
-                valid_count = int(((rt >= 0) & (rt < self.num_local_experts)).sum().item())
-                neg_count = int((rt == -1).sum().item())
-                total = int(rt.numel())
-                # Also log the unique global expert ids that DID get routed to
-                # this rank (so we can verify they match the rank's intended
-                # expert range).  Limit to first 16 unique to keep log small.
-                global_routed = union_topk_ids[(rt >= 0) & (rt < self.num_local_experts)]
-                if global_routed.numel() > 0:
-                    uniq, counts = torch.unique(
-                        global_routed.detach().to(torch.int64), return_counts=True
-                    )
-                    uniq = uniq.tolist()[:16]
-                    counts = counts.tolist()[:16]
-                    routed_summary = list(zip(uniq, counts))
-                else:
-                    routed_summary = []
-            except Exception as exc:
-                valid_count = neg_count = total = -1
-                routed_summary = f"<err: {exc!r}>"
-            self._probe_log(
-                f"dispatch_probe call={self._dispatch_call_count} "
-                f"rank={self.global_rank} replica={self.replica_rank} "
-                f"lane={self.lane_rank} phase_f={self.phase_f_enabled} "
-                f"local_m={local_m} max_m={max_m} | "
-                f"hidden_in={self._stats(hidden_states)} | "
-                f"union_hidden={self._stats(union_hidden)} | "
-                f"union_topk_ids={self._stats(union_topk_ids.float())} | "
-                f"remapped_topk={self._stats(remapped_topk.float())} | "
-                f"routing valid={valid_count}/{total} neg={neg_count} "
-                f"routed_global_experts={routed_summary}"
-            )
-
         return StandardDispatchOutput(
             hidden_states=union_hidden,
             hidden_states_scale=None,
@@ -997,16 +820,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             "max_m": int(self._last_max_m or 0),
             "phase_f": bool(self.phase_f_enabled),
         }
-        log_dynamic = self._should_log_dynamic_path(int(self._last_local_m), call)
-        if log_dynamic:
-            self._probe_log(
-                f"dynamic_combine_enter call={call} rank={self.global_rank} "
-                f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"state={_capture_state_text()} phase_f={self.phase_f_enabled} "
-                f"last_local_m={self._last_local_m} last_max_m={self._last_max_m} "
-                f"input={_tensor_meta(hidden_states)} "
-                f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
-            )
 
         if self.phase_f_enabled:
             # Phase F: lane reduce_scatter only.
@@ -1038,26 +851,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             ):
                 result = local_slice[: int(self._last_local_m)].contiguous()
             self._combine_call_count = call
-            if log_dynamic:
-                self._probe_log(
-                    f"dynamic_combine_after_reduce call={call} rank={self.global_rank} "
-                    f"replica={self.replica_rank} lane={self.lane_rank} "
-                    f"state={_capture_state_text()} reduce_dtype={reduce_dtype} "
-                    f"reduced={_tensor_meta(local_slice)} result={_tensor_meta(result)}"
-                )
-            if (
-                self._probe_enabled
-                and self._combine_call_count in self._probe_milestones
-            ):
-                self._probe_log(
-                    f"combine_probe call={self._combine_call_count} "
-                    f"rank={self.global_rank} replica={self.replica_rank} "
-                    f"lane={self.lane_rank} phase_f=True "
-                    f"last_local_m={int(self._last_local_m)} last_max_m={max_m} | "
-                    f"post_expert_union={self._stats(hidden_states)} | "
-                    f"reduce_scatter_out={self._stats(local_slice)} | "
-                    f"sliced={self._stats(result)}"
-                )
             return result
 
         # Phase D fallback: global all_reduce on the union, then slice.
@@ -1106,21 +899,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         }
         call = self._dispatch_call_count + 1
         if M not in self._static_dispatch_m_logged:
-            self._probe_log(
-                f"static_dispatch_enter rank={self.global_rank} replica={self.replica_rank} "
-                f"lane={self.lane_rank} state={_capture_state_text()} "
-                f"local_m={local_m} graph_bucket_m={M} capture_max_m={capacity_m} "
-                f"phase_f={self.phase_f_enabled} "
-                f"hidden_in={_tensor_meta(hidden_states)} "
-                f"topk_ids_in={_tensor_meta(topk_ids)} "
-                f"topk_weights_in={_tensor_meta(topk_weights)} "
-                f"mapping={_tensor_meta(self.local_expert_mapping)} "
-                f"padded_hidden={_tensor_meta(self._buf_padded_hidden)} "
-                f"gathered_hidden={_tensor_meta(self._buf_gathered_hidden)} "
-                f"union_hidden={_tensor_meta(self._buf_union_hidden)} "
-                f"remap_buf={_tensor_meta(self._buf_union_topk_ids_remapped)} "
-                f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
-            )
             self._static_dispatch_m_logged.add(M)
             self._static_dispatch_logged = True
         if M <= 0 or local_m > capacity_m:
@@ -1158,11 +936,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             self._pad_skip_when_full_enabled and local_m == M
         )
         if skip_pad_zero and not self._pad_skip_when_full_logged:
-            self._probe_log(
-                f"pad_skip_when_full_active rank={self.global_rank} "
-                f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"local_m={local_m} graph_bucket_m={M} capture_max_m={capacity_m}"
-            )
             self._pad_skip_when_full_logged = True
         with _detail_scope(detail_timing, "kunserve_dispatch_static_pad", **timing_fields):
             if not skip_pad_zero:
@@ -1200,12 +973,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             and hasattr(gather_group, "grouped_all_gather_into_tensor")
         )
         if use_grouped and not self._dispatch_ncclgroup_logged:
-            self._probe_log(
-                f"dispatch_ncclgroup_active rank={self.global_rank} "
-                f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"phase_f={self.phase_f_enabled} "
-                f"gather_group={_group_name(gather_group)}"
-            )
             self._dispatch_ncclgroup_logged = True
         with _detail_scope(
             detail_timing, "kunserve_dispatch_static_all_gather", **timing_fields
@@ -1277,16 +1044,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     )
 
         if M not in self._static_after_gather_m_logged:
-            self._probe_log(
-                f"static_dispatch_after_gather rank={self.global_rank} replica={self.replica_rank} "
-                f"lane={self.lane_rank} state={_capture_state_text()} "
-                f"phase_f={self.phase_f_enabled} gather_group="
-                f"{_group_name(gather_group)} gathered_hidden={_tensor_meta(gathered_hidden)} "
-                f"gathered_topk_ids={_tensor_meta(gathered_topk_ids)} "
-                f"union_hidden={_tensor_meta(union_hidden)} "
-                f"union_topk_ids={_tensor_meta(union_topk_ids)} "
-                f"capacity_m={capacity_m}"
-            )
             self._static_after_gather_m_logged.add(M)
             self._static_after_gather_logged = True
 
@@ -1302,13 +1059,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         union_ids = union_topk_ids
         if mapping.device != union_ids.device or mapping.dtype != torch.int32:
             if not self._static_mapping_mismatch_logged:
-                self._probe_log(
-                    f"STATIC_DISPATCH_MAPPING_MISMATCH rank={self.global_rank} "
-                    f"replica={self.replica_rank} lane={self.lane_rank} "
-                    f"state={_capture_state_text()} mapping={_tensor_meta(mapping)} "
-                    f"union_ids={_tensor_meta(union_ids)} expected_dtype=torch.int32 "
-                    f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
-                )
                 self._static_mapping_mismatch_logged = True
             raise RuntimeError(
                 "CrossReplicaStandardDispatcher static mapping must be a "
@@ -1318,10 +1068,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             )
         if int(mapping.numel()) != int(self.num_experts):
             if not self._static_mapping_mismatch_logged:
-                self._probe_log(
-                    f"STATIC_DISPATCH_MAPPING_SIZE_MISMATCH rank={self.global_rank} "
-                    f"mapping={_tensor_meta(mapping)} num_experts={self.num_experts}"
-                )
                 self._static_mapping_mismatch_logged = True
             raise RuntimeError(
                 "CrossReplicaStandardDispatcher static mapping has wrong length: "
@@ -1330,14 +1076,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         with _detail_scope(detail_timing, "kunserve_dispatch_static_remap", **timing_fields):
             if self._remap_fused_enabled:
                 if not self._remap_fused_logged:
-                    self._probe_log(
-                        f"remap_fused_active rank={self.global_rank} "
-                        f"replica={self.replica_rank} lane={self.lane_rank} "
-                        f"phase_f={self.phase_f_enabled} "
-                        f"union_ids={_tensor_meta(union_ids)} "
-                        f"mapping={_tensor_meta(mapping)} "
-                        f"out={_tensor_meta(union_topk_ids_remapped)}"
-                    )
                     self._remap_fused_logged = True
                 fused_remap_topk_ids(
                     union_ids,
@@ -1392,15 +1130,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         call = self._combine_call_count + 1
 
         if not self._static_combine_logged:
-            self._probe_log(
-                f"static_combine_enter rank={self.global_rank} replica={self.replica_rank} "
-                f"lane={self.lane_rank} state={_capture_state_text()} "
-                f"phase_f={self.phase_f_enabled} last_local_m={self._last_local_m} "
-                f"last_max_m={self._last_max_m} last_slice_start={self._last_slice_start} "
-                f"post_expert_hidden={_tensor_meta(hidden_states)} "
-                f"combine_slice_buf={_tensor_meta(getattr(self, '_buf_combine_local_slice', None))} "
-                f"group={_group_name(self.group)} lane_group={_group_name(self.lane_group)}"
-            )
             self._static_combine_logged = True
 
         if self.phase_f_enabled:
@@ -1432,14 +1161,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
             timing_fields["max_m"] = M
             timing_fields["capacity_m"] = int(self._capture_max_m or 0)
             if M not in self._static_combine_m_logged:
-                self._probe_log(
-                    f"static_combine_mode rank={self.global_rank} "
-                    f"replica={self.replica_rank} lane={self.lane_rank} "
-                    f"mode={self._static_combine_mode} phase_f={self.phase_f_enabled} "
-                    f"graph_bucket_m={M} capture_max_m={int(self._capture_max_m or 0)} "
-                    f"lane_group={_group_name(self.lane_group)} "
-                    f"slice_buf={_tensor_meta(getattr(self, '_buf_combine_local_slice', None))}"
-                )
                 self._static_combine_m_logged.add(M)
                 self._static_combine_mode_logged = True
             if self._static_combine_mode in (
@@ -1479,12 +1200,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
                     else None
                 )
                 if use_alt_stream and not self._combine_alt_stream_logged:
-                    self._probe_log(
-                        f"combine_alt_stream_active rank={self.global_rank} "
-                        f"replica={self.replica_rank} lane={self.lane_rank} "
-                        f"phase_f={self.phase_f_enabled} "
-                        f"mode={self._static_combine_mode}"
-                    )
                     self._combine_alt_stream_logged = True
                 if (
                     self._static_combine_mode == "reduce_scatter_tp_all_reduce"
@@ -1728,14 +1443,6 @@ class CrossReplicaStandardDispatcher(BaseDispatcher):
         }
 
         if not self._combine_chunked_logged:
-            self._probe_log(
-                f"combine_chunked_active rank={self.global_rank} "
-                f"replica={self.replica_rank} lane={self.lane_rank} "
-                f"phase_f={self.phase_f_enabled} num_replicas={num_replicas} "
-                f"capture_max_m={M} "
-                f"local_slice={_tensor_meta(local_slice)} "
-                f"union_hidden={_tensor_meta(dispatch_output.hidden_states)}"
-            )
             self._combine_chunked_logged = True
 
         # Slice into per-replica chunks.

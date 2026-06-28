@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import bisect
-import datetime
 import gc
 import inspect
 import logging
@@ -97,20 +96,8 @@ logger = logging.getLogger(__name__)
 
 
 def _kunserve_graph_log(message: str, *args) -> None:
-    path = os.environ.get("KUNSERVE_DETAIL_LOG")
     try:
         logger.info(message, *args)
-    except Exception:
-        pass
-    if not path:
-        return
-    try:
-        rendered = message % args if args else message
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(
-                f"[{ts} pid={os.getpid()}] [KUNSERVE-DBG] cuda_graph {rendered}\n"
-            )
     except Exception:
         pass
 

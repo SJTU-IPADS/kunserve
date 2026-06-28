@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime
 import logging
 import os
 import weakref
@@ -106,10 +105,6 @@ class KunServePyNcclGroup:
         self.device = device
         self.device_module = torch.get_device_module(self.device)
 
-        self._diag_log_path = os.environ.get("KUNSERVE_DETAIL_LOG")
-        self._diag_seen = set()
-        self._diag_counts = {}
-
         self.stateless_group = StatelessProcessGroup.create(
             host=host,
             port=int(port),
@@ -153,11 +148,6 @@ class KunServePyNcclGroup:
             device=self.device,
             use_current_stream=False,
         )
-        self._diag_log(
-            f"comm_ready kind={kind} name={self.name} unique={self.unique_name} "
-            f"rank={self.rank}/{self.world_size} device={self.device} "
-            f"available={bool(getattr(comm, 'available', False))}"
-        )
         return comm
 
     @staticmethod
@@ -167,9 +157,6 @@ class KunServePyNcclGroup:
         except Exception:
             return False
 
-    def _comm_kind(self) -> str:
-        return "graph" if self._is_cuda_graph_capturing() else "eager"
-
     def _require_pynccl(self, *, graph: Optional[bool] = None) -> PyNcclCommunicator:
         use_graph = self._is_cuda_graph_capturing() if graph is None else bool(graph)
         comm = self.pynccl_graph_comm if use_graph else self.pynccl_comm
@@ -177,78 +164,10 @@ class KunServePyNcclGroup:
             raise RuntimeError(
                 f"KunServePyNcclGroup {self.name!r} has no available PyNccl "
                 f"{'graph' if use_graph else 'eager'} communicator."
-            )
+        )
         return comm
 
-    @staticmethod
-    def _capture_state_text() -> str:
-        try:
-            return "capturing" if torch.cuda.is_current_stream_capturing() else "eager"
-        except Exception as exc:
-            return f"capture_state_err={exc!r}"
-
-    @staticmethod
-    def _tensor_meta(tensor: Optional[torch.Tensor]) -> str:
-        if not isinstance(tensor, torch.Tensor):
-            return "None"
-        try:
-            ptr = hex(int(tensor.data_ptr()))
-        except Exception as exc:
-            ptr = f"<ptr_err:{exc!r}>"
-        return (
-            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-            f"device={tensor.device} ptr={ptr} contiguous={tensor.is_contiguous()}"
-        )
-
-    def _diag_log(self, message: str) -> None:
-        if not self._diag_log_path:
-            return
-        try:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-            with open(self._diag_log_path, "a", encoding="utf-8") as fh:
-                fh.write(
-                    f"[{ts} pid={os.getpid()}] [KUNSERVE-DBG] pynccl {message}\n"
-                )
-        except Exception:
-            pass
-
-    def _diag_collective(
-        self,
-        op_name: str,
-        input_: Optional[torch.Tensor],
-        output: Optional[torch.Tensor] = None,
-        *,
-        registered: bool,
-    ) -> None:
-        state = self._capture_state_text()
-        key = (
-            op_name,
-            registered,
-            state,
-            tuple(input_.shape) if isinstance(input_, torch.Tensor) else None,
-            str(input_.dtype) if isinstance(input_, torch.Tensor) else None,
-            str(input_.device) if isinstance(input_, torch.Tensor) else None,
-            tuple(output.shape) if isinstance(output, torch.Tensor) else None,
-            str(output.dtype) if isinstance(output, torch.Tensor) else None,
-            str(output.device) if isinstance(output, torch.Tensor) else None,
-        )
-        count = int(self._diag_counts.get(op_name, 0)) + 1
-        self._diag_counts[op_name] = count
-        if count > 3 and key in self._diag_seen:
-            return
-        self._diag_seen.add(key)
-        self._diag_log(
-            f"collective op={op_name} registered={registered} count={count} "
-            f"state={state} name={self.name} unique={self.unique_name} "
-            f"comm_kind={self._comm_kind()} rank={self.rank}/{self.world_size} "
-            f"device={self.device} "
-            f"input={self._tensor_meta(input_)} output={self._tensor_meta(output)}"
-        )
-
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
-        self._diag_collective(
-            "_all_reduce_in_place", input_, registered=False
-        )
         if self.world_size == 1:
             return
         pynccl_comm = self._require_pynccl()
@@ -263,16 +182,12 @@ class KunServePyNcclGroup:
         if not self._is_cuda_graph_capturing():
             self._all_reduce_in_place(input_)
             return input_
-        self._diag_collective("all_reduce", input_, registered=True)
         inplace_all_reduce(input_, group_name=self.unique_name)
         return input_
 
     def _all_gather_into_tensor(
         self, output: torch.Tensor, input: torch.Tensor
     ) -> None:
-        self._diag_collective(
-            "_all_gather_into_tensor", input, output, registered=False
-        )
         if self.world_size == 1:
             output.copy_(input.reshape(output.shape))
             return
@@ -291,9 +206,6 @@ class KunServePyNcclGroup:
         if not self._is_cuda_graph_capturing():
             self._all_gather_into_tensor(output, input)
             return
-        self._diag_collective(
-            "all_gather_into_tensor", input, output, registered=True
-        )
         reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
     def grouped_all_gather_into_tensor(
@@ -319,12 +231,6 @@ class KunServePyNcclGroup:
             for output, input_ in pairs:
                 output.copy_(input_.reshape(output.shape))
             return
-        self._diag_collective(
-            "grouped_all_gather_into_tensor",
-            pairs[0][1],
-            pairs[0][0],
-            registered=False,
-        )
         pynccl_comm = self._require_pynccl()
         with pynccl_comm.change_state(
             enable=True, stream=get_current_device_stream_fast()
@@ -374,9 +280,6 @@ class KunServePyNcclGroup:
                 f"_reduce_into_tensor recv tensor on wrong device: "
                 f"{recv.device} vs comm device {self.device}."
             )
-        self._diag_collective(
-            "_reduce_into_tensor", send, recv, registered=False
-        )
         pynccl_comm = self._require_pynccl()
         with pynccl_comm.change_state(
             enable=True, stream=get_current_device_stream_fast()
@@ -397,9 +300,6 @@ class KunServePyNcclGroup:
     def _reduce_scatter_tensor(
         self, output: torch.Tensor, input: torch.Tensor
     ) -> torch.Tensor:
-        self._diag_collective(
-            "_reduce_scatter_tensor", input, output, registered=False
-        )
         if self.world_size == 1:
             output.copy_(input.reshape(output.shape))
             return output
@@ -454,7 +354,6 @@ class KunServePyNcclGroup:
         # ncclReduce on the main stream once enabled, so warm the pattern
         # here so its first call inside CUDA graph capture doesn't trigger
         # lazy init.
-        nccl_reduce_preheated = False
         try:
             red_send = torch.zeros(1, device=self.device)
             red_recv = torch.zeros(1, device=self.device)
@@ -468,7 +367,6 @@ class KunServePyNcclGroup:
                 pynccl_comm.comm,
                 cudaStream_t(get_current_device_stream_fast().cuda_stream),
             )
-            nccl_reduce_preheated = True
         except Exception as exc:
             logger.warning(
                 "KunServe ncclReduce preheat failed on %s: %r",
@@ -481,8 +379,6 @@ class KunServePyNcclGroup:
         # stream here (outside any capture) avoids that hazard.  Gated by
         # env so that runs that don't enable the overlap don't pay the
         # extra preheat cost.
-        alt_stream_preheated = False
-        alt_stream_reduce_preheated = False
         if _alt_stream_combine_env_enabled():
             alt_stream = get_kunserve_combine_alt_stream(self.device)
             default_stream = get_current_device_stream_fast()
@@ -513,7 +409,6 @@ class KunServePyNcclGroup:
                         pynccl_comm.comm,
                         cudaStream_t(alt_stream.cuda_stream),
                     )
-                    alt_stream_reduce_preheated = True
                 except Exception as exc:
                     logger.warning(
                         "KunServe ncclReduce alt-stream preheat failed on %s: %r",
@@ -521,15 +416,7 @@ class KunServePyNcclGroup:
                         exc,
                     )
             default_stream.wait_stream(alt_stream)
-            alt_stream_preheated = True
         torch.cuda.synchronize()
-        self._diag_log(
-            f"graph_comm_preheated name={self.name} unique={self.unique_name} "
-            f"rank={self.rank}/{self.world_size} device={self.device} "
-            f"grouped_all_gather=True nccl_reduce_preheated={nccl_reduce_preheated} "
-            f"alt_stream_preheated={alt_stream_preheated} "
-            f"alt_stream_reduce_preheated={alt_stream_reduce_preheated}"
-        )
 
     def reduce_scatter_tensor(
         self,
@@ -546,9 +433,6 @@ class KunServePyNcclGroup:
             return output
         if not self._is_cuda_graph_capturing():
             return self._reduce_scatter_tensor(output, input)
-        self._diag_collective(
-            "reduce_scatter_tensor", input, output, registered=True
-        )
         reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
         return output
 

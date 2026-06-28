@@ -239,18 +239,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-def _kunserve_detail_log_verbose() -> bool:
-    return os.environ.get("KUNSERVE_DETAIL_LOG_VERBOSE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
 def _kunserve_detail_log_is_milestone(rendered: str) -> bool:
-    if _kunserve_detail_log_verbose():
-        return True
     lower = rendered.lower()
     return any(
         key in lower
@@ -295,38 +284,6 @@ def _kunserve_ms(message: str, *args) -> None:
             fh.write(line)
     except Exception:
         pass
-
-
-def _kun_wd(message: str) -> None:
-    """[KUNSERVE-WD] lockstep watchdog probe -> KUNSERVE_DETAIL_LOG only (no
-    logger spam). Each line is flushed to disk so it survives a hang. TEMPORARY
-    debug instrumentation for the cross-replica negotiate lockstep divergence."""
-    if not (
-        _kunserve_detail_log_verbose()
-        or os.environ.get("KUNSERVE_WD_DEBUG", "0").lower()
-        in ("1", "true", "yes", "on")
-    ):
-        return
-    path = os.environ.get("KUNSERVE_DETAIL_LOG")
-    if not path:
-        return
-    try:
-        import datetime as _dt
-
-        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"[{ts} pid={os.getpid()}] {message}\n")
-    except Exception:
-        pass
-
-
-def _kunserve_local_forward_probe_enabled() -> bool:
-    return os.environ.get("KUNSERVE_LOCAL_FORWARD_PROBE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 _BATCH_TIMING_LOG = os.environ.get("SGLANG_BATCH_TIMING_LOG", "").strip()
@@ -3223,20 +3180,6 @@ class Scheduler(
             "gap_ms": round(gap_ms, 3),
         }
         kunserve_timing_log("scheduler_run_batch_begin", **run_timing_fields)
-        local_forward_probe = _kunserve_local_forward_probe_enabled()
-        if local_forward_probe:
-            _kun_wd(
-                "[KUNSERVE-LOCAL] scheduler_run_batch_begin fwd_ct=%d mode=%s "
-                "bs=%d running=%d waiting=%d gap_ms=%.3f"
-                % (
-                    int(self.forward_ct),
-                    batch.forward_mode,
-                    int(batch.batch_size()),
-                    len(self.running_batch.reqs),
-                    len(self.waiting_queue),
-                    float(gap_ms),
-                )
-            )
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -3318,32 +3261,12 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                if local_forward_probe:
-                    _kun_wd(
-                        "[KUNSERVE-LOCAL] scheduler_forward_enter fwd_ct=%d mode=%s bs=%d"
-                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
-                    )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
-                if local_forward_probe:
-                    _kun_wd(
-                        "[KUNSERVE-LOCAL] scheduler_forward_exit fwd_ct=%d mode=%s bs=%d"
-                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
-                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
-                if local_forward_probe:
-                    _kun_wd(
-                        "[KUNSERVE-LOCAL] scheduler_update_cache_enter fwd_ct=%d mode=%s bs=%d"
-                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
-                    )
                 self.update_cache_from_scheduler(batch, batch_result)
-                if local_forward_probe:
-                    _kun_wd(
-                        "[KUNSERVE-LOCAL] scheduler_update_cache_exit fwd_ct=%d mode=%s bs=%d"
-                        % (int(self.forward_ct), batch.forward_mode, int(batch.batch_size()))
-                    )
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -4433,16 +4356,6 @@ class Scheduler(
         stage_ns = time.perf_counter_ns()
         local_force_eager = self._kunserve_batch_requires_eager_for_phase_e(batch)
         local_padded = self._padded_capture_bs(local_bs)
-        _kun_wd(
-            "[KUNSERVE-WD] phase_e_decide fwd_ct=%d local_bs=%d padded=%d fe=%d loop=%s"
-            % (
-                int(self.forward_ct),
-                int(local_bs),
-                int(local_padded),
-                1 if local_force_eager else 0,
-                str(loop),
-            )
-        )
         local_signature = self._phase_e_local_state_signature(
             batch=batch,
             local_bs=int(local_bs),

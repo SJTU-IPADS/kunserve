@@ -12,9 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import datetime
-import logging
-import os
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -22,18 +19,6 @@ import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.server_args import get_global_server_args
-
-_KUNSERVE_DBG_LAST_SIG = {}
-_logger = logging.getLogger(__name__)
-
-
-def _is_cuda_graph_capturing(tensor: Optional[torch.Tensor]) -> bool:
-    if tensor is None or not tensor.is_cuda or not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except Exception:
-        return True
 
 
 def _is_pre_capture_warmup(tensor: Optional[torch.Tensor]) -> bool:
@@ -50,36 +35,6 @@ def _is_pre_capture_warmup(tensor: Optional[torch.Tensor]) -> bool:
         return bool(get_is_capture_mode())
     except Exception:
         return False
-
-
-def _kunserve_dbg(message: str, *args) -> None:
-    _logger.warning(message, *args)
-    path = os.environ.get("KUNSERVE_DETAIL_LOG")
-    if not path:
-        return
-    try:
-        rendered = message % args if args else message
-    except Exception:
-        rendered = message
-    try:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"[{ts} pid={os.getpid()}] {rendered}\n")
-    except Exception:
-        pass
-
-
-def _tensor_meta(tensor: Optional[torch.Tensor]) -> str:
-    if not isinstance(tensor, torch.Tensor):
-        return "None"
-    try:
-        ptr = hex(int(tensor.data_ptr()))
-    except Exception as exc:
-        ptr = f"<ptr_err:{exc!r}>"
-    return (
-        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-        f"device={tensor.device} ptr={ptr} contiguous={tensor.is_contiguous()}"
-    )
 
 
 @dataclass
@@ -100,17 +55,6 @@ class ExpertLocationDispatchInfo:
         assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
-            # KUNSERVE-DBG: noisy on every call, but only at the warning level
-            # the first time this branch is taken per layer per process so we
-            # can see if the static-remap path is silently disabled.
-            sig = ("none", layer_id)
-            if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-                _kunserve_dbg(
-                    "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new: "
-                    "ep_dispatch_algorithm=None (no logical->physical remap will be applied) layer_id=%d",
-                    layer_id,
-                )
-                _KUNSERVE_DBG_LAST_SIG[sig] = True
             return None
 
         partial_dispatch = (
@@ -119,83 +63,6 @@ class ExpertLocationDispatchInfo:
             is not None
             else None
         )
-
-        # KUNSERVE-DBG: log the first 8 entries of the dispatch map for layer 0
-        # once per (process, layer_id) so we can confirm the values flip from
-        # LOCAL identity (logical i -> i) to GLOBAL complementary (e.g. logical
-        # 32 -> physical 64) at commit_balloon time.
-        if layer_id == 0:
-            if partial_dispatch is None:
-                sig = ("layer0_none", ep_dispatch_algorithm)
-                if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-                    _KUNSERVE_DBG_LAST_SIG[sig] = True
-                    _kunserve_dbg(
-                        "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0: "
-                        "partial_logical_to_rank_dispatch_physical_map is None (algo=%s)",
-                        ep_dispatch_algorithm,
-                    )
-            else:
-                probe_values = os.environ.get(
-                    "KUNSERVE_EXPERT_LOCATION_PROBE", ""
-                ).lower() in ("1", "true", "yes", "on")
-                is_capturing = _is_cuda_graph_capturing(partial_dispatch)
-                if is_capturing or not probe_values:
-                    sig = (
-                        "layer0_capture" if is_capturing else "layer0_metadata",
-                        ep_dispatch_algorithm,
-                        tuple(partial_dispatch.shape),
-                        str(partial_dispatch.device),
-                    )
-                    if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-                        _KUNSERVE_DBG_LAST_SIG[sig] = True
-                        reason = (
-                            "cuda graph capture"
-                            if is_capturing
-                            else "probe disabled"
-                        )
-                        _kunserve_dbg(
-                            "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
-                            "first8=<skipped: %s> logical32->phys=None "
-                            "logical64->phys=None shape=%s dtype=%s device=%s",
-                            ep_dispatch_algorithm,
-                            reason,
-                            tuple(partial_dispatch.shape),
-                            partial_dispatch.dtype,
-                            partial_dispatch.device,
-                        )
-                else:
-                    sample = (
-                        partial_dispatch[:8].tolist()
-                        if partial_dispatch.numel() >= 8
-                        else partial_dispatch.tolist()
-                    )
-                    sample32 = (
-                        int(partial_dispatch[32].item())
-                        if partial_dispatch.numel() > 32
-                        else None
-                    )
-                    sample64 = (
-                        int(partial_dispatch[64].item())
-                        if partial_dispatch.numel() > 64
-                        else None
-                    )
-                    sig = (
-                        "layer0_values",
-                        ep_dispatch_algorithm,
-                        tuple(sample),
-                        sample32,
-                        sample64,
-                    )
-                    if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-                        _KUNSERVE_DBG_LAST_SIG[sig] = True
-                        _kunserve_dbg(
-                            "[KUNSERVE-DBG] ExpertLocationDispatchInfo.init_new layer_id=0 algo=%s "
-                            "first8=%s logical32->phys=%s logical64->phys=%s",
-                            ep_dispatch_algorithm,
-                            sample,
-                            sample32,
-                            sample64,
-                        )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -246,35 +113,12 @@ def _topk_ids_logical_to_physical_static(
         return topk_ids
 
     mapping = info.partial_logical_to_rank_dispatch_physical_map
-    sig = (
-        "topk_static_remap",
-        tuple(topk_ids.shape),
-        str(topk_ids.dtype),
-        str(topk_ids.device),
-        str(getattr(mapping, "dtype", None)),
-        str(getattr(mapping, "device", None)),
-        _is_cuda_graph_capturing(topk_ids),
-    )
-    if _KUNSERVE_DBG_LAST_SIG.get(sig) is None:
-        _KUNSERVE_DBG_LAST_SIG[sig] = True
-        _kunserve_dbg(
-            "[KUNSERVE-DBG] topk_static_remap enter: topk_ids=%s mapping=%s capturing=%s pre_capture=%s",
-            _tensor_meta(topk_ids),
-            _tensor_meta(mapping),
-            _is_cuda_graph_capturing(topk_ids),
-            _is_pre_capture_warmup(topk_ids),
-        )
     if mapping is None:
         raise RuntimeError(
             "ExpertLocationDispatchInfo static remap requires a non-None "
             "partial_logical_to_rank_dispatch_physical_map."
         )
     if mapping.device != topk_ids.device:
-        _kunserve_dbg(
-            "[KUNSERVE-DBG] TOPK_STATIC_REMAP_DEVICE_MISMATCH: topk_ids=%s mapping=%s",
-            _tensor_meta(topk_ids),
-            _tensor_meta(mapping),
-        )
         raise RuntimeError(
             "ExpertLocationDispatchInfo static remap mapping must be on the "
             f"same device as topk_ids; mapping={mapping.device}, "

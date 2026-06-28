@@ -260,18 +260,7 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
-def _kunserve_detail_log_verbose() -> bool:
-    return os.environ.get("KUNSERVE_DETAIL_LOG_VERBOSE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
 def _kunserve_detail_log_is_milestone(rendered: str) -> bool:
-    if _kunserve_detail_log_verbose():
-        return True
     lower = rendered.lower()
     return any(
         key in lower
@@ -323,38 +312,6 @@ def _kunserve_ms(message: str, *args) -> None:
     except Exception:
         pass
 
-
-def _kun_wd(message: str) -> None:
-    """[KUNSERVE-WD] lockstep watchdog probe -> KUNSERVE_DETAIL_LOG only.
-
-    No logger.warning (avoids per-step spam). Each line is open/append/closed so
-    it is flushed to disk and survives a hang. TEMPORARY debug instrumentation
-    to locate the cross-replica negotiate/collective lockstep divergence.
-    """
-    if not (
-        _kunserve_detail_log_verbose()
-        or os.environ.get("KUNSERVE_WD_DEBUG", "0").lower()
-        in ("1", "true", "yes", "on")
-    ):
-        return
-    path = os.environ.get("KUNSERVE_DETAIL_LOG")
-    if not path:
-        return
-    try:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"[{ts} pid={os.getpid()}] {message}\n")
-    except Exception:
-        pass
-
-
-def _kunserve_local_forward_probe_enabled() -> bool:
-    return os.environ.get("KUNSERVE_LOCAL_FORWARD_PROBE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -944,19 +901,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 int(local_raw_bs),
             )
 
-        self._kun_wd_negct = getattr(self, "_kun_wd_negct", 0) + 1
-        _kun_wd(
-            "[KUNSERVE-WD] neg_call n=%d raw_bs=%d padded_bs=%d fe=%d "
-            "state=%s backend=%s"
-            % (
-                self._kun_wd_negct,
-                int(local_raw_bs),
-                int(local_padded),
-                1 if local_force_eager else 0,
-                str(self._balloon_state),
-                str(self._balloon_kunserve_comm_backend),
-            )
-        )
+        self._kunserve_negotiation_count = getattr(self, "_kunserve_negotiation_count", 0) + 1
 
         if str(self._balloon_state) != "balloon":
             return local_result()
@@ -976,15 +921,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             world = self._kunserve_group_world_size(runtime_group)
             payload_len = int(local_t.numel())
             all_t = torch.empty(world * payload_len, dtype=torch.int32, device=device)
-            _kun_wd(
-                "[KUNSERVE-WD] neg_ENTER n=%d world=%d raw_bs=%d padded_bs=%d"
-                % (
-                    self._kun_wd_negct,
-                    int(world),
-                    int(local_raw_bs),
-                    int(local_padded),
-                )
-            )
             # Phase E timing (profiling-only, gated by KUNSERVE_PHASE_E_TIMING):
             # bracket the step's FIRST cross-replica rendezvous with host-side
             # CUDA events.  Its dur ~= tiny real comm (a few int32) + lockstep
@@ -1025,25 +961,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     pe_end.record()
                 except Exception:
                     pe_end = None
-            _kun_wd("[KUNSERVE-WD] neg_EXIT n=%d" % (self._kun_wd_negct,))
             all_t = all_t.view(world, payload_len)
             raw_values = all_t[:, 0]
             padded_values = all_t[:, 1]
             eager_values = all_t[:, 2]
             state_fingerprint = self._kunserve_fingerprint_ints(
                 all_t.detach().cpu().reshape(-1).tolist()
-            )
-            _kun_wd(
-                "[KUNSERVE-WD] neg_RESULT_READY n=%d raw_min=%d raw_max=%d "
-                "padded_min=%d padded_max=%d any_fe=%d"
-                % (
-                    self._kun_wd_negct,
-                    int(raw_values.min().item()),
-                    int(raw_values.max().item()),
-                    int(padded_values.min().item()),
-                    int(padded_values.max().item()),
-                    int(eager_values.max().item()),
-                )
             )
             if pe_start is not None and pe_end is not None:
                 # .cpu() above already synced the stream, so pe_end is complete.
@@ -1055,7 +978,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     kunserve_phase_e_log(
                         "phase_e_negotiate",
                         gpu_ms=round(pe_gpu_ms, 3),
-                        n=int(self._kun_wd_negct),
+                        n=int(self._kunserve_negotiation_count),
                         raw_bs=int(local_raw_bs),
                         padded_bs=int(local_padded),
                         raw_max=int(raw_values.max().item()),
@@ -1309,16 +1232,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return bool(can_run_graph)
 
-        if bool(can_run_graph) and not synced:
-            _kun_wd(
-                "[KUNSERVE-LOCAL] local_graph_decision_sync force_eager "
-                "fp=%d tp_rank=%s bs=%s"
-                % (
-                    int(getattr(self, "forward_pass_id", -1)),
-                    getattr(self, "tp_rank", None),
-                    "unknown",
-                )
-            )
         return synced
 
     def get_balloon_step_graph_bs_override(self) -> Optional[int]:
@@ -1958,10 +1871,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             #
             # Earlier code used an unconditional `arange(num_local)` override
             # claiming rows 32..63 caused cudaErrorIllegalAddress during
-            # warmup.  We verified (KUNSERVE_WEIGHT_PROBE in session
-            # 2026-05-24) that rows 32..63 are physically backed and the
-            # checksum of rank 2's rows 32..63 differs from rank 0's rows
-            # 0..31 -- they DO hold the upper-half experts the controller
+            # warmup.  We verified that rows 32..63 are physically backed and
+            # the checksum of rank 2's rows 32..63 differs from rank 0's rows
+            # 0..31: they DO hold the upper-half experts the controller
             # intended.  The override was causing replica 1's Triton kernel
             # to read the LOWER half (duplicate of replica 0's experts),
             # so experts 32..63 and 96..127 were never computed and tokens
@@ -2637,146 +2549,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 "capture anyway",
                                 label,
                                 exc,
-                            )
-                # KUNSERVE-DBG: GLOBAL cuda-graph capture's first warmup
-                # run faults inside torch.embedding() with
-                # cudaErrorIllegalAddress (confirmed via
-                # CUDA_LAUNCH_BLOCKING=1).  Probe the input-embedding
-                # weight — a plain, non-VMM tensor — here, on the default
-                # stream, *before* entering the graph-capture context.
-                # This bisects the failure:
-                #   probe raises  -> device memory was already corrupt
-                #                    after GLOBAL bundle registration /
-                #                    NCCL preheat above;
-                #   probe passes  -> the weight is intact entering
-                #                    capture, so the corruption is
-                #                    introduced by the capture machinery
-                #                    (graph memory pool / variant switch /
-                #                    capture stream), not anything before.
-                # NOTE: do NOT probe self.model.parameters() broadly — the
-                # VMM MoE weight tensors have virtual-only rows 32..63 that
-                # fault on access by design; only the embedding is safe.
-                if (
-                    backend_lower == "sglang"
-                    and policy_lower == "fixed_padded"
-                ):
-                    _emb_weight = None
-                    for _mod_name, _mod in self.model.named_modules():
-                        if _mod_name.endswith("embed_tokens"):
-                            _emb_weight = getattr(_mod, "weight", None)
-                            break
-                    if _emb_weight is not None:
-                        # Phase 1: explicit device sync to flush any
-                        # deferred GPU errors from background NCCL ops.
-                        # If THIS raises, the error is from a background
-                        # GPU operation (NCCL side-effect), NOT from the
-                        # embedding weight pointer.
-                        # If this passes but an explicitly enabled
-                        # Phase 2 data probe raises, the weight data read
-                        # itself is invalid (memory mapping issue).
-                        try:
-                            torch.cuda.synchronize()
-                            _kunserve_ms(
-                                "[KUNSERVE-DBG] pre-capture "
-                                "explicit sync OK (no deferred GPU "
-                                "errors at this point)"
-                            )
-                        except Exception as _sync_exc:
-                            _kunserve_ms(
-                                "[KUNSERVE-DBG] pre-capture "
-                                "explicit sync FAILED: %r -- "
-                                "a BACKGROUND GPU operation (NCCL or "
-                                "other) caused cudaErrorIllegalAddress; "
-                                "the embedding weight pointer itself "
-                                "may be intact.",
-                                _sync_exc,
-                            )
-                            raise
-                        # Phase 2: optional data probe.  By default do
-                        # not launch a kernel over the embedding table here:
-                        # with CUDA VMM enabled, the old full-table sum could
-                        # be the first operation to fault and poison the CUDA
-                        # context before GLOBAL capture even starts.  Metadata
-                        # is enough for the default warmup path; set
-                        # KUNSERVE_PRECAPTURE_EMBED_PROBE=tiny or full when
-                        # explicitly debugging embedding storage.
-                        _probe_mode = os.environ.get(
-                            "KUNSERVE_PRECAPTURE_EMBED_PROBE", "metadata"
-                        ).strip().lower()
-                        if _probe_mode in (
-                            "1",
-                            "true",
-                            "yes",
-                            "tiny",
-                            "sample",
-                        ):
-                            try:
-                                _flat = _emb_weight.detach().reshape(-1)
-                                _n = min(16, int(_flat.numel()))
-                                _probe_val = (
-                                    float(_flat[:_n].float().sum().item())
-                                    if _n > 0
-                                    else 0.0
-                                )
-                                _kunserve_ms(
-                                    "[KUNSERVE-DBG] pre-capture "
-                                    "embed_tokens.weight tiny probe OK: "
-                                    "shape=%s dtype=%s device=%s "
-                                    "sample_n=%d sample_sum=%.4f",
-                                    tuple(_emb_weight.shape),
-                                    _emb_weight.dtype,
-                                    _emb_weight.device,
-                                    _n,
-                                    _probe_val,
-                                )
-                            except Exception as exc:
-                                _kunserve_ms(
-                                    "[KUNSERVE-DBG] pre-capture "
-                                    "embed_tokens.weight tiny probe FAILED "
-                                    "AFTER clean sync: %r -- CUDA context "
-                                    "is poisoned; aborting before capture.",
-                                    exc,
-                                )
-                                raise
-                        elif _probe_mode in ("full", "sum", "full_sum"):
-                            try:
-                                _probe_val = float(
-                                    _emb_weight.detach().sum().item()
-                                )
-                                _kunserve_ms(
-                                    "[KUNSERVE-DBG] pre-capture "
-                                    "embed_tokens.weight full probe OK: "
-                                    "shape=%s dtype=%s device=%s sum=%.4f",
-                                    tuple(_emb_weight.shape),
-                                    _emb_weight.dtype,
-                                    _emb_weight.device,
-                                    _probe_val,
-                                )
-                            except Exception as exc:
-                                _kunserve_ms(
-                                    "[KUNSERVE-DBG] pre-capture "
-                                    "embed_tokens.weight full probe FAILED "
-                                    "AFTER clean sync: %r -- CUDA context "
-                                    "is poisoned; aborting before capture.",
-                                    exc,
-                                )
-                                raise
-                        else:
-                            try:
-                                _data_ptr = int(_emb_weight.data_ptr())
-                                _data_ptr_text = hex(_data_ptr)
-                            except Exception as exc:
-                                _data_ptr_text = f"<unavailable: {exc!r}>"
-                            _kunserve_ms(
-                                "[KUNSERVE-DBG] pre-capture "
-                                "embed_tokens.weight metadata: shape=%s "
-                                "dtype=%s device=%s data_ptr=%s "
-                                "probe_mode=%s (no device read)",
-                                tuple(_emb_weight.shape),
-                                _emb_weight.dtype,
-                                _emb_weight.device,
-                                _data_ptr_text,
-                                _probe_mode,
                             )
                 _kunserve_ms(
                     "[KUNSERVE-MS] GLOBAL cuda graph capture BEGIN "
@@ -5767,35 +5539,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_select_count = int(
             getattr(self, "_kunserve_forward_select_log_count", 0)
         )
-        local_forward_probe = _kunserve_local_forward_probe_enabled()
-        if local_forward_probe:
-            _kun_wd(
-                "[KUNSERVE-LOCAL] model_forward_select fp=%d state=%s variant=%s "
-                "mode=%s bs=%s input_tokens=%s can_run_graph=%s "
-                "local_can_run_graph=%s tp_graph_decision_changed=%s "
-                "mode_allows_graph=%s has_graph_runner=%s runner_can_run=%s "
-                "replay_enabled=%s force_eager=%s graph_bs_override=%s "
-                "tp_rank=%s pp_rank=%s"
-                % (
-                    int(self.forward_pass_id),
-                    balloon_state,
-                    runtime_variant,
-                    forward_batch.forward_mode,
-                    getattr(forward_batch, "batch_size", None),
-                    input_tokens_for_timing,
-                    bool(can_run_graph),
-                    bool(local_can_run_graph),
-                    bool(tp_graph_decision_changed),
-                    bool(mode_allows_graph),
-                    bool(has_graph_runner),
-                    bool(runner_can_run),
-                    bool(self.is_cuda_graph_replay_enabled()),
-                    bool(getattr(self, "_balloon_step_force_eager", False)),
-                    self.get_balloon_step_graph_bs_override(),
-                    getattr(self, "tp_rank", None),
-                    getattr(self, "pp_rank", None),
-                )
-            )
         if balloon_state != "local" or runtime_variant == "global":
             log_count = forward_select_count + 1
             self._kunserve_forward_select_log_count = log_count
@@ -5849,29 +5592,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
         if can_run_graph:
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_graph_replay_enter fp=%d state=%s "
-                    "variant=%s mode=%s bs=%s graph_bs_override=%s"
-                    % (
-                        int(self.forward_pass_id),
-                        balloon_state,
-                        runtime_variant,
-                        forward_batch.forward_mode,
-                        getattr(forward_batch, "batch_size", None),
-                        self.get_balloon_step_graph_bs_override(),
-                    )
-                )
             with kunserve_timing_scope("model_runner_graph_replay", **forward_timing_fields):
                 ret = self.graph_runner.replay(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
-                )
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_graph_replay_exit fp=%d"
-                    % int(self.forward_pass_id)
                 )
             return ModelRunnerOutput(
                 logits_output=ret,
@@ -5882,25 +5607,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         # For MLP sync
-        if local_forward_probe:
-            _kun_wd(
-                "[KUNSERVE-LOCAL] model_prepare_sync_enter fp=%d mode=%s bs=%s"
-                % (
-                    int(self.forward_pass_id),
-                    forward_batch.forward_mode,
-                    getattr(forward_batch, "batch_size", None),
-                )
-            )
         with kunserve_timing_scope("model_runner_prepare_sync", **forward_timing_fields):
             if forward_batch.global_num_tokens_cpu is not None:
                 forward_batch.prepare_mlp_sync_batch(self)
             else:
                 forward_batch.prepare_attn_tp_scatter_input(self)
-        if local_forward_probe:
-            _kun_wd(
-                "[KUNSERVE-LOCAL] model_prepare_sync_exit fp=%d"
-                % int(self.forward_pass_id)
-            )
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
             forward_batch.num_token_non_padded is not None
@@ -5913,69 +5624,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if forward_batch.forward_mode.is_decode():
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_decode_enter fp=%d bs=%s"
-                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
-                )
             with kunserve_timing_scope("model_runner_forward_decode", **forward_timing_fields):
                 ret = self.forward_decode(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_decode_exit fp=%d"
-                    % int(self.forward_pass_id)
-                )
         elif forward_batch.forward_mode.is_split_prefill():
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_split_prefill_enter fp=%d bs=%s"
-                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
-                )
             with kunserve_timing_scope("model_runner_forward_split_prefill", **forward_timing_fields):
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
                     forward_count=split_forward_count,
                 )
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_split_prefill_exit fp=%d"
-                    % int(self.forward_pass_id)
-                )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_extend_enter fp=%d bs=%s"
-                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
-                )
             with kunserve_timing_scope("model_runner_forward_extend", **forward_timing_fields):
                 ret, can_run_graph = self.forward_extend(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_extend_exit fp=%d"
-                    % int(self.forward_pass_id)
-                )
         elif forward_batch.forward_mode.is_idle():
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_idle_enter fp=%d bs=%s"
-                    % (int(self.forward_pass_id), getattr(forward_batch, "batch_size", None))
-                )
             with kunserve_timing_scope("model_runner_forward_idle", **forward_timing_fields):
                 ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-            if local_forward_probe:
-                _kun_wd(
-                    "[KUNSERVE-LOCAL] model_forward_idle_exit fp=%d"
-                    % int(self.forward_pass_id)
-                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
