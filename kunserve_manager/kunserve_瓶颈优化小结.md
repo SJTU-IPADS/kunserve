@@ -399,7 +399,7 @@ KUNSERVE_NVTX_STAGE_PROFILE=1
 
 更大的优化方向仍是：
 
-- DeepEP / token A2A dispatcher；
+- token A2A dispatcher；
 - 更窄的 peer exchange；
 - lane combine 与本地 TP all-reduce 的语义融合；
 - 尽量把 KunServe GLOBAL 通信形态逼近单实例 native TP=4。

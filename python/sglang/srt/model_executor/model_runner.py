@@ -769,119 +769,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._balloon_offloaded_local_experts = 0
         self._balloon_last_error = None
         self._balloon_process_group_name = None
-        self._balloon_kunserve_comm_backend = "deepep"
+        self._balloon_kunserve_comm_backend = "sglang"
         self._balloon_capture_policy = "auto"
         self._balloon_kunserve_pg_names: Dict[str, str] = {}
         self._balloon_fused_moe_layers: Optional[List[torch.nn.Module]] = None
 
-        # KunServe LOCAL/GLOBAL split:
-        #
-        # The original concern: with moe_a2a_backend=deepep + deepep_mode=auto,
-        # FusedMoE.__init__ creates a LOCAL DeepEP dispatcher whose first
-        # decode forward initializes NVSHMEM for the local TP group; if
-        # register_balloon_global_runtime_bundle later builds a GLOBAL DeepEP
-        # dispatcher in LL mode, NVSHMEM's per-process singleton trips on the
-        # `nvshmem_rank == internode::init(...)` assert (one process can only
-        # init one NVSHMEM context).
-        #
-        # Why we don't need the override anymore: with
-        # SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=1 (the default in this repo),
-        # register_balloon_global_runtime_bundle below builds the GLOBAL
-        # dispatcher with DeepEPMode.NORMAL only — NORMAL skips NVSHMEM init
-        # entirely (DeepEP buffer.py:96 gate). So LOCAL is free to use the
-        # default DeepEP+DeepGEMM path that baseline (FP8 + deepep + deep_gemm
-        # without kunserve) is known to run correctly. Forcing LOCAL to
-        # StandardDispatcher+Triton was producing ~25% degenerate outputs in
-        # ab_20260507_163750 (sample-7 r1 first request, 4 tokens of garbage)
-        # while a same-config baseline (ab_20260509_015613/baseline) was clean.
-        #
-        # If someone ever flips SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL=0 to use
-        # LL for GLOBAL (e.g., once IBGDA + peermem are properly set up), the
-        # double-init assert returns and the override needs to be re-enabled.
-        # Gate the override on that condition only.
-        if (
-            envs.SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS.get()
-            and not envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
-        ):
-            self._force_local_bundle_to_standard_dispatcher()
-
-    def _force_local_bundle_to_standard_dispatcher(self) -> None:
-        """Replace each FusedMoE layer's LOCAL bundle with a StandardDispatcher.
-
-        Called when KunServe is in play (SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS=1).
-        Standard dispatch keeps fixed shapes (cuda-graph friendly) and runs
-        without NVSHMEM. LOCAL intentionally uses the Triton runner instead of
-        reusing the original DeepGEMM runner: the standard->deep_gemm permute
-        path is unsafe for EP-local execution with -1 non-local expert ids and
-        can corrupt hidden states before any KunServe GLOBAL commit happens.
-        The companion ``reduce_results=True`` flag tells FusedMoE.forward_impl
-        to finish the TP all-reduce internally; qwen3_moe.forward_deepep does
-        not add one on top, and the per-bundle dispatcher abstraction means
-        model-level code does not need to know which mode the layer is using.
-        """
-        if self.is_draft_worker:
-            return
-        from sglang.srt.layers.moe.fused_moe_triton.layer import (
-            FusedMoERuntimeVariant,
-        )
-        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-        from sglang.srt.layers.moe.token_dispatcher.standard import (
-            StandardDispatcher,
-        )
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
-        layers = self._iter_fused_moe_layers()
-        if not layers:
-            return
-
-        for layer in layers:
-            local_runner = MoeRunner(
-                MoeRunnerBackend.TRITON,
-                layer.local_bundle.moe_runner_config,
-            )
-            standard = StandardDispatcher(
-                layer.local_bundle.moe_runner_config,
-                moe_ep_size=layer.local_bundle.moe_ep_size,
-                moe_ep_rank=layer.local_bundle.moe_ep_rank,
-                # local_expert_mapping is built lazily by StandardDispatcher
-                # on first dispatch using moe_ep_rank — leave None so it
-                # picks up the correct mapping for the live layer.
-                local_expert_mapping=None,
-            )
-            # Re-register so self._runtime_bundles[LOCAL] points at the new
-            # bundle. Do not reuse the original runner here: in KunServe FP8
-            # runs it is DeepGEMM, while LOCAL standard dispatch has already
-            # converted non-local experts to -1 ids. The Triton standard path
-            # is the normal local EP fallback and keeps LOCAL independent from
-            # DeepEP/NVSHMEM.
-            layer.register_runtime_bundle(
-                variant=FusedMoERuntimeVariant.LOCAL,
-                moe_runner_config=layer.local_bundle.moe_runner_config,
-                dispatcher=standard,
-                runner=local_runner,
-                moe_ep_size=layer.local_bundle.moe_ep_size,
-                moe_ep_rank=layer.local_bundle.moe_ep_rank,
-                moe_tp_size=layer.local_bundle.moe_tp_size,
-                moe_tp_rank=layer.local_bundle.moe_tp_rank,
-                num_local_experts=layer.local_bundle.num_local_experts,
-                # Standard dispatch leaves partial sums on each rank, so
-                # FusedMoE.forward_impl must run tp_group all-reduce.
-                reduce_results=True,
-            )
-            # Refresh self.dispatcher / self.reduce_results / etc. on the
-            # FusedMoE layer so the very next forward (graph capture or live)
-            # actually picks up the new bundle.
-            layer.switch_runtime_bundle(FusedMoERuntimeVariant.LOCAL)
-        # Use _kunserve_ms (writes to KUNSERVE_DETAIL_LOG and goes through
-        # logger.warning) instead of logger.info — sglang's Ray-actor stdout
-        # capture suppresses INFO-level lines, which made it impossible to
-        # confirm this override actually fired in the previous run.
-        _kunserve_ms(
-            "[KUNSERVE-MS] forced LOCAL bundle to StandardDispatcher "
-            "+ Triton runner (reduce_results=True) on %d FusedMoE layers; "
-            "NVSHMEM will only init when the GLOBAL bundle is created.",
-            len(layers),
-        )
+        # KunServe is sglang-backend only.
 
     def _iter_fused_moe_layers(self) -> List[torch.nn.Module]:
         if self._balloon_fused_moe_layers is None:
@@ -1674,7 +1567,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         active_local_expert_mapping_by_layer: Optional[Dict[int, List[int]]] = None,
         physical_to_logical_map=None,
         process_group_name: Optional[str] = None,
-        kunserve_comm_backend: str = "deepep",
+        kunserve_comm_backend: str = "sglang",
         capture_policy: str = "auto",
         kunserve_pg_names: Optional[Dict[str, str]] = None,
         kunserve_backend_config: Optional[Dict[str, Any]] = None,
@@ -1683,13 +1576,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not fused_layers:
             raise ValueError("Balloon runtime requires a model with FusedMoE layers.")
 
-        kunserve_comm_backend = str(kunserve_comm_backend or "deepep").lower()
+        kunserve_comm_backend = str(kunserve_comm_backend or "sglang").lower()
         capture_policy = str(capture_policy or "auto").lower()
         kunserve_backend_config = dict(kunserve_backend_config or {})
-        if kunserve_comm_backend not in ("deepep", "sglang"):
+        if kunserve_comm_backend != "sglang":
             raise ValueError(
                 "Unsupported KunServe GLOBAL communication backend "
-                f"{kunserve_comm_backend!r}; expected 'deepep' or 'sglang'."
+                f"{kunserve_comm_backend!r}; only 'sglang' is supported."
             )
 
         # KunServe BALLOON publishes a complementary physical_to_logical_map
@@ -1712,41 +1605,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"{getattr(self.server_args, 'ep_dispatch_algorithm', None)!r}."
             )
         moe_a2a_backend = get_moe_a2a_backend()
-        if kunserve_comm_backend == "deepep":
-            if moe_a2a_backend.is_none():
-                raise ValueError(
-                    "Balloon GLOBAL bundle with kunserve_comm_backend='deepep' "
-                    "requires a cross-rank MoE A2A backend. "
-                    "moe_a2a_backend='none' would make the GLOBAL bundle's "
-                    "auto-registered dispatcher fall back to StandardDispatcher, "
-                    "which only does rank-local expert compute + intra-TP "
-                    "all-reduce; it cannot route tokens to experts retained by "
-                    "the peer KunServe replica. Pass "
-                    "engine_kwargs.sglang.moe_a2a_backend=deepep and "
-                    "engine_kwargs.sglang.moe_runner_backend=deep_gemm, or set "
-                    "kunserve_comm_backend='sglang' to use the new "
-                    "CrossReplicaStandardDispatcher. NOTE: the LOCAL bundle is "
-                    "intentionally overridden back to Standard by "
-                    "_force_local_bundle_to_standard_dispatcher (gated on "
-                    "SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS), so this flag only "
-                    "affects the GLOBAL bundle's default."
-                )
-            if (
-                moe_a2a_backend.is_deepep() or moe_a2a_backend.is_mooncake()
-            ) and str(getattr(self.server_args, "moe_runner_backend", None)) != (
-                "deep_gemm"
-            ):
-                raise ValueError(
-                    "Balloon GLOBAL bundle with kunserve_comm_backend='deepep' and "
-                    "moe_a2a_backend="
-                    f"{moe_a2a_backend.value!r} requires "
-                    "server_args.moe_runner_backend='deep_gemm'. This sglang build "
-                    "only registers DeepEP/Mooncake MoE pre/post permutation paths "
-                    "for the deep_gemm runner; leaving the runner as 'auto' or "
-                    "'triton' can crash the scheduler during warmup/cuda-graph "
-                    "capture. Pass engine_kwargs.sglang.moe_runner_backend=deep_gemm. "
-                    f"Current value: {getattr(self.server_args, 'moe_runner_backend', None)!r}."
-                )
 
         active_mappings = self._normalize_balloon_active_mappings(
             retained_local_experts=retained_local_experts,
@@ -1795,7 +1653,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "[KUNSERVE-DBG] register_balloon_global_runtime_bundle: "
                     "GLOBAL metadata.logical_to_rank_dispatch_physical_map is None "
                     "tp_rank=%s ep_dispatch_algorithm=%s -- topk will NOT remap, "
-                    "DeepEP will route by raw logical id and corrupt outputs",
+                    "GLOBAL dispatch will route by raw logical id and corrupt outputs",
                     self.tp_rank,
                     getattr(self.server_args, "ep_dispatch_algorithm", None),
                 )
@@ -2018,9 +1876,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         lane_group=lane_group,
                         local_tp_group=local_tp_group,
                     )
-                # Use the normal Standard/Triton MoE core for the correctness
-                # backend. This avoids DeepEP/NVSHMEM and DeepGEMM entirely;
-                # the dispatcher itself performs global all-gather + all-reduce.
+                # Use the normal Standard/Triton MoE core. The dispatcher
+                # itself performs global all-gather + all-reduce.
                 explicit_global_runner = MoeRunner(
                     MoeRunnerBackend.TRITON,
                     global_runner_config,
@@ -2042,37 +1899,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         ("ready" if local_tp_group is not None else "unavailable"),
                         kunserve_backend_config,
                     )
-            # When SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL is on (default), build
-            # the GLOBAL bundle's dispatcher in DeepEP NORMAL mode explicitly
-            # (NOT LL). Reason: this host's container does not expose
-            # /dev/infiniband/, so NVSHMEM's IBGDA transport fails to init.
-            # NVSHMEM falls back to NVL/SHM which is enough for the symmetric
-            # heap setup, but LL atomic ops still loop on completion via
-            # IBGDA-style signaling and deadlock silently after a few hundred
-            # decode steps (see ab_20260507_053135 — BALLOON forward runs 7s
-            # then both replicas freeze without any NCCL/Python exception).
-            # NORMAL mode for cross-replica intra-node has rdma_ranks=1 and
-            # low_latency_mode=False, so DeepEP buffer.py:96 skips NVSHMEM
-            # init entirely. Trade-off: dynamic-shape dispatch can't be cuda
-            # graph captured, so GLOBAL forward runs eager. LOCAL forward
-            # (StandardDispatcher) keeps its cuda graph.
-            elif envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get():
-                from sglang.srt.batch_overlap.two_batch_overlap import (
-                    MaybeTboDeepEPDispatcher,
-                )
-                from sglang.srt.layers.moe.utils import DeepEPMode
-                explicit_global_dispatcher = MaybeTboDeepEPDispatcher(
-                    group=runtime_group,
-                    router_topk=global_runner_config.top_k,
-                    permute_fusion=True,
-                    num_experts=global_runner_config.num_experts,
-                    num_local_experts=int(mapping.numel()),
-                    hidden_size=global_runner_config.hidden_size,
-                    params_dtype=global_runner_config.params_dtype,
-                    deepep_mode=DeepEPMode.NORMAL,  # ← key: force NORMAL, no NVSHMEM
-                    async_finish=True,
-                    return_recv_hook=True,
-                )
 
             # CrossReplicaStandardDispatcher (sglang backend) uses each
             # rank's OWN local weight tensor rows for the experts it kept
@@ -2122,7 +1948,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             layer.register_runtime_bundle(
                 variant="global",
                 moe_runner_config=global_runner_config,
-                dispatcher=explicit_global_dispatcher,  # None ⇒ default DeepEP via create_moe_dispatcher
+                dispatcher=explicit_global_dispatcher,
                 runner=explicit_global_runner,
                 group=runtime_group,
                 moe_ep_size=resolved_ep_size,
@@ -2134,14 +1960,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 dispatcher_local_expert_mapping=dispatcher_local_expert_mapping,
                 # GLOBAL bundle combine already aggregates each token's expert
                 # outputs across the whole cross-replica EP world:
-                #   - DeepEP does it inside DeepEP combine;
                 #   - CrossReplicaStandardDispatcher does it with a global
                 #     all-reduce then slices back to local tokens.
                 # Adding the FusedMoE-level tp_group all-reduce on top would
                 # double-reduce within the local TP group. Companion: LOCAL
-                # bundle (StandardDispatcher) registered in
-                # _force_local_bundle_to_standard_dispatcher passes
-                # reduce_results=True because Standard's combine is a no-op and
+                # bundle handles its own local reduction semantics.
                 # partial sums need a final tp_group all-reduce.
                 reduce_results=False,
             )
@@ -2472,7 +2295,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         physical_to_logical_map,
         process_group_name: Optional[str],
         capture_cuda_graph: bool,
-        kunserve_comm_backend: str = "deepep",
+        kunserve_comm_backend: str = "sglang",
         capture_policy: str = "auto",
         kunserve_pg_names: Optional[Dict[str, str]] = None,
         kunserve_backend_config: Optional[Dict[str, Any]] = None,
@@ -2533,8 +2356,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # this variant is already in `self.graphs`.
         if capture_cuda_graph:
             # Skip GLOBAL capture for known unsupported communication paths:
-            #   - deepep + DEEPEP_NORMAL=True  → DeepEP NORMAL dispatch_a/b
-            #     has dynamic shape (no NVSHMEM so we can't go to LL).
             #   - sglang + capture_policy != fixed_padded → the dispatcher
             #     stays in dynamic eager mode (no static buffers, host syncs
             #     present).
@@ -2542,7 +2363,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             #     collectives on every cross-replica group touched by the
             #     dispatcher. Raw torch.distributed CUDA collectives remain
             #     unsupported inside CUDA graphs.
-            backend_lower = str(kunserve_comm_backend or "deepep").lower()
+            backend_lower = str(kunserve_comm_backend or "sglang").lower()
             policy_lower = str(capture_policy or "auto").lower()
             allow_torch_dist_cudagraph = (
                 os.environ.get("KUNSERVE_ALLOW_TORCH_DIST_CUDAGRAPH", "")
@@ -2606,14 +2427,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             "the active global/lane groups"
                         )
                 else:
-                    skip_capture = bool(
-                        envs.SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL.get()
+                    skip_capture = True
+                    skip_capture_reason = (
+                        "non-fixed_padded GLOBAL capture policy: graph "
+                        "capture skipped (eager)"
                     )
-                    if skip_capture:
-                        skip_capture_reason = (
-                            "DeepEP NORMAL uses a dynamic-shape eager "
-                            "communication path"
-                        )
             if not skip_capture:
                 # NCCL communicator preheat for the sglang fixed_padded
                 # path.  The static CrossReplicaStandardDispatcher uses
@@ -2628,9 +2446,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # on replay.  Issue one dummy of each collective on the
                 # group while we are outside the capture context so the
                 # communicator is fully built before capture begins.
-                # The deepep path does its own NCCL/NVSHMEM warmup
-                # through the DeepEP buffer setup, so we only do this
-                # for the sglang backend.
                 if (
                     backend_lower == "sglang"
                     and policy_lower == "fixed_padded"
@@ -2976,7 +2791,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         physical_to_logical_map=None,
         process_group_name: Optional[str] = None,
         capture_cuda_graph: bool = True,
-        kunserve_comm_backend: str = "deepep",
+        kunserve_comm_backend: str = "sglang",
         capture_policy: str = "auto",
         kunserve_pg_names: Optional[Dict[str, str]] = None,
         kunserve_backend_config: Optional[Dict[str, Any]] = None,
@@ -3056,7 +2871,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         physical_to_logical_map=None,
         process_group_name: Optional[str] = None,
         capture_cuda_graph: bool = True,
-        kunserve_comm_backend: str = "deepep",
+        kunserve_comm_backend: str = "sglang",
         capture_policy: str = "auto",
         kunserve_pg_names: Optional[Dict[str, str]] = None,
         kunserve_backend_config: Optional[Dict[str, Any]] = None,
@@ -3416,10 +3231,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._balloon_graph_replay_enabled = True
 
             # Phase E: reserve a dummy KV slot for keepalive batches.
-            # Done after the KV pool has been expanded (so we draw from
-            # the new headroom, not from real-request capacity).  Only
-            # for the sglang backend's keepalive path; DeepEP uses a
-            # different keepalive mechanism.
+            # Done after the KV pool has been expanded, so we draw from the
+            # new headroom instead of real-request capacity.
             if (
                 str(self._balloon_kunserve_comm_backend or "").lower()
                 == "sglang"

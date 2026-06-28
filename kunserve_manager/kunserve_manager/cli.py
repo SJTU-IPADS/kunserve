@@ -98,13 +98,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--comm-backend",
-        choices=("deepep", "sglang"),
-        default=_env_or("KUNSERVE_MANAGER_COMM_BACKEND", "deepep"),
-        help=(
-            "KunServe GLOBAL MoE communication backend. 'deepep' keeps the "
-            "existing DeepEP dispatcher path; 'sglang' uses the "
-            "correctness-first CrossReplicaStandardDispatcher (default: deepep)."
-        ),
+        choices=("sglang",),
+        default=_env_or("KUNSERVE_MANAGER_COMM_BACKEND", "sglang"),
+        help="KunServe GLOBAL MoE communication backend (default: sglang).",
     )
     p.add_argument(
         "--capture-policy",

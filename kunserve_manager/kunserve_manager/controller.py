@@ -40,7 +40,7 @@ class KunServeController:
         offload_local_experts: Optional[int] = None,
         group_name: str = "kunserve_global_ep",
         backend: str = "nccl",
-        comm_backend: str = "deepep",
+        comm_backend: str = "sglang",
         capture_policy: str = "auto",
         enable_restore: bool = False,
         pg_init_max_attempts: int = 8,
@@ -937,9 +937,7 @@ class KunServeController:
                 # fatal because silently falling back to the global group makes
                 # perf traces look valid while they are not using the Phase F
                 # lane path.  Set KUNSERVE_ALLOW_GLOBAL_GROUP_FALLBACK=1 only
-                # for explicit fallback debugging.  Only meaningful for the
-                # sglang comm backend; the DeepEP path does its own dispatch
-                # coordination.
+                # for explicit fallback debugging.
                 if self.runtime_backend.comm_backend == "sglang" and not (
                     os.environ.get("KUNSERVE_DISABLE_LANE_SUBGROUPS", "")
                     in ("1", "true", "True", "yes")

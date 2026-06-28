@@ -1389,8 +1389,8 @@ class Scheduler(
                     )
                     phase_e_force_eager_set = True
             elif batch is None:
-                # Non-sglang backends (DeepEP NORMAL): keep the legacy
-                # local-only keepalive behavior.
+                # No peer-negotiated batch was needed; keep the local-only
+                # keepalive behavior.
                 stage_ns = time.perf_counter_ns()
                 batch = self._maybe_get_balloon_keepalive_batch()
                 self._kunserve_scheduler_gap_log(
@@ -3442,22 +3442,6 @@ class Scheduler(
                 else None
             )
 
-            ideal_e2e_ms_estimate = None
-            if isinstance(e2e_ms, (int, float)):
-                ideal = e2e_ms
-                if isinstance(queue_wait_ms_cumulative, (int, float)):
-                    ideal -= queue_wait_ms_cumulative
-                ideal -= retract_wasted_ms
-                if isinstance(extra_prefill_ms, (int, float)):
-                    ideal -= extra_prefill_ms
-                ideal_e2e_ms_estimate = round(max(0.0, ideal), 3)
-
-            e2e_saved_ms_estimate = (
-                round(e2e_ms - ideal_e2e_ms_estimate, 3)
-                if isinstance(e2e_ms, (int, float))
-                and isinstance(ideal_e2e_ms_estimate, (int, float))
-                else None
-            )
 
             queue_wait_ms_last = self._queue_wait_ms_last_dequeue.get(req.rid)
             record = {
@@ -3501,8 +3485,6 @@ class Scheduler(
                 "prefill_count": prefill_count,
                 "retract_wasted_ms": retract_wasted_ms,
                 "extra_prefill_ms": extra_prefill_ms,
-                "ideal_e2e_ms_estimate": ideal_e2e_ms_estimate,
-                "e2e_saved_ms_estimate": e2e_saved_ms_estimate,
                 # KunServe per-request decode-step accounting. Counters are
                 # incremented in _log_decode_step_timing each time the request
                 # appears in a decode batch.
@@ -3902,7 +3884,7 @@ class Scheduler(
         if str(getattr(model_runner, "_balloon_state", "local")) != "balloon":
             return False
         backend = str(
-            getattr(model_runner, "_balloon_kunserve_comm_backend", "deepep") or ""
+            getattr(model_runner, "_balloon_kunserve_comm_backend", "sglang") or ""
         ).lower()
         if backend != "sglang":
             return False
@@ -4784,9 +4766,8 @@ class Scheduler(
     ) -> ScheduleBatch:
         """Phase E: build an IDLE batch shaped to a peer-negotiated bs.
 
-        ``target_bs == 0`` is the historical empty-batch behavior (used by
-        DeepEP backend and by transient DeepEP path-corruption mitigation
-        before Phase D).  ``target_bs > 0`` is the Phase E flow: the
+        ``target_bs == 0`` is the historical empty-batch behavior.
+        ``target_bs > 0`` is the Phase E flow: the
         keepalive batch carries that many dummy decode tokens so the
         cross-replica all_gather_into_tensor / all_reduce inside the
         captured GLOBAL graph see the matching ``local_m`` on every rank.
@@ -4818,9 +4799,9 @@ class Scheduler(
             )
 
         # Pull the keepalive KV scratch slot and phantom req_pool entry
-        # from model_runner.  None means commit_balloon didn't reserve them
-        # (legacy DeepEP path, or alloc failed); prepare_for_idle will
-        # then fall back to slot 0 / req_pool[0] with a warning.
+        # from model_runner. None means commit_balloon didn't reserve them
+        # or allocation failed; prepare_for_idle will then fall back to
+        # slot 0 / req_pool[0] with a warning.
         dummy_kv_slot: Optional[int] = None
         phantom_req_idx: Optional[int] = None
         model_runner = getattr(self.tp_worker, "model_runner", None)
@@ -4858,7 +4839,7 @@ class Scheduler(
     def _maybe_get_balloon_keepalive_batch(
         self, *, target_bs: int = 0
     ) -> Optional[ScheduleBatch]:
-        """Legacy entry point preserved for DeepEP backend.
+        """Build a local balloon keepalive batch when needed.
 
         For the sglang Phase D + Phase E flow callers should use
         ``negotiate_balloon_step_bs`` + ``_build_balloon_keepalive_batch``

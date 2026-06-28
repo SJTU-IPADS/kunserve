@@ -445,14 +445,6 @@ class Envs:
     SGLANG_EXPERIMENTAL_VMM_MOE_WEIGHTS = EnvBool(False)
     SGLANG_EXPERIMENTAL_VMM_KV_CACHE = EnvBool(False)
     SGLANG_EXPERIMENTAL_VMM_KV_RESERVE_SLOTS = EnvInt(0)
-    # When True, the kunserve GLOBAL runtime bundle uses DeepEP NORMAL mode
-    # (not LOW_LATENCY), bypassing the NVSHMEM IBGDA path. Required on hosts
-    # whose container does not expose /dev/infiniband/, where IBGDA init
-    # fails silently and LL atomic ops then deadlock mid-decode after a few
-    # hundred steps. Side effect: GLOBAL forward runs eager (no cuda graph)
-    # because normal-mode dispatch has dynamic shapes; LOCAL forward
-    # (StandardDispatcher) keeps its cuda graph regardless.
-    SGLANG_KUNSERVE_GLOBAL_DEEPEP_NORMAL = EnvBool(True)
     # In-sglang KunServe manager. Enable on exactly one coordinator HTTP
     # process and pass the participating replica HTTP addresses as
     # comma-separated host:port values. The old verl-side controller knobs map
