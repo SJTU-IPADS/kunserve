@@ -337,7 +337,6 @@ GLOO_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}
 
 ```bash
 KUNSERVE_GLOBAL_FORWARD_PROBE=1
-KUNSERVE_NVTX_STAGE_PROFILE=1
 ```
 
 作用：
@@ -349,7 +348,7 @@ KUNSERVE_NVTX_STAGE_PROFILE=1
   - FusedMoE dispatch/core/combine/all-reduce
   - KunServe dispatch all-gather / remap
   - KunServe combine reduce-scatter / all-reduce
-- 文本日志写入 `kunserve_sglang_detail.log`，NVTX range 进入 nsys。
+- 文本日志写入 `kunserve_sglang_detail.log`。
 
 用途：
 
@@ -426,9 +425,6 @@ OUT_ROOT=/workspace/verl/outputs/kunserve_probe_$(date +%Y%m%d_%H%M%S)
 ONLY_RUN=kunserve \
 OUT_ROOT="$OUT_ROOT" \
 KUNSERVE_GLOBAL_FORWARD_PROBE=1 \
-KUNSERVE_NVTX_STAGE_PROFILE=1 \
-SGLANG_SERVER_NSYS_PROFILE=1 \
-SGLANG_SERVER_NSYS_TRACE=cuda,nvtx,osrt \
 bash /workspace/verl/data/compare_kunserve_vs_baseline.sh
 ```
 
